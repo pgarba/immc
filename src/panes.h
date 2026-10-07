@@ -15,6 +15,8 @@ struct Pane {
     char path_edit[4096]; // edit buffer for the path bar
     bool path_edit_active; // true while the path InputText has keyboard focus
     std::vector<bool> marked; // multi-select flags, parallel to entries
+    bool quick_view;          // Ctrl+T preview pane for this panel
+    int page_size;            // visible rows, measured during render (0 = fallback)
 };
 
 // Pending file operation shown in the bottom op bar

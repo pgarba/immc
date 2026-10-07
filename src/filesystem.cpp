@@ -183,3 +183,25 @@ bool fs_move_entry(const char* src, const char* dst) {
     if (!fs_copy_entry(src, dst)) return false;
     return fs_delete_entry(src);
 }
+
+void format_mode(mode_t mode, char* out) {
+    static const char* rwx = "rwx";
+    for (int i = 0; i < 3; i++) {
+        for (int b = 2; b >= 0; b--) {
+            *out++ = (mode & (1 << (i * 3 + b))) ? rwx[2 - b] : '-';
+        }
+    }
+    *out = '\0';
+}
+
+long fs_read_preview(const char* path, char* buf, size_t max_bytes) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, max_bytes, f);
+    fclose(f);
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] == '\0') return -1; // binary
+    }
+    buf[n] = '\0';
+    return (long)n;
+}

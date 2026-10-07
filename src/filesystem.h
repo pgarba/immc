@@ -36,4 +36,11 @@ bool fs_delete_entry(const char* path);                 // recursive for directo
 bool fs_move_entry(const char* src, const char* dst);   // rename, fallback copy+delete
 bool fs_make_dir(const char* path);
 
+// Format a mode as an rwx string, e.g. "rw-r--r--"
+void format_mode(mode_t mode, char* out);
+
+// Read up to max_bytes of a file into buf (NUL-terminated). Returns bytes read,
+// or -1 if the file is binary (contains NUL) or unreadable.
+long fs_read_preview(const char* path, char* buf, size_t max_bytes);
+
 #endif // FILESYSTEM_H
