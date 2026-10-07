@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="0" y="0" width="128" height="128" rx="14" fill="#1a1d21"/>
+  <!-- Left panel -->
+  <rect x="10" y="14" width="48" height="100" rx="6" fill="#23272e"/>
+  <rect x="10" y="14" width="48" height="16" rx="6" fill="#3373cc"/>
+  <!-- Right panel -->
+  <rect x="70" y="14" width="48" height="100" rx="6" fill="#23272e"/>
+  <rect x="70" y="14" width="48" height="16" rx="6" fill="#2b3038"/>
+  <!-- File rows left -->
+  <g fill="#4d8fd6">
+    <rect x="16" y="36" width="30" height="6" rx="2"/>
+    <rect x="16" y="48" width="36" height="6" rx="2"/>
+    <rect x="16" y="60" width="26" height="6" rx="2"/>
+  </g>
+  <g fill="#8a93a0">
+    <rect x="16" y="72" width="34" height="6" rx="2"/>
+    <rect x="16" y="84" width="28" height="6" rx="2"/>
+  </g>
+  <!-- File rows right -->
+  <g fill="#8a93a0">
+    <rect x="76" y="36" width="32" height="6" rx="2"/>
+    <rect x="76" y="48" width="26" height="6" rx="2"/>
+    <rect x="76" y="60" width="36" height="6" rx="2"/>
+    <rect x="76" y="72" width="30" height="6" rx="2"/>
+    <rect x="76" y="84" width="24" height="6" rx="2"/>
+  </g>
+  <!-- Selected row in left panel -->
+  <rect x="14" y="96" width="40" height="8" rx="2" fill="#3373cc"/>
+  <!-- immc wordmark -->
+  <text x="64" y="122" font-family="monospace" font-size="14" font-weight="bold" fill="#e8eef6" text-anchor="middle">immc</text>
+</svg>

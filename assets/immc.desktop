@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=immc
+GenericName=File Manager
+Comment=Midnight Commander clone (Dear ImGui)
+Exec=/home/adam/github/immc/build/mc-clone
+Icon=immc
+Terminal=false
+Categories=Utility;FileManager;
