@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
+#include <unistd.h>
 #include <libgen.h>
 #include <float.h>
 
@@ -116,13 +117,16 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
     ImGui::EndChild();
 }
 
-// Quick view: file info + text preview for the current selection.
-static void render_quick_view(Pane& pane, float width, float height, const char* id) {
-    ImGui::BeginChild(id, ImVec2(width, height), ImGuiChildFlags_Borders);
+// Quick view: separate floating window with file info + text preview
+// for the focused pane's current selection (Total Commander F3).
+static void render_quick_view(AppPanes* app, Pane& pane) {
+    ImGui::SetNextWindowSize(ImVec2(620, 460), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 640, 60), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Quick view");
 
     if (pane.selected >= pane.entry_count) {
         ImGui::TextUnformatted("(empty)");
-        ImGui::EndChild();
+        ImGui::End();
         return;
     }
     FileEntry* e = pane.entries[pane.selected];
@@ -140,7 +144,7 @@ static void render_quick_view(Pane& pane, float width, float height, const char*
     if (!is_directory(e->name, e->mode)) {
         char full[4100];
         snprintf(full, sizeof(full), "%s/%s", pane.current_dir, e->name);
-        static char preview[4096];
+        static char preview[8192];
         long n = fs_read_preview(full, preview, sizeof(preview) - 1);
         if (n < 0) {
             ImGui::TextUnformatted("(binary or unreadable)");
@@ -148,7 +152,7 @@ static void render_quick_view(Pane& pane, float width, float height, const char*
             ImGui::TextUnformatted(preview);
         }
     }
-    ImGui::EndChild();
+    ImGui::End();
 }
 
 void app_panes_render(AppPanes* app) {
@@ -166,10 +170,11 @@ void app_panes_render(AppPanes* app) {
     // Top menu bar
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("Commands")) {
-            if (ImGui::MenuItem("Change Directory", "F3")) {
-                // TODO: drive selection dialog
+            if (ImGui::MenuItem("Quick view", "F3")) {
+                Pane& a = left_focus ? left : right;
+                a.quick_view = !a.quick_view;
             }
-            if (ImGui::MenuItem("Refresh", "F5")) {
+            if (ImGui::MenuItem("Refresh", "R")) {
                 left_focus ? app_panes_refresh_left(app) : app_panes_refresh_right(app);
             }
             if (ImGui::MenuItem("Quit", "Alt+Q")) {
@@ -226,16 +231,9 @@ void app_panes_render(AppPanes* app) {
     ImGui::PopStyleColor(5);
     ImGui::Separator();
 
-    // Left pane body: file list, plus quick view on the right half when active
+    // Left pane body: full-width file list (quick view is a separate window)
     float left_w = ImGui::GetContentRegionAvail().x;
-    if (left.quick_view) {
-        float half = left_w * 0.5f;
-        render_file_list(app, left, left_focus, half, "left_pane");
-        ImGui::SameLine();
-        render_quick_view(left, half, child_h, "left_quickview");
-    } else {
-        render_file_list(app, left, left_focus, left_w, "left_pane");
-    }
+    render_file_list(app, left, left_focus, left_w, "left_pane");
 
     ImGui::TableNextColumn();
 
@@ -264,16 +262,9 @@ void app_panes_render(AppPanes* app) {
     ImGui::PopStyleColor(5);
     ImGui::Separator();
 
-    // Right pane body: file list, plus quick view on the right half when active
+    // Right pane body: full-width file list (quick view is a separate window)
     float right_w = ImGui::GetContentRegionAvail().x;
-    if (right.quick_view) {
-        float half = right_w * 0.5f;
-        render_file_list(app, right, !left_focus, half, "right_pane");
-        ImGui::SameLine();
-        render_quick_view(right, half, child_h, "right_quickview");
-    } else {
-        render_file_list(app, right, !left_focus, right_w, "right_pane");
-    }
+    render_file_list(app, right, !left_focus, right_w, "right_pane");
     ImGui::EndTable();
 
     // Bottom bar: op bar when an op is pending, otherwise the status line.
@@ -311,6 +302,13 @@ void app_panes_render(AppPanes* app) {
     }
 
     ImGui::End();
+
+    // Quick view as a separate window, drawn after the main window so it
+    // floats on top. Shows the focused pane's current selection.
+    Pane& active = left_focus ? left : right;
+    if (active.quick_view) {
+        render_quick_view(app, active);
+    }
 }
 
 AppPanes* app_panes_init() {
@@ -412,8 +410,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
 
-    // Ctrl+T: toggle quick view for the focused pane
-    if (key == SDLK_T && (mod & SDL_KMOD_CTRL)) {
+    // F3: toggle quick view (Total Commander mapping)
+    if (key == SDLK_F3) {
         active.quick_view = !active.quick_view;
         return;
     }
@@ -434,8 +432,30 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
 
-    // F4: delete marked entries (or current selection)
+    // F4: edit — launch external editor ($EDITOR, vim fallback) on the selection
     if (key == SDLK_F4) {
+        if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
+            FileEntry* e = active.entries[active.selected];
+            if (!is_directory(e->name, e->mode)) {
+                char full[4100];
+                snprintf(full, sizeof(full), "%s/%s", active.current_dir, e->name);
+                const char* editor = getenv("EDITOR");
+                if (!editor || !*editor) editor = "vim";
+                pid_t pid = fork();
+                if (pid == 0) {
+                    // Child: exec the editor. It needs a terminal; from a GUI app
+                    // this spawns detached (no visible TTY), but honors $EDITOR.
+                    execlp("sh", "sh", "-c", editor, full, (char*)nullptr);
+                    _exit(1);
+                }
+                snprintf(app->status_msg, sizeof(app->status_msg), "Edit: %s %s", editor, e->name);
+            }
+        }
+        return;
+    }
+
+    // Shift+Del: delete marked entries (or current selection)
+    if (key == SDLK_DELETE && (mod & SDL_KMOD_SHIFT)) {
         int ok = 0;
         int marks = marked_count(active);
         for (int i = 0; i < active.entry_count; i++) {
