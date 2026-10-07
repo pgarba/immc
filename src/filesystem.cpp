@@ -4,6 +4,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <cstdio>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 FileEntry* file_entry_new(const char* name, mode_t mode, off_t size, time_t mtime) {
     FileEntry* entry = (FileEntry*)calloc(1, sizeof(FileEntry));
@@ -104,4 +107,79 @@ bool is_directory(const char* name, mode_t mode) {
 
 bool is_executable(const char* name, mode_t mode) {
     return (mode & S_IXUSR) != 0;
+}
+
+bool fs_make_dir(const char* path) {
+    return mkdir(path, 0755) == 0;
+}
+
+bool fs_copy_entry(const char* src, const char* dst) {
+    struct stat st;
+    if (stat(src, &st) != 0) return false;
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(dst, st.st_mode & 0777) != 0 && errno != EEXIST) return false;
+        DIR* dir = opendir(src);
+        if (!dir) return false;
+        struct dirent* de;
+        bool ok = true;
+        while ((de = readdir(dir)) != nullptr) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            char s2[4100], d2[4100];
+            snprintf(s2, sizeof(s2), "%s/%s", src, de->d_name);
+            snprintf(d2, sizeof(d2), "%s/%s", dst, de->d_name);
+            if (!fs_copy_entry(s2, d2)) ok = false;
+        }
+        closedir(dir);
+        return ok;
+    }
+
+    // Regular file: read + write, preserve mode and mtime
+    FILE* in = fopen(src, "rb");
+    if (!in) return false;
+    FILE* out = fopen(dst, "wb");
+    if (!out) { fclose(in); return false; }
+
+    char buf[65536];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    }
+    fclose(in);
+    fclose(out);
+    if (!ok) return false;
+
+    chmod(dst, st.st_mode & 0777);
+    struct timespec times[2] = { st.st_mtime, st.st_mtime };
+    utimensat(AT_FDCWD, dst, times, 0);
+    return true;
+}
+
+bool fs_delete_entry(const char* path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR* dir = opendir(path);
+        if (!dir) return false;
+        struct dirent* de;
+        bool ok = true;
+        while ((de = readdir(dir)) != nullptr) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            char p2[4100];
+            snprintf(p2, sizeof(p2), "%s/%s", path, de->d_name);
+            if (!fs_delete_entry(p2)) ok = false;
+        }
+        closedir(dir);
+        if (!ok) return false;
+        return rmdir(path) == 0;
+    }
+    return unlink(path) == 0;
+}
+
+bool fs_move_entry(const char* src, const char* dst) {
+    if (rename(src, dst) == 0) return true;   // same filesystem: fast path
+    if (!fs_copy_entry(src, dst)) return false;
+    return fs_delete_entry(src);
 }

@@ -73,7 +73,7 @@ int main(int, char**)
                     // and end any active text edit (reverts on the next frame).
                     if (ImGui::GetIO().WantTextInput)
                         ImGui::ClearActiveID();
-                    app_panes_handle_key(panes, event.key.key);
+                    app_panes_handle_key(panes, event.key.key, event.key.mod);
                     continue;
                 }
             }
@@ -84,11 +84,18 @@ int main(int, char**)
             // but not while an ImGui text field (e.g. the path bar) is being edited
             if (event.type == SDL_EVENT_KEY_DOWN) {
                 if (ImGui::GetIO().WantTextInput) {
-                    // A text field is active. Only Enter matters: commit the typed path.
-                    if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)
-                        app_panes_commit_path(panes);
+                    // A text field is active. Enter commits the focused field;
+                    // Escape cancels a pending op.
+                    if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                        if (panes->op_input_active)
+                            app_panes_commit_op(panes);
+                        else
+                            app_panes_commit_path(panes);
+                    } else if (event.key.key == SDLK_ESCAPE && panes->op_input_active) {
+                        app_panes_cancel_op(panes);
+                    }
                 } else {
-                    app_panes_handle_key(panes, event.key.key);
+                    app_panes_handle_key(panes, event.key.key, event.key.mod);
                 }
             }
         }

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cstdio>
+#include <cerrno>
 #include <libgen.h>
 #include <float.h>
 
@@ -28,6 +29,22 @@ AppPanes::AppPanes() {
     right.path_edit_active = false;
     left_focus = true;
     active_path_pane = -1;
+    op = OP_NONE;
+    op_name[0] = '\0';
+    op_input_active = false;
+    status_msg[0] = '\0';
+}
+
+static int marked_count(const Pane& p) {
+    int n = 0;
+    for (size_t i = 0; i < p.marked.size(); i++)
+        if (p.marked[i]) n++;
+    return n;
+}
+
+static void toggle_mark(Pane& p, int idx) {
+    if (idx < 0 || idx >= p.entry_count || idx >= (int)p.marked.size()) return;
+    p.marked[idx] = !p.marked[idx];
 }
 
 void refresh_pane(Pane* pane, const char* path) {
@@ -36,6 +53,7 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->current_dir[sizeof(pane->current_dir) - 1] = '\0';
     pane->selected = 0;
     list_directory(path, &pane->entries, &pane->entry_count);
+    pane->marked.assign(pane->entry_count, false);
 }
 
 void app_panes_refresh_left(AppPanes* app) {
@@ -131,7 +149,13 @@ void app_panes_render(AppPanes* app) {
     for (int i = 0; i < left.entry_count; i++) {
         FileEntry* entry = left.entries[i];
         bool selected = left_focus && (i == left.selected);
-        
+        bool is_marked = i < (int)left.marked.size() && left.marked[i];
+
+        // MC-style: marked entries get a green bar (in either pane)
+        if (is_marked) {
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.2f, 0.55f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
         if (is_directory(entry->name, entry->mode)) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 1.0f, 1.0f));
         } else if (is_executable(entry->name, entry->mode)) {
@@ -152,6 +176,7 @@ void app_panes_render(AppPanes* app) {
         if (is_directory(entry->name, entry->mode) || is_executable(entry->name, entry->mode)) {
             ImGui::PopStyleColor();
         }
+        if (is_marked) ImGui::PopStyleColor(2);
     }
     ImGui::PopStyleColor(); // HeaderHovered
     ImGui::EndChild();
@@ -193,7 +218,13 @@ void app_panes_render(AppPanes* app) {
     for (int i = 0; i < right.entry_count; i++) {
         FileEntry* entry = right.entries[i];
         bool selected = !left_focus && (i == right.selected);
-        
+        bool is_marked = i < (int)right.marked.size() && right.marked[i];
+
+        // MC-style: marked entries get a green bar (in either pane)
+        if (is_marked) {
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.2f, 0.55f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
         if (is_directory(entry->name, entry->mode)) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 1.0f, 1.0f));
         } else if (is_executable(entry->name, entry->mode)) {
@@ -214,18 +245,37 @@ void app_panes_render(AppPanes* app) {
         if (is_directory(entry->name, entry->mode) || is_executable(entry->name, entry->mode)) {
             ImGui::PopStyleColor();
         }
+        if (is_marked) ImGui::PopStyleColor(2);
     }
     ImGui::PopStyleColor(); // HeaderHovered
     ImGui::EndChild();
     ImGui::EndTable();
 
-    // Bottom status/command bar (single line, fixed height = reserved space)
+    // Bottom bar: op bar when an op is pending, otherwise the status line.
+    // Single line, fixed height = reserved space.
     ImGui::Separator();
-    char status[4100];
-    snprintf(status, sizeof(status), "Ready - %s pane selected, %d entries",
-             left_focus ? "Left" : "Right",
-             left_focus ? left.entry_count : right.entry_count);
-    ImGui::InputText("command", status, sizeof(status));
+    if (app->op != OP_NONE) {
+        const char* op_label = (app->op == OP_RENAME) ? "Rename" : "New dir";
+        ImGui::TextUnformatted(op_label);
+        ImGui::SameLine();
+        ImGui::SetKeyboardFocusHere(); // grab keyboard when the op bar appears
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##opname", app->op_name, sizeof(app->op_name));
+        app->op_input_active = ImGui::IsItemActive();
+    } else {
+        app->op_input_active = false;
+        char status[4100];
+        int marks = marked_count(left_focus ? left : right);
+        if (app->status_msg[0]) {
+            snprintf(status, sizeof(status), "%s", app->status_msg);
+        } else {
+            snprintf(status, sizeof(status), "Ready - %s pane, %d entries%s",
+                     left_focus ? "Left" : "Right",
+                     left_focus ? left.entry_count : right.entry_count,
+                     marks ? " (marked)" : "");
+        }
+        ImGui::InputText("command", status, sizeof(status));
+    }
 
     ImGui::End();
 }
@@ -262,10 +312,124 @@ void app_panes_free(AppPanes* app) {
     delete app;
 }
 
-void app_panes_handle_key(AppPanes* app, SDL_Keycode key) {
+// Run fs op over marked entries, or just the current selection if none marked.
+// `act` performs the op on one src path; returns count of successes.
+static int run_on_targets(AppPanes* app, Pane& pane, bool (*act)(const char*, const char*), const char* dst_dir, const char* name_override) {
+    int ok = 0;
+    int marks = marked_count(pane);
+    for (int i = 0; i < pane.entry_count; i++) {
+        if (marks == 0 && i != pane.selected) continue;
+        if (marks > 0 && !pane.marked[i]) continue;
+        FileEntry* e = pane.entries[i];
+        if (strcmp(e->name, "..") == 0) continue;
+        char src[4100];
+        snprintf(src, sizeof(src), "%s/%s", pane.current_dir, e->name);
+        const char* nm = name_override ? name_override : e->name;
+        char dst[4100];
+        snprintf(dst, sizeof(dst), "%s/%s", dst_dir, nm);
+        if (act(src, dst)) ok++;
+    }
+    return ok;
+}
+
+void app_panes_commit_op(AppPanes* app) {
+    Pane& pane = app->left_focus ? app->left : app->right;
+    if (app->op == OP_RENAME) {
+        if (pane.selected < pane.entry_count && strcmp(pane.entries[pane.selected]->name, "..") != 0) {
+            FileEntry* e = pane.entries[pane.selected];
+            char src[4100], dst[4100];
+            snprintf(src, sizeof(src), "%s/%s", pane.current_dir, e->name);
+            snprintf(dst, sizeof(dst), "%s/%s", pane.current_dir, app->op_name);
+            if (rename(src, dst) == 0) {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Renamed %s -> %s", e->name, app->op_name);
+            } else {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Rename failed: %s", strerror(errno));
+            }
+            refresh_pane(&pane, pane.current_dir);
+        }
+    } else if (app->op == OP_MKDIR) {
+        char dst[4100];
+        snprintf(dst, sizeof(dst), "%s/%s", pane.current_dir, app->op_name);
+        if (fs_make_dir(dst)) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Created dir %s", app->op_name);
+            refresh_pane(&pane, pane.current_dir);
+        } else {
+            snprintf(app->status_msg, sizeof(app->status_msg), "mkdir failed: %s", strerror(errno));
+        }
+    }
+    app->op = OP_NONE;
+    app->op_name[0] = '\0';
+    app->op_input_active = false;
+}
+
+void app_panes_cancel_op(AppPanes* app) {
+    app->op = OP_NONE;
+    app->op_name[0] = '\0';
+    app->op_input_active = false;
+}
+
+void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // Handle keyboard input
     Pane& active = app->left_focus ? app->left : app->right;
-    
+    Pane& other = app->left_focus ? app->right : app->left;
+
+    // Ctrl+Space: toggle mark on the current entry (MC-style multi-select)
+    if (key == SDLK_SPACE && (mod & SDL_KMOD_CTRL)) {
+        toggle_mark(active, active.selected);
+        return;
+    }
+
+    // F2: rename (op bar with name prefilled)
+    if (key == SDLK_F2) {
+        if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
+            app->op = OP_RENAME;
+            snprintf(app->op_name, sizeof(app->op_name), "%s", active.entries[active.selected]->name);
+        }
+        return;
+    }
+
+    // F7: mkdir (op bar with empty name)
+    if (key == SDLK_F7) {
+        app->op = OP_MKDIR;
+        app->op_name[0] = '\0';
+        return;
+    }
+
+    // F4: delete marked entries (or current selection)
+    if (key == SDLK_F4) {
+        int ok = 0;
+        int marks = marked_count(active);
+        for (int i = 0; i < active.entry_count; i++) {
+            if (marks == 0 && i != active.selected) continue;
+            if (marks > 0 && !active.marked[i]) continue;
+            FileEntry* e = active.entries[i];
+            if (strcmp(e->name, "..") == 0) continue;
+            char src[4100];
+            snprintf(src, sizeof(src), "%s/%s", active.current_dir, e->name);
+            if (fs_delete_entry(src)) ok++;
+        }
+        snprintf(app->status_msg, sizeof(app->status_msg), ok ? "Deleted %d entries" : "Delete failed: %s", ok, strerror(errno));
+        refresh_pane(&active, active.current_dir);
+        return;
+    }
+
+    // F5: copy marked entries (or current selection) to the other pane
+    if (key == SDLK_F5) {
+        int ok = run_on_targets(app, active, fs_copy_entry, other.current_dir, nullptr);
+        snprintf(app->status_msg, sizeof(app->status_msg), ok ? "Copied %d entries to %s" : "Copy failed: %s", ok, other.current_dir, strerror(errno));
+        refresh_pane(&other, other.current_dir);
+        return;
+    }
+
+    // F6: move marked entries (or current selection) to the other pane
+    if (key == SDLK_F6) {
+        int ok = run_on_targets(app, active, fs_move_entry, other.current_dir, nullptr);
+        snprintf(app->status_msg, sizeof(app->status_msg), ok ? "Moved %d entries to %s" : "Move failed: %s", ok, other.current_dir, strerror(errno));
+        refresh_pane(&active, active.current_dir);
+        refresh_pane(&other, other.current_dir);
+        return;
+    }
+
     switch (key) {
         case SDLK_UP:
             if (active.selected > 0) {

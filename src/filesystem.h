@@ -30,4 +30,10 @@ bool is_directory(const char* name, mode_t mode);
 // Check if entry is executable
 bool is_executable(const char* name, mode_t mode);
 
+// File operations (return true on success)
+bool fs_copy_entry(const char* src, const char* dst);   // recursive for directories
+bool fs_delete_entry(const char* path);                 // recursive for directories
+bool fs_move_entry(const char* src, const char* dst);   // rename, fallback copy+delete
+bool fs_make_dir(const char* path);
+
 #endif // FILESYSTEM_H
