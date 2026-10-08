@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -150,6 +151,53 @@ bool is_executable(const char* name, mode_t mode) {
 
 bool fs_make_dir(const char* path) {
     return mkdir(path, 0755) == 0;
+}
+
+// Shift+F4: an empty file. O_EXCL so an existing name is never truncated.
+bool fs_touch(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+}
+
+// Shift+Ctrl+F5: a link in another directory. `src` is expected absolute.
+bool fs_symlink(const char* src, const char* dst) {
+    return symlink(src, dst) == 0;
+}
+
+// Run a helper as: prog [sub] path. True only if it exited 0.
+static bool run_helper(const char* prog, const char* sub, const char* path) {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        if (sub) execlp(prog, prog, sub, path, (char*)nullptr);
+        else     execlp(prog, prog, path, (char*)nullptr);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// TC splits delete into "direkt" and "Papierkorb". The trash half is handed to
+// a desktop helper; when neither is installed the caller deletes directly.
+bool fs_trash(const char* path) {
+    if (run_helper("gio", "trash", path)) return true;
+    if (run_helper("trash-put", nullptr, path)) return true;
+    return false;
+}
+
+// Probed once per run: the confirm dialog has to say "move to trash" or
+// "delete" before anything is touched.
+bool fs_trash_available(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = system("command -v gio >/dev/null 2>&1 || "
+                        "command -v trash-put >/dev/null 2>&1") == 0 ? 1 : 0;
+    return cached == 1;
 }
 
 // Copy with an optional progress context: totals are computed up-front by the

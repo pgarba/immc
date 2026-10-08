@@ -46,6 +46,10 @@ bool fs_delete_entry(const char* path);                 // recursive for directo
 bool fs_move_entry(const char* src, const char* dst);   // rename, fallback copy+delete
 bool fs_make_dir(const char* path);
 bool fs_exists(const char* path);
+bool fs_touch(const char* path);                  // create an empty file, fails if it exists
+bool fs_symlink(const char* src, const char* dst); // link at dst pointing at src
+bool fs_trash(const char* path);                  // hand the file to a desktop trash helper
+bool fs_trash_available(void);                    // is such a helper installed at all?
 
 // One entry of a recursive (TC branch view) listing. `rel` is the path relative
 // to the root that was walked, with '/' separators.

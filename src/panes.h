@@ -82,7 +82,8 @@ struct Pane {
 enum AppOp {
     OP_NONE = 0,
     OP_RENAME,   // op_name = new name for the target entry
-    OP_MKDIR     // op_name = new directory name
+    OP_MKDIR,    // op_name = new directory name
+    OP_NEWFILE   // op_name = name of an empty file to create
 };
 
 // Pending confirmation dialog (Y/N)
@@ -194,6 +195,8 @@ public:
     bool entry_menu_open;     // Shift+F10: context menu at the cursor row
     bool ctx_menu_alive;      // the context popup is open this frame
     bool compare_on;          // Shift+F2: color rows against the other pane
+    int  trash_mode;          // config: Del/F8 goes to the trash
+    int  delete_trash;        // set by the delete prompt: this delete goes to trash
     bool quick_view_pane;     // Ctrl+Q: the inactive pane previews the cursor file
     bool tree_open;           // Alt+F10 / Ctrl+F8: directory tree window
     int  tree_target;         // pane index the tree navigates

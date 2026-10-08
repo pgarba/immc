@@ -34,6 +34,7 @@ void mc_config_default(MCConfig* c) {
     c->view_mode = 0;      // VIEW_MID
     c->sort_mode = 0;      // FS_SORT_NAME
     c->show_hidden = 0;
+    c->trash = 1;          // Del/F8 goes to the trash when a helper exists
     c->left_tab_count = 0;  c->left_tab_active = 0;
     c->right_tab_count = 0; c->right_tab_active = 0;
     for (int i = 0; i < MC_MAX_TABS; i++) {
@@ -76,6 +77,7 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "view_mode"))   c->view_mode = atoi(val);
         else if (!strcmp(key, "sort_mode"))   c->sort_mode = atoi(val);
         else if (!strcmp(key, "show_hidden")) c->show_hidden = atoi(val);
+        else if (!strcmp(key, "trash"))       c->trash = atoi(val);
         else if (!strcmp(key, "left_tab_active"))  c->left_tab_active = atoi(val);
         else if (!strcmp(key, "right_tab_active")) c->right_tab_active = atoi(val);
         else {
@@ -109,6 +111,7 @@ void mc_config_load(MCConfig* c) {
     if (c->view_mode < 0 || c->view_mode > 2) c->view_mode = 0;
     if (c->sort_mode < 0 || c->sort_mode > 4) c->sort_mode = 0;
     c->show_hidden = c->show_hidden ? 1 : 0;
+    c->trash = c->trash ? 1 : 0;
 }
 
 void mc_config_save(const MCConfig* c) {
@@ -143,12 +146,14 @@ void mc_config_save(const MCConfig* c) {
         "\n"
         "# Listing, restored at startup: view_mode 0=mid 1=brief 2=full,\n"
         "# sort_mode 0=name 1=ext 2=size 3=date 4=unsorted, show_hidden 1=dotfiles\n"
+        "# trash 1 = Del/F8 goes to the desktop trash (Shift+Del is always direct)\n"
         "view_mode = %d\n"
         "sort_mode = %d\n"
-        "show_hidden = %d\n",
+        "show_hidden = %d\n"
+        "trash = %d\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
         c->font, (double)c->font_size, c->theme,
-        c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden);
+        c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->trash);
 
     fprintf(f,
         "\n# Pane tabs restored at startup (written on exit)\n"

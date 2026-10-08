@@ -20,6 +20,7 @@ struct MCConfig {
     int   view_mode;      // 0 = mid, 1 = brief, 2 = full (AppView in panes.h)
     int   sort_mode;      // FsSortMode in filesystem.h
     int   show_hidden;    // 1 = list dotfiles
+    int   trash;          // 1 = Del/F8 goes to the trash, Shift always direct
 
     // Pane tabs (left/right), saved on exit and restored at startup.
     // count = 0 means "use the app defaults".

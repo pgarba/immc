@@ -29,8 +29,8 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | C quick filter | done | `Ctrl+S` live filter over a `view` row map, `Ctrl+F11` executables only, `Ctrl+F12` preset |
 | D navigation & panes | done | `Ctrl+←/→`, `Ctrl+↑`, `Ctrl+Shift+↓/T/W`, `Ctrl+,`, `Alt+F11/F12`, `Alt+↓`, `Alt+F8`, `Alt+F1/F2` |
 | E views & dialogs | done | `Shift+F10`/`Menu` context menu, `Alt+F3` default app, `Ctrl+F1/F2` short/long, `Shift+F2` compare, `Ctrl+Q` quick view pane, `Alt+F10`/`Ctrl+F8` tree, `Ctrl+B` branch view |
-| F file operations | not started | |
-| G delete to trash | not started | |
+| F file operations | done | `Shift+F4` new file + editor, `Shift+F5` copy in place, `Shift+F6` rename in place, `Shift+Ctrl+F5` link in other pane, `Ctrl+L` count marked, `Alt+Shift+Enter` dir sizes |
+| G delete to trash | done | `trash` in config (default on), `Del`/`F8` via `gio trash`/`trash-put`, `Shift+Del`/`Shift+F8` direct, prompt says which |
 | H big items | not started | |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden` and `filter_preset`.

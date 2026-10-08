@@ -95,6 +95,8 @@ AppPanes::AppPanes() {
     pane_menu_open = false; pane_menu_alive = false;
     entry_menu_open = false; ctx_menu_alive = false;
     compare_on = false;
+    trash_mode = 1;
+    delete_trash = 0;
     tree_open = false;
     tree_target = 0;
     quick_view_pane = false;
@@ -808,6 +810,7 @@ static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move);
 
 static void do_delete(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    bool to_trash = app->delete_trash != 0;
     prog_begin(app, active, active, false);
     app->prog_is_delete = true;
     int ok = 0;
@@ -819,25 +822,39 @@ static void do_delete(AppPanes* app) {
         if (strcmp(e->name, "..") == 0) continue;
         char src[4100];
         snprintf(src, sizeof(src), "%s/%s", active.current_dir, entry_rel(active, i));
-        if (fs_delete_entry_progress(src, copy_progress_cb, app)) ok++;
+        bool removed;
+        if (to_trash) {
+            // A trash helper is a rename, so it has no per-file progress to pump.
+            removed = fs_trash(src) || fs_delete_entry_progress(src, copy_progress_cb, app);
+        } else {
+            removed = fs_delete_entry_progress(src, copy_progress_cb, app);
+        }
+        if (removed) ok++;
         if (app->quit_request) break;
     }
     app->prog_active = false;
-    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Deleted %d entries", ok);
+    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), to_trash ? "Trashed %d entries" : "Deleted %d entries", ok);
     else    snprintf(app->status_msg, sizeof(app->status_msg), "Delete failed: %s", strerror(errno));
     refresh_pane(&active, active.current_dir);
 }
 
-static void request_delete(AppPanes* app) {
+static void request_delete(AppPanes* app, bool force_direct) {
     Pane& active = app->left_focus ? app->left : app->right;
     int n = count_targets(app, active);
     if (n == 0) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to delete");
         return;
     }
+    // TC splits "direkt" and "Papierkorb": Shift always deletes for good, and
+    // the prompt has to say which one is about to happen.
+    app->delete_trash = (app->trash_mode && !force_direct && fs_trash_available()) ? 1 : 0;
     app->confirm = CONF_DELETE;
-    snprintf(app->confirm_text, sizeof(app->confirm_text),
-             "Delete %d entrie%s in %s ?", n, n == 1 ? "y" : "s", active.current_dir);
+    if (app->delete_trash)
+        snprintf(app->confirm_text, sizeof(app->confirm_text),
+                 "Move %d entrie%s to the trash ?", n, n == 1 ? "y" : "s");
+    else
+        snprintf(app->confirm_text, sizeof(app->confirm_text),
+                 "Delete %d entrie%s in %s ?", n, n == 1 ? "y" : "s", active.current_dir);
 }
 
 void app_panes_set_sdl_window(AppPanes* app, void* window) {
@@ -1503,7 +1520,9 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     if (ImGui::MenuItem("Move to other pane")) app->pending_op = 2;
     if (ImGui::MenuItem("Paste here", "Ctrl+V")) app->pending_op = 3;
     ImGui::Separator();
-    if (ImGui::MenuItem("Delete")) request_delete(app);
+    if (ImGui::MenuItem("Delete")) request_delete(app, false);
+    if (ImGui::MenuItem(app->trash_mode ? "Deletes go to trash" : "Deletes are always direct"))
+        app->trash_mode = app->trash_mode ? 0 : 1;
 }
 
 static void render_tab_bar(AppPanes* app, Pane& pane) {
@@ -2148,7 +2167,7 @@ static void render_about(AppPanes* app) {
         "TOTAL COMMANDER KEYS\n"
         "F1 help            F9 pane menu     F10 app menu    Alt+F4 quit\n"
         "F3 view            F4 edit          F5 copy         F6 move/rename\n"
-        "F7 new folder      F8 / Del delete  Shift+F8 delete (no trash)\n"
+        "F7 new folder      F8 / Del to the trash   Shift+F8 / Shift+Del direct delete\n"
         "Ins / Space        mark             Num+ / Num- extend / shrink\n"
         "Num* invert        Num/ restore     Ctrl+Num+ all   Ctrl+Num- none\n"
         "Alt+Num+/- mark or unmark the same extension\n"
@@ -2168,7 +2187,13 @@ static void render_about(AppPanes* app) {
         "Alt+Enter properties               Ctrl+R refresh     Ctrl+O view mode\n"
         "Alt+. hidden files Alt+D add to hotlist  Shift+F9 hotlist  Alt+F7 search\n"
         "Ctrl+S quick filter  Ctrl+Shift+S re-apply  Ctrl+F10 clear filter\n"
-        "Ctrl+F11 executables only  Ctrl+F12 filter preset from the config\n\n"
+        "Ctrl+F11 executables only  Ctrl+F12 filter preset from the config\n"
+        "Shift+F10 / Menu local menu   Shift+Esc minimize window   F1 hides this help\n"
+        "Ctrl+F1/F2 short / long view  Shift+F2 compare panes  Ctrl+Q quick view panel\n"
+        "Alt+F10 or Ctrl+F8 dir tree   Ctrl+B branch view (Ctrl+Shift+B marked only)\n"
+        "Alt+F3 open with the default application\n"
+        "Shift+F4 new file and edit    Shift+F5 copy in place  Shift+F6 rename in place\n"
+        "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
         "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
     if (!open) app->about_open = false;
@@ -2224,6 +2249,12 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
 
 // Commands menu items. Shared by the menu bar and the F10 keyboard menu so the
 // two can never drift apart.
+// Defined further down with the keyboard handlers; the menu offers them too.
+static void do_copy_in_place(AppPanes* app);
+static void do_symlink_other(AppPanes* app);
+static void count_marked_sizes(AppPanes* app);
+static void fill_dir_sizes(AppPanes* app);
+
 static void render_commands_items(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other  = app->left_focus ? app->right : app->left;
@@ -2260,6 +2291,11 @@ static void render_commands_items(AppPanes* app) {
         if (app->tree_open) app->tree_open = false; else tree_open(app, active);
     }
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
+    if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
+    if (ImGui::MenuItem("Copy in place", "Shift+F5")) do_copy_in_place(app);
+    if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) do_symlink_other(app);
+    if (ImGui::MenuItem("Count marked", "Ctrl+L")) count_marked_sizes(app);
+    if (ImGui::MenuItem("Fill directory sizes", "Alt+Shift+Enter")) fill_dir_sizes(app);
     if (ImGui::MenuItem("Add to hotlist", "Alt+D")) {
         bool dup = false;
         for (const std::string& s : app->hotlist) if (s == active.current_dir) { dup = true; break; }
@@ -2459,7 +2495,9 @@ void app_panes_render(AppPanes* app) {
     ImGui::SetCursorPosY(win_h - bar_h);
     ImGui::Separator();
     if (app->op != OP_NONE) {
-        const char* label = app->op == OP_RENAME ? "Rename to:" : "New directory name:";
+        const char* label = app->op == OP_RENAME ? "Rename to:"
+                          : app->op == OP_NEWFILE ? "New file name:"
+                          : "New directory name:";
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
         ImGui::SetKeyboardFocusHere(-1);
@@ -2550,6 +2588,7 @@ AppPanes* app_panes_init() {
 void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->view_mode = app->view_mode;
     cfg->show_hidden = app->show_hidden ? 1 : 0;
+    cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
     Pane* src[2] = { &app->left, &app->right };
@@ -2572,6 +2611,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     struct stat st;
     if (cfg->view_mode >= 0 && cfg->view_mode <= 2) app->view_mode = cfg->view_mode;
     app->show_hidden = cfg->show_hidden != 0;
+    app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
@@ -2636,6 +2676,17 @@ void app_panes_commit_op(AppPanes* app) {
         } else {
             snprintf(app->status_msg, sizeof(app->status_msg), "mkdir failed: %s", strerror(errno));
         }
+    } else if (app->op == OP_NEWFILE) {
+        char path[4100];
+        snprintf(path, sizeof(path), "%s/%s", active.current_dir, app->op_name);
+        if (fs_touch(path)) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Created %s", path);
+            refresh_pane(&active, active.current_dir);
+            spawn_terminal_editor(app, path);
+        } else {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Cannot create %s: %s",
+                     path, strerror(errno));
+        }
     } else if (app->op == OP_RENAME) {
         char dst_dir[4096];
         snprintf(dst_dir, sizeof(dst_dir), "%s", active.current_dir);
@@ -2652,6 +2703,92 @@ void app_panes_cancel_op(AppPanes* app) {
     app->op = OP_NONE;
     app->op_name[0] = '\0';
     app->op_input_active = false;
+}
+
+// TC Shift+F5: copy the targets alongside themselves in the same directory.
+// The copy lands in a free ".copy" / ".copy.1" / ".copy.2" slot.
+static void unique_copy_name(const char* dir, const char* base, char* out, size_t cap) {
+    for (int n = 0; n < 1000; n++) {
+        if (n == 0) snprintf(out, cap, "%s/%s.copy", dir, base);
+        else        snprintf(out, cap, "%s/%s.copy.%d", dir, base, n);
+        if (!fs_exists(out)) return;
+    }
+    snprintf(out, cap, "%s/%s.copy", dir, base);
+}
+
+static void do_copy_in_place(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    StringList srcs = target_paths(active);
+    if (srcs.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
+        return;
+    }
+    int ok = 0;
+    for (const std::string& s : srcs) {
+        char dst[4100];
+        unique_copy_name(active.current_dir, path_basename(s), dst, sizeof(dst));
+        if (fs_copy_entry(s.c_str(), dst)) ok++;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%d of %d copied in place",
+             ok, (int)srcs.size());
+    refresh_pane(&active, active.current_dir);
+}
+
+// TC Shift+Ctrl+F5: a link to each target inside the other pane. The link body
+// is absolute, so it stays valid wherever the other pane is showing.
+static void do_symlink_other(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    StringList srcs = target_paths(active);
+    if (srcs.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to link");
+        return;
+    }
+    int ok = 0;
+    for (const std::string& s : srcs) {
+        char dst[4100];
+        snprintf(dst, sizeof(dst), "%s/%s", other.current_dir, path_basename(s));
+        if (fs_symlink(s.c_str(), dst)) ok++;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%d link(s) in %s", ok, other.current_dir);
+    refresh_pane(&other, other.current_dir);
+}
+
+// TC Ctrl+L: sum up the marked entries (the cursor entry when nothing is marked).
+static void count_marked_sizes(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    StringList t = target_paths(active);
+    if (t.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to count");
+        return;
+    }
+    long long bytes = 0; long files = 0, dirs = 0;
+    for (const std::string& p : t) {
+        long long b = 0; long f = 0, d = 0;
+        fs_count_tree(p.c_str(), &b, &f, &d);
+        bytes += b; files += f; dirs += d;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             "Counted %d: %lld bytes, %ld files, %ld dirs", (int)t.size(), bytes, files, dirs);
+}
+
+// TC Alt+Shift+Enter: fill the size column for the directories on screen.
+// Bounded per press so a huge tree cannot lock the UI; press again to continue.
+static const int DIRSIZE_PER_PRESS = 200;
+
+static void fill_dir_sizes(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    int done = 0, left = 0;
+    for (int r = 0; r < (int)active.view.size(); r++) {
+        int i = active.view[r];
+        FileEntry* e = active.entries[i];
+        if (!is_directory(e->name, e->mode) || strcmp(e->name, "..") == 0) continue;
+        if (i < (int)active.dir_size.size() && active.dir_size[i] >= 0) continue;
+        if (done < DIRSIZE_PER_PRESS) { compute_dir_size(active, i); done++; }
+        else left++;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "Dir sizes: %d filled%s", done,
+             left ? ", press again for the next batch" : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -2995,6 +3132,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // TC Ctrl+B: branch view of the whole subtree; Ctrl+Shift+B branches only
     // the marked directories. Pressing either again leaves branch view.
     if (key == SDLK_B && (mod & SDL_KMOD_CTRL)) { branch_toggle(app, active, shift); return; }
+    // TC Ctrl+L: sum up the marked entries.
+    if (key == SDLK_L && (mod & SDL_KMOD_CTRL)) { count_marked_sizes(app); return; }
 
     // ---- marking ----
     if (key == SDLK_SPACE && (mod & SDL_KMOD_CTRL)) { toggle_mark(active, active.selected); return; }
@@ -3066,7 +3205,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (key == SDLK_F3) { active.quick_view = !active.quick_view; return; }
-    if (key == SDLK_DELETE) { request_delete(app); return; }
+    if (key == SDLK_DELETE) { request_delete(app, shift); return; }
 
     // TC Shift+F2: mark the differences between the two panes.
     if (key == SDLK_F2 && shift) {
@@ -3097,6 +3236,13 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         app->op_name[0] = '\0';
         return;
     }
+    // TC Shift+F4: create an empty file and open it in the editor.
+    if (key == SDLK_F4 && shift) {
+        if (branch_blocked(app, active)) return;
+        app->op = OP_NEWFILE;
+        app->op_name[0] = '\0';
+        return;
+    }
     if (key == SDLK_F4) {
         if (active.selected < active.entry_count) {
             FileEntry* e = active.entries[active.selected];
@@ -3110,11 +3256,24 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
     // TC "F8, Del": plain Del deletes; Shift+Del / Shift+F8 skip the trash
     // (wired up in the trash phase, both confirm first today).
-    if (key == SDLK_F8 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { request_delete(app); return; }
+    if (key == SDLK_F8 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { request_delete(app, shift); return; }
     // Ctrl+F8: the directory tree, like Alt+F10.
     if (key == SDLK_F8 && (mod & SDL_KMOD_CTRL)) {
         if (app->tree_open) app->tree_open = false;
         else tree_open(app, active);
+        return;
+    }
+    // TC Shift+Ctrl+F5: link the targets into the other pane.
+    if (key == SDLK_F5 && shift && (mod & SDL_KMOD_CTRL)) { do_symlink_other(app); return; }
+    // TC Shift+F5: copy the targets alongside themselves.
+    if (key == SDLK_F5 && shift) { do_copy_in_place(app); return; }
+    // TC Shift+F6: move/rename inside the current directory = the rename prompt.
+    if (key == SDLK_F6 && shift) {
+        if (branch_blocked(app, active)) return;
+        if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
+            app->op = OP_RENAME;
+            snprintf(app->op_name, sizeof(app->op_name), "%s", active.entries[active.selected]->name);
+        }
         return;
     }
     if (key == SDLK_F5) { do_copy(app); return; }
@@ -3180,6 +3339,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         snprintf(parentbuf, sizeof(parentbuf), "%s", active.current_dir);
         char* parent = dirname(parentbuf);
         navigate_to(app, &active, parent);
+        return;
+    }
+    // TC Alt+Shift+Enter: compute the size of every directory on screen.
+    if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) && (mod & SDL_KMOD_ALT) && shift) {
+        fill_dir_sizes(app);
         return;
     }
     if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) && (mod & SDL_KMOD_ALT)) {

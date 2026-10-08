@@ -300,6 +300,44 @@ static void test_fs_list_tree() {
     fs_set_show_hidden(false);
 }
 
+// Phase F primitives: fs_touch never clobbers, fs_symlink stores an absolute
+// body, and the in-place copy picks a free ".copy" slot.
+static void test_fs_helpers(const std::string& root) {
+    CHECK(fs_touch((root + "/fresh.txt").c_str()));
+    CHECK(fs_exists((root + "/fresh.txt").c_str()));
+    CHECK(!fs_touch((root + "/fresh.txt").c_str()));   // O_EXCL: never truncates
+
+    CHECK(fs_symlink((root + "/alpha.txt").c_str(), (root + "/link.txt").c_str()));
+    CHECK(fs_exists((root + "/link.txt").c_str()));
+    char buf[512];
+    ssize_t n = readlink((root + "/link.txt").c_str(), buf, sizeof(buf) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        buf[n] = '\0';
+        CHECK(strcmp(buf, (root + "/alpha.txt").c_str()) == 0);
+    }
+}
+
+static void test_unique_copy_name(const std::string& root) {
+    char out[4100];
+    unique_copy_name(root.c_str(), "alpha.txt", out, sizeof(out));
+    CHECK(strcmp(out, (root + "/alpha.txt.copy").c_str()) == 0);
+    CHECK(fs_touch((root + "/alpha.txt.copy").c_str()));
+    unique_copy_name(root.c_str(), "alpha.txt", out, sizeof(out));
+    CHECK(strcmp(out, (root + "/alpha.txt.copy.1").c_str()) == 0);
+    CHECK(fs_touch((root + "/alpha.txt.copy.1").c_str()));
+    unique_copy_name(root.c_str(), "alpha.txt", out, sizeof(out));
+    CHECK(strcmp(out, (root + "/alpha.txt.copy.2").c_str()) == 0);
+}
+
+// The trash half of TC's delete split. Availability is probed once and cached;
+// a path no helper can resolve must fail rather than fall through silently.
+static void test_trash_helpers(void) {
+    bool a = fs_trash_available();
+    CHECK(a == fs_trash_available());
+    CHECK(!fs_trash("/mc-clone-does-not-exist-xyzzy"));
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -346,6 +384,9 @@ int main() {
     test_tabs(p, root.c_str());
     test_branch_view(&app, p);
     test_fs_list_tree();
+    test_fs_helpers(root);
+    test_unique_copy_name(root);
+    test_trash_helpers();
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);
