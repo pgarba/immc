@@ -27,6 +27,15 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp)
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp)
 target_link_libraries(mc-clone PRIVATE imgui)
 target_include_directories(mc-clone PRIVATE src)
+
+# Logic tests. tests/test_panes.cpp includes src/panes.cpp so the file-static
+# helpers (quick filter, row->entry view map, marking, clipboard paths) can be
+# checked without a display.
+enable_testing()
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp)
+target_link_libraries(test-panes PRIVATE imgui)
+target_include_directories(test-panes PRIVATE src)
+add_test(NAME panes COMMAND test-panes)

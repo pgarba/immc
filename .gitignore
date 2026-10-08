@@ -1,2 +1,3 @@
 build/
 extern_dont_commit/
+compile_commands.json
