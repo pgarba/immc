@@ -338,6 +338,78 @@ static void test_trash_helpers(void) {
     CHECK(!fs_trash("/mc-clone-does-not-exist-xyzzy"));
 }
 
+// TC quick search: prefix match from the cursor forward, wrapping, extending
+// the word, and respecting the filtered view. A miss leaves the cursor alone.
+static void test_quick_search(AppPanes* app, Pane& p) {
+    p.quick_active = false; p.quick[0] = '\0';
+    p.selected = idx_of(p, "alpha.txt");
+    quick_search(app, p, 'b');
+    CHECK(p.quick_active);
+    CHECK(strcmp(p.quick, "b") == 0);
+    CHECK(strcmp(entry_rel(p, p.selected), "beta.txt") == 0);
+
+    quick_search(app, p, 'x');                 // "bx": no match, cursor stays
+    CHECK(strcmp(p.quick, "bx") == 0);
+    CHECK(strcmp(entry_rel(p, p.selected), "beta.txt") == 0);
+
+    p.quick_active = false; p.quick[0] = '\0';
+    p.selected = idx_of(p, "beta.txt");
+    quick_search(app, p, 'a');                 // wraps past the end back to alpha
+    CHECK(strcmp(entry_rel(p, p.selected), "alpha.txt") == 0);
+
+    p.quick_active = false; p.quick[0] = '\0';
+    p.selected = idx_of(p, "alpha.txt");
+    snprintf(p.filter, sizeof(p.filter), "sub");
+    rebuild_view(p);
+    quick_search(app, p, 's');                 // only visible rows are searched
+    CHECK(strcmp(entry_rel(p, p.selected), "sub") == 0);
+    quick_search(app, p, 'u');                 // "su" extends the word
+    CHECK(strcmp(entry_rel(p, p.selected), "sub") == 0);
+    p.filter[0] = '\0';
+    rebuild_view(p);
+    p.quick_active = false; p.quick[0] = '\0';
+}
+
+// Shift+F1 column set: parsing tolerates case and padding, unknown keys are
+// dropped, and the render cache must notice a rewritten spec.
+static void test_columns(AppPanes* app) {
+    bool on[COL_N];
+    columns_parse("name,size,date,perms", on);
+    CHECK(on[COL_NAME] && on[COL_SIZE] && on[COL_DATE] && on[COL_PERMS]);
+    CHECK(!on[COL_EXT] && !on[COL_TYPE]);
+
+    columns_parse("name, ext , TYPE", on);
+    CHECK(on[COL_EXT] && on[COL_TYPE] && !on[COL_SIZE]);
+
+    columns_parse("name,name,bogus", on);
+    CHECK(on[COL_NAME]);
+    CHECK(!on[COL_EXT] && !on[COL_SIZE] && !on[COL_DATE] && !on[COL_PERMS] && !on[COL_TYPE]);
+
+    for (int c = 0; c < COL_N; c++) on[c] = (c == COL_NAME || c == COL_EXT || c == COL_TYPE);
+    columns_write(app, on);
+    CHECK(strcmp(app->columns, "name,ext,type") == 0);
+    columns_spec(app, on);
+    CHECK(on[COL_EXT] && on[COL_TYPE] && !on[COL_SIZE]);
+
+    CHECK(strcmp(col_ext("archive.tar.gz"), "gz") == 0);
+    CHECK(strcmp(col_ext("Makefile"), "") == 0);
+    CHECK(strcmp(col_ext(".hidden"), "") == 0);      // no extension on dotfiles
+    CHECK(strcmp(col_ext("README."), "") == 0);
+
+    FileEntry fe;
+    memset(&fe, 0, sizeof(fe));
+    fe.mode = S_IFDIR | 0755;
+    CHECK(strcmp(col_type(&fe, true, false), "DIR") == 0);
+    fe.mode = S_IFLNK | 0777;
+    CHECK(strcmp(col_type(&fe, false, false), "LNK") == 0);
+    fe.mode = S_IFREG | 0755;
+    CHECK(strcmp(col_type(&fe, false, true), "EXE") == 0);
+    fe.mode = S_IFREG | 0644;
+    CHECK(strcmp(col_type(&fe, false, false), "FILE") == 0);
+
+    snprintf(app->columns, sizeof(app->columns), "name,size,date,perms");
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -387,6 +459,8 @@ int main() {
     test_fs_helpers(root);
     test_unique_copy_name(root);
     test_trash_helpers();
+    test_quick_search(&app, p);
+    test_columns(&app);
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);

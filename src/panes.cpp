@@ -9,6 +9,7 @@
 #include <imgui_impl_opengl3.h>
 #include <SDL3/SDL_opengl.h>
 #include <string.h>
+#include <strings.h>   // strncasecmp: quick search prefix match
 #include <ctype.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -58,9 +59,11 @@ AppPanes::AppPanes() {
     left.filter[0] = '\0'; left.last_filter[0] = '\0'; left.filter_applied[0] = '\0';
     left.filter_active = false; left.filter_field_active = false; left.filter_focus_request = false;
     left.filter_exec_only = false;
+    left.quick[0] = '\0'; left.quick_active = false;
     right.filter[0] = '\0'; right.last_filter[0] = '\0'; right.filter_applied[0] = '\0';
     right.filter_active = false; right.filter_field_active = false; right.filter_focus_request = false;
     right.filter_exec_only = false;
+    right.quick[0] = '\0'; right.quick_active = false;
     left_focus = true;
     active_path_pane = -1;
     op = OP_NONE;
@@ -95,6 +98,8 @@ AppPanes::AppPanes() {
     pane_menu_open = false; pane_menu_alive = false;
     entry_menu_open = false; ctx_menu_alive = false;
     compare_on = false;
+    columns_open = false;
+    snprintf(columns, sizeof(columns), "name,size,date,perms");
     trash_mode = 1;
     delete_trash = 0;
     tree_open = false;
@@ -1603,6 +1608,87 @@ static void render_quick_view_panel(AppPanes* app, float w, float h, const char*
     ImGui::EndChild();
 }
 
+// Shift+F1: the long view's column set is user-defined. The spec is a
+// comma-separated list; "name" is always present and always first.
+enum FileCol { COL_NAME, COL_EXT, COL_SIZE, COL_DATE, COL_PERMS, COL_TYPE, COL_N };
+static const char* k_col_key[COL_N]   = { "name", "ext", "size", "date", "perms", "type" };
+static const char* k_col_label[COL_N] = { "Name", "Ext", "Size", "Date", "Perms", "Type" };
+static const float k_col_width[COL_N] = { 0.0f, 70.0f, 75.0f, 100.0f, 80.0f, 55.0f };
+
+static void columns_parse(const char* spec, bool* on) {
+    for (int c = 0; c < COL_N; c++) on[c] = false;
+    on[COL_NAME] = true;
+    const char* p = spec;
+    while (p && *p) {
+        const char* comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        while (len && (*p == ' ' || *p == '\t')) { p++; len--; }
+        while (len && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+        for (int c = 1; c < COL_N; c++)
+            if (len == strlen(k_col_key[c]) && !strncasecmp(p, k_col_key[c], len)) on[c] = true;
+        p = comma ? comma + 1 : NULL;
+    }
+}
+
+// Parsed once per spec change: render_file_list asks for this on every row.
+static void columns_spec(const AppPanes* app, bool* on) {
+    static char cached[256] = "";
+    static bool cached_on[COL_N];
+    if (strcmp(cached, app->columns) != 0) {
+        columns_parse(app->columns, cached_on);
+        snprintf(cached, sizeof(cached), "%s", app->columns);
+    }
+    for (int c = 0; c < COL_N; c++) on[c] = cached_on[c];
+}
+
+static void columns_write(AppPanes* app, const bool* on) {
+    char out[256];
+    size_t n = (size_t)snprintf(out, sizeof(out), "name");
+    for (int c = 1; c < COL_N && n + 16 < sizeof(out); c++)
+        if (on[c]) n += (size_t)snprintf(out + n, sizeof(out) - n, ",%s", k_col_key[c]);
+    snprintf(app->columns, sizeof(app->columns), "%s", out);
+}
+
+static const char* col_ext(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return (dot && dot != name && dot[1]) ? dot + 1 : "";
+}
+
+static const char* col_type(FileEntry* e, bool is_dir, bool is_exec) {
+    if (is_dir) return "DIR";
+    if (S_ISLNK(e->mode)) return "LNK";
+    if (is_exec) return "EXE";
+    return "FILE";
+}
+
+static void render_columns_dialog(AppPanes* app) {
+    if (!app->columns_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(300, 260), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 150, io.DisplaySize.y * 0.5f - 130), ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Define columns", &open, ImGuiWindowFlags_NoCollapse);
+    ImGui::TextUnformatted("Columns of the long view (Ctrl+F2).\nName is always the first column.");
+    ImGui::Separator();
+    bool on[COL_N];
+    columns_spec(app, on);
+    bool changed = false;
+    for (int c = 1; c < COL_N; c++) {
+        if (ImGui::Checkbox(k_col_label[c], &on[c])) changed = true;
+    }
+    if (changed) columns_write(app, on);
+    ImGui::Separator();
+    if (ImGui::Button("Short")) snprintf(app->columns, sizeof(app->columns), "name,size");
+    ImGui::SameLine();
+    if (ImGui::Button("Long")) snprintf(app->columns, sizeof(app->columns), "name,size,date,perms");
+    ImGui::SameLine();
+    if (ImGui::Button("All")) snprintf(app->columns, sizeof(app->columns), "name,ext,size,date,perms,type");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Current: %s", app->columns);
+    if (!open) app->columns_open = false;
+    ImGui::End();
+}
+
 static void render_file_list(AppPanes* app, Pane& pane, bool focused, float width, float height, const char* id) {
     ImGui::PushID(id);
     ImGui::BeginChild(id, ImVec2(width, height));
@@ -1632,14 +1718,27 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
         cmp = compare_map(app, (&pane == &app->left) ? app->right : app->left);
 
     if (use_table) {
-        int cols = (app->view_mode == VIEW_FULL) ? 4 : 3;
-        if (ImGui::BeginTable("##filetable", cols,
+        // The long view follows the Shift+F1 column set; the mid view keeps the
+        // fixed name/size/date trio.
+        bool col_on[COL_N];
+        int col_order[COL_N], ncols = 0;
+        if (app->view_mode == VIEW_FULL) {
+            columns_spec(app, col_on);
+            for (int c = 0; c < COL_N; c++) if (col_on[c]) col_order[ncols++] = c;
+        } else {
+            col_order[ncols++] = COL_NAME;
+            col_order[ncols++] = COL_SIZE;
+            col_order[ncols++] = COL_DATE;
+        }
+        if (ImGui::BeginTable("##filetable", ncols,
                               ImGuiTableFlags_NoBordersInBody | ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.42f);
-            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 75.0f);
-            ImGui::TableSetupColumn("Date", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-            if (app->view_mode == VIEW_FULL)
-                ImGui::TableSetupColumn("Perms", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            for (int k = 0; k < ncols; k++) {
+                int c = col_order[k];
+                if (c == COL_NAME)
+                    ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthStretch, 0.42f);
+                else
+                    ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthFixed, k_col_width[c]);
+            }
 
             for (int r = 0; r < (int)pane.view.size(); r++) {
                 int i = pane.view[r];
@@ -1732,12 +1831,18 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
                     human_size(entry->size, sz, sizeof(sz));
                 }
                 fmt_date(entry->mtime, dt, sizeof(dt));
-                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(sz);
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(dt);
-                if (app->view_mode == VIEW_FULL) {
-                    char pm[16];
-                    format_mode(entry->mode, pm);
-                    ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(pm);
+                char pm[16];
+                format_mode(entry->mode, pm);
+                for (int k = 1; k < ncols; k++) {
+                    ImGui::TableSetColumnIndex(k);
+                    switch (col_order[k]) {
+                        case COL_EXT:   ImGui::TextUnformatted(col_ext(entry_rel(pane, i))); break;
+                        case COL_SIZE:  ImGui::TextUnformatted(sz); break;
+                        case COL_DATE:  ImGui::TextUnformatted(dt); break;
+                        case COL_PERMS: ImGui::TextUnformatted(pm); break;
+                        case COL_TYPE:  ImGui::TextUnformatted(col_type(entry, is_dir, is_exec)); break;
+                        default: break;
+                    }
                 }
             }
             ImGui::EndTable();
@@ -2193,7 +2298,8 @@ static void render_about(AppPanes* app) {
         "Alt+F10 or Ctrl+F8 dir tree   Ctrl+B branch view (Ctrl+Shift+B marked only)\n"
         "Alt+F3 open with the default application\n"
         "Shift+F4 new file and edit    Shift+F5 copy in place  Shift+F6 rename in place\n"
-        "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n\n"
+        "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n"
+        "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
         "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
     if (!open) app->about_open = false;
@@ -2290,6 +2396,7 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Directory tree", "Alt+F10")) {
         if (app->tree_open) app->tree_open = false; else tree_open(app, active);
     }
+    if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
     if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
     if (ImGui::MenuItem("Copy in place", "Shift+F5")) do_copy_in_place(app);
@@ -2554,6 +2661,7 @@ void app_panes_render(AppPanes* app) {
     render_dirhist(app);
     render_cmdhist(app);
     render_volumes(app);
+    render_columns_dialog(app);
     render_tree(app);
     render_search(app);
     render_confirm(app);
@@ -2591,6 +2699,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
+    snprintf(cfg->columns, sizeof(cfg->columns), "%s", app->columns);
     Pane* src[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         Pane& pane = *src[p];
@@ -2615,6 +2724,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
+    if (cfg->columns[0]) snprintf(app->columns, sizeof(app->columns), "%s", cfg->columns);
     Pane* dst[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         const char (*tabs)[4096] = (p == 0) ? cfg->left_tabs : cfg->right_tabs;
@@ -2791,6 +2901,38 @@ static void fill_dir_sizes(AppPanes* app) {
              left ? ", press again for the next batch" : "");
 }
 
+// TC quick search (AltGr + a letter): jump to the next entry whose name starts
+// with the word typed so far; further letters extend it. It walks the visible
+// rows, so a quick filter narrows the search the way it narrows everything else.
+static bool quick_search(AppPanes* app, Pane& pane, char ch) {
+    if (pane.quick_active) {
+        size_t n = strlen(pane.quick);
+        if (n + 1 < sizeof(pane.quick)) { pane.quick[n] = ch; pane.quick[n + 1] = '\0'; }
+    } else {
+        snprintf(pane.quick, sizeof(pane.quick), "%c", ch);
+        pane.quick_active = true;
+    }
+    int n = (int)pane.view.size();
+    if (n == 0) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Search: %s (empty list)", pane.quick);
+        return true;
+    }
+    int pos = row_pos(pane, pane.selected);
+    if (pos < 0) pos = -1;
+    size_t len = strlen(pane.quick);
+    for (int step = 1; step <= n; step++) {
+        int i = pane.view[(pos + step) % n];
+        if (strncasecmp(entry_rel(pane, i), pane.quick, len) == 0) {
+            pane.selected = i;
+            pane.scroll_request = true;
+            snprintf(app->status_msg, sizeof(app->status_msg), "Search: %s", pane.quick);
+            return true;
+        }
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "Search: %s (no match)", pane.quick);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard
 // ---------------------------------------------------------------------------
@@ -2832,7 +2974,7 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     default:
         break;
     }
-    if (mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT)) return true;
+    if (mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_MODE)) return true;
     return false;
 }
 
@@ -2886,8 +3028,28 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         app->props_open = false; return;
     }
 
+    if (key == SDLK_ESCAPE && active.quick_active) {
+        active.quick_active = false;
+        active.quick[0] = '\0';
+        return;
+    }
+
+    // ---- TC quick search: AltGr + a letter. AltGr is SDL_KMOD_MODE, or the
+    //      right Alt on layouts without a real AltGr. Checked before the Alt
+    //      bindings so AltGr+Q searches instead of quitting. ----
+    if ((mod & (SDL_KMOD_MODE | SDL_KMOD_RALT)) && key >= SDLK_A && key <= SDLK_Z) {
+        quick_search(app, active, (char)tolower((int)key));
+        return;
+    }
+
     // ---- quit (TC Alt+F4; Alt+Q kept as an alias) ----
     if ((key == SDLK_F4 || key == SDLK_Q) && (mod & SDL_KMOD_ALT)) { app->quit_request = true; return; }
+
+    // ---- TC Shift+F1: define the columns of the long view ----
+    if (key == SDLK_F1 && shift && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) {
+        app->columns_open = !app->columns_open;
+        return;
+    }
 
     // ---- help (TC F1) ----
     if (key == SDLK_F1 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) {
@@ -3351,6 +3513,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+        active.quick_active = false;   // the search word is spent
         // Enter in the quick filter commits it and leaves the field; the filter
         // itself stays applied.
         if (active.filter_field_active) {

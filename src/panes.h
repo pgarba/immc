@@ -52,6 +52,10 @@ struct Pane {
     bool filter_field_active;   // the row holds the keyboard this frame
     bool filter_focus_request;  // one-shot: focus the row next frame
     bool filter_exec_only;      // Ctrl+F11: only executables pass the filter
+    // TC quick search (AltGr + letter): the word typed so far. AltGr arrives as
+    // SDL_KMOD_MODE, or as the right Alt on layouts without a real AltGr.
+    char quick[128];
+    bool quick_active;
     std::vector<int> view;      // visible rows -> entry index
     bool quick_view;          // F3 quick view for this panel
     int list_mode = LIST_NORMAL;  // LIST_NORMAL | LIST_BRANCH
@@ -205,6 +209,10 @@ public:
     int view_mode;      // AppViewMode, Ctrl+O cycles
     bool show_hidden;   // Alt+. toggles
     char filter_preset[256];  // Ctrl+F12 user filter, from the config
+    // Shift+F1 column set for the long view: comma-separated, always starting
+    // with "name". Vocabulary: name, ext, size, date, perms, type.
+    char columns[256];
+    bool columns_open;          // the "Define columns" dialog is up
     bool quit_request;  // F10 / Alt+Q / menu Quit
 
     AppPanes();

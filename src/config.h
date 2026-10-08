@@ -22,6 +22,10 @@ struct MCConfig {
     int   show_hidden;    // 1 = list dotfiles
     int   trash;          // 1 = Del/F8 goes to the trash, Shift always direct
 
+    // Column set of the long view (Shift+F1). Comma-separated; "name" is always
+    // first. Vocabulary: name, ext, size, date, perms, type.
+    char  columns[256];
+
     // Pane tabs (left/right), saved on exit and restored at startup.
     // count = 0 means "use the app defaults".
     char left_tabs[MC_MAX_TABS][4096];

@@ -35,6 +35,7 @@ void mc_config_default(MCConfig* c) {
     c->sort_mode = 0;      // FS_SORT_NAME
     c->show_hidden = 0;
     c->trash = 1;          // Del/F8 goes to the trash when a helper exists
+    snprintf(c->columns, sizeof(c->columns), "name,size,date,perms");
     c->left_tab_count = 0;  c->left_tab_active = 0;
     c->right_tab_count = 0; c->right_tab_active = 0;
     for (int i = 0; i < MC_MAX_TABS; i++) {
@@ -78,6 +79,7 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "sort_mode"))   c->sort_mode = atoi(val);
         else if (!strcmp(key, "show_hidden")) c->show_hidden = atoi(val);
         else if (!strcmp(key, "trash"))       c->trash = atoi(val);
+        else if (!strcmp(key, "columns"))     snprintf(c->columns, sizeof(c->columns), "%s", val);
         else if (!strcmp(key, "left_tab_active"))  c->left_tab_active = atoi(val);
         else if (!strcmp(key, "right_tab_active")) c->right_tab_active = atoi(val);
         else {
@@ -150,10 +152,13 @@ void mc_config_save(const MCConfig* c) {
         "view_mode = %d\n"
         "sort_mode = %d\n"
         "show_hidden = %d\n"
-        "trash = %d\n",
+        "trash = %d\n"
+        "\n# Columns of the long view (Shift+F1); name is always first\n"
+        "columns = %s\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
         c->font, (double)c->font_size, c->theme,
-        c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->trash);
+        c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->trash,
+        c->columns);
 
     fprintf(f,
         "\n# Pane tabs restored at startup (written on exit)\n"

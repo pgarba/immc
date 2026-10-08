@@ -31,7 +31,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | E views & dialogs | done | `Shift+F10`/`Menu` context menu, `Alt+F3` default app, `Ctrl+F1/F2` short/long, `Shift+F2` compare, `Ctrl+Q` quick view pane, `Alt+F10`/`Ctrl+F8` tree, `Ctrl+B` branch view |
 | F file operations | done | `Shift+F4` new file + editor, `Shift+F5` copy in place, `Shift+F6` rename in place, `Shift+Ctrl+F5` link in other pane, `Ctrl+L` count marked, `Alt+Shift+Enter` dir sizes |
 | G delete to trash | done | `trash` in config (default on), `Del`/`F8` via `gio trash`/`trash-put`, `Shift+Del`/`Shift+F8` direct, prompt says which |
-| H big items | not started | |
+| H big items | partial | quick search (`AltGr+letter`) and `Shift+F1` custom columns done; multi-rename dropped by decision; embedded/split tree panes not started |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden` and `filter_preset`.
 
@@ -156,7 +156,7 @@ Config now also persists `view_mode`, `sort_mode`, `show_hidden` and `filter_pre
 | TC | Ours | Status | Action |
 |---|---|---|---|
 | Ctrl+C copy to clipboard / Ctrl+X cut / Ctrl+V paste | unbound (no-op) | MISS | app-level file clipboard (§4.4) |
-| Ctrl+M multi-rename tool | unbound | MISS | dedicated dialog mini-app |
+| Ctrl+M multi-rename tool | unbound | dropped | user decision: not needed |
 | Ctrl+P current path into command line | Alt+C prefills `cd ` | MISS | `Ctrl+P` → `cmd = active.current_dir` |
 | Ctrl+Z comments | — | OUT | no comment store |
 
@@ -284,12 +284,17 @@ above.
   `Shift+Del`/`Shift+F8` = always direct (matches TC's "direkt/Papierkorb" split).
 
 ### 4.8 Phase H — bigger items (each its own session)
-- `Ctrl+M` multi-rename tool: find/replace, case ops, counter (`{n}`), dry-run preview list, then a
-  batched rename pass with collision pre-check. Self-contained mini-app; ~1 day.
-- Quick search (`AltGr+letter` / `Ctrl+Alt+letter`): type-ahead prefix jump in the pane; needs
-  AltGr detection (`SDL_KMOD_ALTGR`) so it doesn't collide with `Alt+letter` bindings.
-- `Shift+F1` custom columns: column set stored in config; ~half a day.
+- ~~`Ctrl+M` multi-rename tool~~ — **dropped by user decision**, not on the parity list for this project.
+- Quick search (`AltGr+letter`) — **done**. SDL3 has no `SDL_KMOD_ALTGR`; AltGr arrives as
+  `SDL_KMOD_MODE`, or as `SDL_KMOD_RALT` on layouts without a real AltGr, so the binding tests
+  both. It is checked *before* the `Alt+letter` bindings, which is what keeps `AltGr+Q` a search
+  instead of a quit. The word walks `view`, so a quick filter narrows it; a miss leaves the
+  cursor alone; `Esc` or `Enter` ends it.
+- `Shift+F1` custom columns — **done**. `columns` in config (comma-separated: name, ext, size,
+  date, perms, type). Name is always first and cannot be turned off. The set drives the long
+  view (`Ctrl+F2`); the mid view keeps the fixed name/size/date trio, brief stays name-only.
 - Embedded/split tree panes (`Ctrl+Shift+F8`, `Shift+Tab`): structural change to the pane layout.
+  Not started; the `Alt+F10` floating tree window covers the same navigation for now.
 
 ---
 
