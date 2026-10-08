@@ -2511,6 +2511,10 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Tree in this panel", "Ctrl+Shift+F8")) tree_mode_toggle(app, active, TREE_EMBED);
     if (ImGui::MenuItem("Split view: tree + list", "Shift+Tab")) tree_mode_toggle(app, active, TREE_SPLIT);
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
+    // Reserved but not implemented: greyed out so the shortcut is discoverable
+    // without pretending the feature exists.
+    ImGui::MenuItem("Pack archive", "Alt+F5", false, false);
+    ImGui::MenuItem("Extract archive", "Alt+F6", false, false);
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
     if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
     if (ImGui::MenuItem("Copy in place", "Shift+F5")) do_copy_in_place(app);
@@ -3047,6 +3051,15 @@ static bool quick_search(AppPanes* app, Pane& pane, char ch) {
     return true;
 }
 
+// TC's archive keys: Alt+F5 pack, Alt+Shift+F5 pack and delete, Alt+F6 and
+// Alt+F9 extract, Alt+Shift+F9 test. Archives are not implemented (they need a
+// third-party backend), but the bindings stay reserved: without this, Alt+F5
+// falls through to plain F5 and quietly copies instead.
+static bool is_archive_key(SDL_Keycode key, SDL_Keymod mod) {
+    if (!(mod & SDL_KMOD_ALT)) return false;
+    return key == SDLK_F5 || key == SDLK_F6 || key == SDLK_F9;
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard
 // ---------------------------------------------------------------------------
@@ -3227,12 +3240,20 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         else app->entry_menu_open = true;
         return;
     }
+    if (is_archive_key(key, mod)) {
+        const char* what = (key == SDLK_F5) ? (shift ? "Pack and delete" : "Pack")
+                       : (key == SDLK_F9 && shift) ? "Test archive"
+                       : "Extract from archive";
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%s: archives are not supported yet", what);
+        return;
+    }
     if (key == SDLK_F10) {
         if (app->menu_alive) app->popup_close_request = true; else app->menu_open = true;
         app->pane_menu_open = false;
         return;
     }
-    if (key == SDLK_F9 && !shift && !app->pane_menu_alive) {
+    if (key == SDLK_F9 && !shift && !app->pane_menu_alive && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) {
         app->pane_menu_open = true;
         app->menu_open = false;
         return;
@@ -3557,8 +3578,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         }
         return;
     }
-    if (key == SDLK_F5) { do_copy(app); return; }
-    if (key == SDLK_F6) { do_move(app); return; }
+    if (key == SDLK_F5 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { do_copy(app); return; }
+    if (key == SDLK_F6 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { do_move(app); return; }
 
     // ---- navigation (all moves walk the visible rows, i.e. the filter) ----
     if (key == SDLK_UP) {

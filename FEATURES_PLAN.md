@@ -328,6 +328,13 @@ above.
 `ArchiveBackend` interface behind `list_directory`/`fs_copy_entry` with a pane "inside archive" flag;
 branch/compare/filter then need to skip archive modes. Estimated 2-4 days — the single largest item.
 
+**The bindings are reserved anyway.** They used to fall through to the plain `F5`/`F6`/`F9` handlers,
+so `Alt+F5` quietly ran a copy and `Alt+F9` opened the pane menu. `is_archive_key()` now claims all
+five and the status line says which archive operation is missing; the Commands menu shows
+"Pack archive" / "Extract archive" greyed out so the shortcuts are discoverable. The plain `F5`, `F6`
+and `F9` handlers also refuse `Alt`/`Ctrl`, so a future archive implementation cannot regress into a
+copy again.
+
 ---
 
 ## 7. Order, effort, verification

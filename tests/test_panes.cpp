@@ -466,6 +466,27 @@ static void test_tree_panel(AppPanes* app, Pane& p, const std::string& root) {
     p.tree_mode = TREE_OFF;
 }
 
+// TC's archive keys must stay reserved. Alt+F5 leaking into plain F5 is what
+// made the app copy files when the user asked it to pack them.
+static void test_archive_keys(void) {
+    CHECK(is_archive_key(SDLK_F5, SDL_KMOD_ALT));
+    CHECK(is_archive_key(SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT));
+    CHECK(is_archive_key(SDLK_F6, SDL_KMOD_ALT));
+    CHECK(is_archive_key(SDLK_F9, SDL_KMOD_ALT));
+    CHECK(is_archive_key(SDLK_F9, SDL_KMOD_ALT | SDL_KMOD_SHIFT));
+    // plain and Ctrl forms belong to copy / move / the pane menu
+    CHECK(!is_archive_key(SDLK_F5, SDL_KMOD_NONE));
+    CHECK(!is_archive_key(SDLK_F5, SDL_KMOD_SHIFT));
+    CHECK(!is_archive_key(SDLK_F6, SDL_KMOD_NONE));
+    CHECK(!is_archive_key(SDLK_F9, SDL_KMOD_NONE));
+    CHECK(!is_archive_key(SDLK_F5, SDL_KMOD_CTRL));
+    // neighbouring Alt keys are real features, not archive keys
+    CHECK(!is_archive_key(SDLK_F4, SDL_KMOD_ALT));
+    CHECK(!is_archive_key(SDLK_F7, SDL_KMOD_ALT));
+    CHECK(!is_archive_key(SDLK_F8, SDL_KMOD_ALT));
+    CHECK(!is_archive_key(SDLK_F10, SDL_KMOD_ALT));
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -518,6 +539,7 @@ int main() {
     test_quick_search(&app, p);
     test_columns(&app);
     test_tree_panel(&app, p, root);
+    test_archive_keys();
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);
