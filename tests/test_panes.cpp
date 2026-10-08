@@ -487,6 +487,58 @@ static void test_archive_keys(void) {
     CHECK(!is_archive_key(SDLK_F10, SDL_KMOD_ALT));
 }
 
+// Drive the real key handler, not just the classifier: this is the path that
+// regressed, where Alt+F5 reached the plain F5 handler and copied files.
+static void test_archive_keys_live(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    refresh_pane(&p, root.c_str());
+    int before = p.entry_count;
+
+    int ai = idx_of(p, "alpha.txt");
+    CHECK(ai >= 0);
+    p.selected = ai;
+    p.marked[ai] = true;
+
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    CHECK(strstr(app->status_msg, "Pack") != NULL);
+    CHECK(strstr(app->status_msg, "not supported") != NULL);
+    CHECK(!app->prog_active);
+    CHECK(app->pending_op == 0);
+    CHECK(app->clipboard.paths.empty());      // nothing queued for a copy
+
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
+    CHECK(strstr(app->status_msg, "Pack and delete") != NULL);
+    CHECK(fs_exists((root + "/alpha.txt").c_str()));   // not deleted
+
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_ALT);
+    CHECK(strstr(app->status_msg, "Extract") != NULL);
+    CHECK(!app->prog_active);
+
+    app->pane_menu_open = false;
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT);
+    CHECK(!app->pane_menu_open);              // the pane menu stays shut
+    CHECK(strstr(app->status_msg, "Extract") != NULL);
+
+    app->pane_menu_open = false;
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
+    CHECK(!app->pane_menu_open);
+    CHECK(strstr(app->status_msg, "Test archive") != NULL);
+
+    refresh_pane(&p, root.c_str());
+    CHECK(p.entry_count == before);           // no copies, no .copy files, no moves
+    CHECK(fs_exists((root + "/alpha.txt").c_str()));
+
+    // the unmodified key still opens the pane menu
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_NONE);
+    CHECK(app->pane_menu_open);
+    app->pane_menu_open = false;
+
+    free_entries(p.entries, p.entry_count);
+    p.entries = nullptr;
+    p.entry_count = 0;
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -540,6 +592,7 @@ int main() {
     test_columns(&app);
     test_tree_panel(&app, p, root);
     test_archive_keys();
+    test_archive_keys_live(&app, root);
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);
