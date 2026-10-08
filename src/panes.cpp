@@ -1102,6 +1102,19 @@ static void clipboard_set(AppPanes* app, Pane& pane, bool cut) {
              paths.size() == 1 ? "y" : "ies", cut ? "cut" : "copy");
 }
 
+// TC Ctrl+P: put the pane's path in the command line. Text that is already
+// there is kept and the path appended, so "rm " + path works; the command
+// buffer is shorter than a path can be, so a deep directory truncates.
+static void cmd_put_path(AppPanes* app, Pane& pane) {
+    size_t used = strlen(app->cmd);
+    if (used && app->cmd[used - 1] != ' ') {
+        if (used + 1 < sizeof(app->cmd)) app->cmd[used++] = ' ';
+    }
+    app->cmd[used] = '\0';
+    snprintf(app->cmd + used, sizeof(app->cmd) - used, "%s", pane.current_dir);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Path into the command line");
+}
+
 static int count_existing_paths(const char* dst_dir, const StringList& paths) {
     int n = 0;
     for (size_t i = 0; i < paths.size(); i++) {
@@ -2387,7 +2400,7 @@ static void render_about(AppPanes* app) {
         "Ins / Space        mark             Num+ / Num- extend / shrink\n"
         "Num* invert        Num/ restore     Ctrl+Num+ all   Ctrl+Num- none\n"
         "Alt+Num+/- mark or unmark the same extension\n"
-        "Ctrl+A all         Ctrl+I invert    Shift+arrows range mark\n"
+        "Ctrl+A all         Ctrl+I other pane  Shift+arrows range mark\n"
         "Ctrl+F3/F4/F5/F6/F7 sort name / ext / date / size / unsorted\n"
         "Shift+F3 view only the entry under the cursor\n"
         "Tab switch pane    Enter open/run   Backspace or Ctrl+PgUp parent\n"
@@ -2397,7 +2410,7 @@ static void render_about(AppPanes* app) {
         "Ctrl+Up / Ctrl+Shift+Down open the cursor dir in a new tab\n"
         "Ctrl+Left/Right show the cursor dir in the other pane\n"
         "Ctrl+U swap the pane directories   Ctrl+, go to the root\n"
-        "Ctrl+C copy        Ctrl+X cut       Ctrl+V paste\n"
+        "Ctrl+C copy        Ctrl+X cut       Ctrl+V paste   Ctrl+P path into cmd line\n"
         "Alt+Down dir history   Alt+F8 command history   Alt+F1/F2 choose drive\n"
         "Alt+F11/F12 keyboard-focus the left / right path bar\n"
         "Alt+Enter properties               Ctrl+R refresh     Ctrl+O view mode\n"
@@ -2534,7 +2547,9 @@ static void render_commands_items(AppPanes* app) {
     ImGui::Separator();
     if (ImGui::MenuItem("Mark all", "Ctrl+Num+")) select_all_marks(active);
     if (ImGui::MenuItem("Clear marks", "Ctrl+Num-")) clear_marks(active);
-    if (ImGui::MenuItem("Invert marks", "Ctrl+I")) invert_marks(active);
+    if (ImGui::MenuItem("Invert marks", "Num*")) invert_marks(active);
+    if (ImGui::MenuItem("Switch to other pane", "Ctrl+I")) app->left_focus = !app->left_focus;
+    if (ImGui::MenuItem("Current path to command line", "Ctrl+P")) cmd_put_path(app, active);
     if (ImGui::MenuItem("Swap panes", "Ctrl+U")) swap_panes(app, false);
     if (ImGui::MenuItem("Branch view", "Ctrl+B")) branch_toggle(app, active, false);
     if (ImGui::MenuItem("Branch marked dirs", "Ctrl+Shift+B")) branch_toggle(app, active, true);
@@ -3452,7 +3467,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (key == SDLK_A && (mod & SDL_KMOD_CTRL)) { select_all_marks(active); return; }
-    if (key == SDLK_I && (mod & SDL_KMOD_CTRL)) { invert_marks(active); return; }
+    // Invert lives on TC's Num*, which frees Ctrl+I for TC's pane switch below.
     if (mod & SDL_KMOD_CTRL) {
         // Ctrl+Num+ all, Ctrl+Num- none; the Shift+minus forms touch files only.
         if (key == SDLK_MINUS || key == SDLK_KP_MINUS) { clear_marks(active, shift ? SCOPE_FILES : SCOPE_ALL); return; }
@@ -3477,6 +3492,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (key == SDLK_C) { clipboard_set(app, active, false); return; }
         if (key == SDLK_X) { clipboard_set(app, active, true); return; }
         if (key == SDLK_V) { do_paste(app); return; }
+        if (key == SDLK_P) { cmd_put_path(app, active); return; }
     }
 
     // ---- file operations ----
@@ -3635,6 +3651,9 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (n >= 0) { active.selected = n; active.scroll_request = true; }
         return;
     }
+    // TC Ctrl+I: switch to the target pane. It is Tab, not Ctrl+Tab, which
+    // cycles this pane's tabs.
+    if (key == SDLK_I && (mod & SDL_KMOD_CTRL)) { app->left_focus = !app->left_focus; return; }
     if (key == SDLK_TAB && shift) { tree_mode_toggle(app, active, TREE_SPLIT); return; }
     if (key == SDLK_TAB) { app->left_focus = !app->left_focus; return; }
     if (key == SDLK_BACKSPACE) {

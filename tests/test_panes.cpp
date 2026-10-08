@@ -539,6 +539,62 @@ static void test_archive_keys_live(AppPanes* app, const std::string& root) {
     p.entry_count = 0;
 }
 
+// TC Ctrl+P (path into the command line) and Ctrl+I (switch to the target
+// pane). Ctrl+I used to invert the marks, which is TC's Num*.
+static void test_ctrl_p_and_i(AppPanes* app, const std::string& root) {
+    // The key handler reaches the panes through AppPanes, so drive app->left
+    // rather than the standalone test pane.
+    Pane& p = app->left;
+    app->left_focus = true;
+    refresh_pane(&p, root.c_str());
+    app->cmd[0] = '\0';
+
+    app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
+    CHECK(strcmp(app->cmd, p.current_dir) == 0);
+
+    // Existing text is kept, the path is appended.
+    snprintf(app->cmd, sizeof(app->cmd), "rm ");
+    app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
+    CHECK(strncmp(app->cmd, "rm ", 3) == 0);
+    CHECK(strcmp(app->cmd + 3, p.current_dir) == 0);
+
+    // No trailing space: one is inserted, so the path cannot glue onto a word.
+    snprintf(app->cmd, sizeof(app->cmd), "rm");
+    app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
+    CHECK(strcmp(app->cmd, (std::string("rm ") + p.current_dir).c_str()) == 0);
+
+    // A path longer than the buffer truncates instead of overflowing it.
+    char deep[512];
+    for (size_t i = 0; i < sizeof(deep) - 1; i++) deep[i] = 'x';
+    deep[sizeof(deep) - 1] = '\0';
+    snprintf(p.current_dir, sizeof(p.current_dir), "/%s", deep);
+    app->cmd[0] = '\0';
+    app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
+    CHECK(strlen(app->cmd) < sizeof(app->cmd));
+    snprintf(p.current_dir, sizeof(p.current_dir), "%s", root.c_str());
+    app->cmd[0] = '\0';
+
+    // Ctrl+I moves the focus, it no longer touches the marks.
+    refresh_pane(&p, root.c_str());
+    clear_marks(p);
+    int before = marked_count(p);
+    bool was_left = app->left_focus;
+    app_panes_handle_key(app, SDLK_I, SDL_KMOD_CTRL);
+    CHECK(app->left_focus != was_left);
+    CHECK(marked_count(p) == before);
+    app_panes_handle_key(app, SDLK_I, SDL_KMOD_CTRL);
+    CHECK(app->left_focus == was_left);
+
+    // Num* still inverts, so nothing was lost by moving Ctrl+I. ".." is never
+    // marked, so the count is one short of the row count.
+    app_panes_handle_key(app, SDLK_ASTERISK, SDL_KMOD_NONE);
+    CHECK(marked_count(p) == p.entry_count - 1);
+    app_panes_handle_key(app, SDLK_ASTERISK, SDL_KMOD_NONE);
+    CHECK(marked_count(p) == 0);
+
+    refresh_pane(&p, root.c_str());
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -592,6 +648,7 @@ int main() {
     test_columns(&app);
     test_tree_panel(&app, p, root);
     test_archive_keys();
+    test_ctrl_p_and_i(&app, root);
     test_archive_keys_live(&app, root);
 
     free_entries(p.entries, p.entry_count);

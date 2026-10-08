@@ -32,16 +32,21 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | F file operations | done | `Shift+F4` new file + editor, `Shift+F5` copy in place, `Shift+F6` rename in place, `Shift+Ctrl+F5` link in other pane, `Ctrl+L` count marked, `Alt+Shift+Enter` dir sizes |
 | G delete to trash | done | `trash` in config (default on), `Del`/`F8` via `gio trash`/`trash-put`, `Shift+Del`/`Shift+F8` direct, prompt says which |
 | H big items | done except multi-rename | quick search (`AltGr+letter`), `Shift+F1` custom columns, `Ctrl+Shift+F8` tree panel and `Shift+Tab` split view. Multi-rename dropped by decision |
+| I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
+
+**Nothing in §2 is open except archives (§6).**
 
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
 `fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, and the tree model)
-run headless — 155 checks: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
+run headless — 196 checks: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
 `?` was never handled in the glob matcher, and `tree_toggle()` kept a `vector` reference across an
 `insert()`, so the `expanded` flag was written to freed memory and the next press duplicated the
-row's children. Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
+row's children. Bindings are now also driven through `app_panes_handle_key` itself, not only through
+the classifiers — that is the path on which `Alt+F5` used to reach the plain copy handler.
+Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 
 ---
 
@@ -118,11 +123,11 @@ row's children. Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone
 ### Navigation, tabs, panes
 | TC | Ours | Status | Action |
 |---|---|---|---|
-| ↤ / Ctrl+PgUp parent dir | Backspace ✓, **Ctrl+PgUp = prev tab** | CONFLICT | Ctrl+PgUp → parent; also bind `\`; tabs move to `Ctrl+Tab` |
+| ↤ / Ctrl+PgUp parent dir | Backspace ✓, **Ctrl+PgUp = prev tab** | CONFLICT | Ctrl+PgUp → parent; `\` left unbound (§5); tabs move to `Ctrl+Tab` |
 | Ctrl+PgDn open dir under cursor | **Ctrl+PgDn = next tab** | CONFLICT | Ctrl+PgDn → open under cursor in this pane |
 | Ctrl+← / Ctrl+→ open under cursor in other pane | unbound | MISS | cursor stays put |
 | Ctrl+< root | unbound | MISS | `Ctrl+Shift+Comma` → `/` |
-| Ctrl+I switch to target pane | unbound | MISS | alias of Tab |
+| Ctrl+I switch to target pane | alias of Tab | OK | — |
 | Ctrl+R refresh | ✓ | OK | — |
 | Ctrl+T new tab (active) | ✓ | OK | — |
 | Ctrl+Shift+T new tab (inactive) | unbound | MISS | `tab_new(pane, activate=false)` |
@@ -160,7 +165,7 @@ row's children. Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone
 |---|---|---|---|
 | Ctrl+C copy to clipboard / Ctrl+X cut / Ctrl+V paste | unbound (no-op) | MISS | app-level file clipboard (§4.4) |
 | Ctrl+M multi-rename tool | unbound | dropped | user decision: not needed |
-| Ctrl+P current path into command line | Alt+C prefills `cd ` | MISS | `Ctrl+P` → `cmd = active.current_dir` |
+| Ctrl+P current path into command line | `Ctrl+P` appends it; `Alt+C` prefills `cd ` | OK | — |
 | Ctrl+Z comments | — | OUT | no comment store |
 
 ### Out of scope (Windows/legacy or dependency-bound)
@@ -311,9 +316,11 @@ above.
 |---|---|---|
 | `F2` = re-read source dir | `F2` = rename | the table's F2 is a Norton-Commander-ism; real TC uses F2 for rename, and our rename flow is built on it. Refresh stays `Ctrl+R` (also in the table). |
 | `F10` = menu only | `F10` = menu (migrated), `Alt+F4`/`Alt+Q` = quit | TC-faithful; `Alt+Q` kept as an extra. |
-| `Backspace` unbound | `Backspace` = parent dir | additive convenience; TC's `\` and `Ctrl+PgUp` also bound. |
+| `Backspace` unbound | `Backspace` = parent dir | additive convenience; TC's `Ctrl+PgUp` and `\` do the same. `\` is left unbound: it is a legal filename byte on Linux, and `Ctrl+,` already covers TC's root jump. |
 | `Ctrl+O`, `Alt+.`, `Ctrl+1..9`, `Alt+C`, `Alt+PgUp/PgDn` | kept | MC extras not in the TC table; no collisions after Phase 0. |
 | `Ctrl+B` branch view is a full browser | branch view is capped (depth 6, 4000 rows) and `F2`/`F7` are refused inside it | the subtree is a snapshot; rename/mkdir address rows by name only, so they are blocked instead of silently hitting the wrong file. Delete/copy/move/view go through `entry_rel()` and are correct. |
+| `Ctrl+I` = switch to the target pane | same, and invert moves to `Num*` | `Ctrl+I` was our invert shortcut. `Num*` is TC's own invert binding and was already wired, so `Ctrl+I` goes back to the pane switch the table asks for instead of staying a documented deviation. |
+| `Ctrl+P` replaces the command line | appends to it | a path can be 4096 bytes and the command buffer is 512, and `rm ` + path is the common case; appending keeps both the typed verb and the path, and a too-long path truncates inside the buffer instead of overflowing it. |
 | `Shift+F2` compares content | compares name + size + type | content compare needs a diff engine; size/type mismatch is the 95% case. Colors come from the new theme slots `diff_missing` / `diff_differ`. |
 | `AltGr+letter` quick search | same, detected as `SDL_KMOD_MODE` or `SDL_KMOD_RALT` | SDL3 has no `SDL_KMOD_ALTGR`. The binding is tested before the `Alt+letter` handlers so `AltGr+Q` searches instead of quitting. |
 | tree panel keyboard | embed mode: keyboard drives the tree; split mode: keyboard stays with the file list | in a split panel there is no third focus to cycle to, and `Tab` already switches panes in TC. The tree is mouse-driven in split mode. |
