@@ -30,6 +30,20 @@ using StringList = std::vector<std::string>;
 // flattens the whole subtree below the pane's directory into one list.
 enum PaneListMode { LIST_NORMAL = 0, LIST_BRANCH = 1 };
 
+// TC puts a directory tree inside a panel: Ctrl+Shift+F8 replaces the file
+// list with it, Shift+Tab splits the panel into tree + list.
+enum PaneTreeMode { TREE_OFF = 0, TREE_EMBED = 1, TREE_SPLIT = 2 };
+
+// One visible row of a directory tree. Collapsed subtrees simply are not in
+// the list, so the vector is always the set of rows on screen.
+struct TreeRow {
+    char path[4096];
+    int  depth;
+    bool expanded;
+    bool has_children;
+};
+using TreeRows = std::vector<TreeRow>;
+
 struct Pane {
     char current_dir[4096];
     FileEntry** entries;
@@ -59,6 +73,12 @@ struct Pane {
     std::vector<int> view;      // visible rows -> entry index
     bool quick_view;          // F3 quick view for this panel
     int list_mode = LIST_NORMAL;  // LIST_NORMAL | LIST_BRANCH
+    // TC tree panel (Ctrl+Shift+F8 embeds it, Shift+Tab splits the panel).
+    // Each pane owns its model: the floating Alt+F10 window edits the target
+    // pane's model too, so both views stay in sync.
+    int tree_mode = TREE_OFF;   // TREE_OFF | TREE_EMBED | TREE_SPLIT
+    TreeRows tree_rows;
+    int tree_selected = 0;      // cursor row inside tree_rows
     StringList rel;           // branch view: path of each row under current_dir
     int list_gen;             // bumped on every reload; caches key off this
     float cursor_screen_x;    // screen pos of the cursor row, for Shift+F10

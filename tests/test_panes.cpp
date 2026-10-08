@@ -410,6 +410,62 @@ static void test_columns(AppPanes* app) {
     snprintf(app->columns, sizeof(app->columns), "name,size,date,perms");
 }
 
+// TC tree panel: the model is per pane, expand/collapse is symmetric, and the
+// arrow keys drive it without touching the file rows.
+static void test_tree_panel(AppPanes* app, Pane& p, const std::string& root) {
+    snprintf(p.current_dir, sizeof(p.current_dir), "%s", root.c_str());
+    tree_fill(p);
+    CHECK(strcmp(p.tree_rows[0].path, root.c_str()) == 0);
+    CHECK(p.tree_rows[0].depth == 0 && p.tree_rows[0].expanded);
+    CHECK(p.tree_rows.size() >= 2);            // root + sub
+
+    int sub = -1;
+    const std::string subpath = root + "/sub";
+    for (int i = 1; i < (int)p.tree_rows.size(); i++)
+        if (p.tree_rows[i].path == subpath) sub = i;
+    CHECK(sub >= 0);
+
+    size_t before = p.tree_rows.size();
+    tree_toggle(p, sub);                        // sub/deep splices in
+    CHECK(p.tree_rows.size() == before + 1);
+    CHECK(p.tree_rows[sub + 1].depth == p.tree_rows[sub].depth + 1);
+    tree_toggle(p, sub);                        // and comes back out symmetrically
+    CHECK(p.tree_rows.size() == before);
+
+    // Each pane owns its model: expanding in one must not move the other.
+    snprintf(app->right.current_dir, sizeof(app->right.current_dir), "%s", root.c_str());
+    app->right.tree_rows.clear();
+    tree_fill(app->right);
+    CHECK(app->right.tree_rows.size() == p.tree_rows.size());
+    tree_toggle(app->right, sub);
+    CHECK(app->right.tree_rows.size() == p.tree_rows.size() + 1);
+    app->right.tree_rows.clear();
+
+    p.tree_selected = 0;
+    CHECK(tree_nav(app, p, SDLK_DOWN));
+    CHECK(p.tree_selected == 1);
+    CHECK(tree_nav(app, p, SDLK_UP));
+    CHECK(p.tree_selected == 0);
+    CHECK(tree_nav(app, p, SDLK_UP));           // clamped at the top
+    CHECK(p.tree_selected == 0);
+    CHECK(tree_nav(app, p, SDLK_END));
+    int end = p.tree_selected;
+    CHECK(end == (int)p.tree_rows.size() - 1);
+    CHECK(tree_nav(app, p, SDLK_LEFT));         // collapse, or jump to the parent
+    CHECK(p.tree_selected <= end);
+    CHECK(!tree_nav(app, p, SDLK_F3));          // unrelated keys fall through
+
+    tree_mode_toggle(app, p, TREE_EMBED);
+    CHECK(p.tree_mode == TREE_EMBED);
+    tree_mode_toggle(app, p, TREE_EMBED);       // same mode again turns it off
+    CHECK(p.tree_mode == TREE_OFF);
+    tree_mode_toggle(app, p, TREE_SPLIT);
+    CHECK(p.tree_mode == TREE_SPLIT);
+    tree_mode_toggle(app, p, TREE_EMBED);       // switching kinds, not off
+    CHECK(p.tree_mode == TREE_EMBED);
+    p.tree_mode = TREE_OFF;
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -461,6 +517,7 @@ int main() {
     test_trash_helpers();
     test_quick_search(&app, p);
     test_columns(&app);
+    test_tree_panel(&app, p, root);
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);

@@ -1369,16 +1369,12 @@ static void open_with_default(AppPanes* app, const char* fullpath) {
 // Alt+F10 / Ctrl+F8: directory tree window
 // ---------------------------------------------------------------------------
 
-// The tree is a flat list of the directories currently visible in the window;
-// expanding a row splices its children in below it.
-struct TreeRow {
-    char path[4096];
-    int  depth;
-    bool expanded;
-    bool has_children;
-};
+// The tree is a flat list of the directories currently visible; expanding a row
+// splices its children in below it (TreeRow itself lives in panes.h because
+// each Pane owns a model).
 
-static std::vector<TreeRow> g_tree;
+// The tree model lives per pane (Pane::tree_rows). The floating Alt+F10 window
+// and the embedded panel tree edit the same rows, so the two views agree.
 
 static bool dir_has_children(const char* path) {
     DIR* d = opendir(path);
@@ -1421,32 +1417,143 @@ static void tree_children(const char* path, std::vector<TreeRow>& out, int depth
     }
 }
 
-static void tree_open(AppPanes* app, Pane& pane) {
-    g_tree.clear();
+// Fill the model with `current_dir` and its child directories.
+static void tree_fill(Pane& pane) {
+    TreeRows& t = pane.tree_rows;
+    t.clear();
     TreeRow root;
     snprintf(root.path, sizeof(root.path), "%s", pane.current_dir);
     root.depth = 0;
     root.expanded = true;
     root.has_children = dir_has_children(root.path);
-    g_tree.push_back(root);
-    if (root.has_children) tree_children(root.path, g_tree, 1);
+    t.push_back(root);
+    if (root.has_children) tree_children(root.path, t, 1);
+    if (pane.tree_selected >= (int)t.size()) pane.tree_selected = 0;
+}
+
+static void tree_open(AppPanes* app, Pane& pane) {
+    tree_fill(pane);
     app->tree_open = true;
     app->tree_target = (&pane == &app->left) ? 0 : 1;
 }
 
+// Ctrl+Shift+F8 (tree instead of the list) / Shift+Tab (tree beside the list).
+// The model is refilled on the way in so the tree is always rooted at what the
+// pane is showing.
+static void tree_mode_toggle(AppPanes* app, Pane& pane, int mode) {
+    pane.tree_mode = (pane.tree_mode == mode) ? TREE_OFF : mode;
+    if (pane.tree_mode != TREE_OFF) {
+        tree_fill(pane);
+        pane.tree_selected = 0;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             pane.tree_mode == TREE_EMBED ? "Tree panel"
+           : pane.tree_mode == TREE_SPLIT ? "Split view: tree + list"
+           : "Tree panel off");
+}
+
 // Collapse or expand row `idx`.
-static void tree_toggle(int idx) {
-    TreeRow& row = g_tree[idx];
-    if (row.expanded) {
+// Collapse or expand row `idx`. Note the re-indexing after insert/erase: a
+// reference into the vector does not survive a reallocation, and writing
+// `expanded` through a stale one leaves the row thinking it is still collapsed
+// (which then duplicates its children on the next press).
+static void tree_toggle(Pane& pane, int idx) {
+    TreeRows& t = pane.tree_rows;
+    if (idx < 0 || idx >= (int)t.size()) return;
+    if (t[idx].expanded) {
+        int depth = t[idx].depth;
         int end = idx + 1;
-        while (end < (int)g_tree.size() && g_tree[end].depth > row.depth) end++;
-        g_tree.erase(g_tree.begin() + idx + 1, g_tree.begin() + end);
-        row.expanded = false;
+        while (end < (int)t.size() && t[end].depth > depth) end++;
+        t.erase(t.begin() + idx + 1, t.begin() + end);
+        t[idx].expanded = false;
     } else {
-        std::vector<TreeRow> kids;
-        tree_children(row.path, kids, row.depth + 1);
-        g_tree.insert(g_tree.begin() + idx + 1, kids.begin(), kids.end());
-        row.expanded = true;
+        TreeRows kids;
+        tree_children(t[idx].path, kids, t[idx].depth + 1);
+        t.insert(t.begin() + idx + 1, kids.begin(), kids.end());
+        t[idx].expanded = true;
+    }
+}
+
+// One pane's worth of tree rows, used by the floating window and by the
+// embedded/split panel alike. Clicking a name moves that pane; +/- expands.
+static void render_tree_rows(AppPanes* app, Pane& pane, bool focused,
+                             float width, float height, const char* id) {
+    ImGui::PushID(id);
+    ImGui::BeginChild(id, ImVec2(width, height));
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0))
+        app->left_focus = (&pane == &app->left);
+    if (pane.tree_rows.empty()) tree_fill(pane);
+
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+
+    for (int i = 0; i < (int)pane.tree_rows.size(); i++) {
+        const TreeRow& row = pane.tree_rows[i];
+        const char* base = strrchr(row.path, '/');
+        base = (base && base[1]) ? base + 1 : row.path;
+        bool sel = focused && (i == pane.tree_selected);
+        ImGui::PushID(i);
+        ImGui::Indent(row.depth * 12.0f);
+        if (row.has_children) {
+            if (ImGui::SmallButton(row.expanded ? "-" : "+")) tree_toggle(pane, i);
+            ImGui::SameLine();
+        }
+        if (sel) {
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float h = ImGui::GetTextLineHeightWithSpacing();
+            float x1 = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - 8.0f;
+            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(x1, p.y + h),
+                                                      mc_theme_colors()->cursor_bg);
+        }
+        bool clicked = ImGui::Selectable(base, sel);
+        if (clicked) {
+            pane.tree_selected = i;
+            app->left_focus = (&pane == &app->left);
+            DIR* probe = opendir(row.path);
+            if (probe) { closedir(probe); navigate_to(app, &pane, row.path); }
+        }
+        ImGui::Unindent(row.depth * 12.0f);
+        ImGui::PopID();
+    }
+
+    ImGui::PopStyleColor(3);
+    ImGui::EndChild();
+    ImGui::PopID();
+}
+
+// Keyboard for the embedded tree: arrows move, Left/Right collapse and expand,
+// Enter sends the pane to the selected directory.
+static bool tree_nav(AppPanes* app, Pane& pane, SDL_Keycode key) {
+    TreeRows& t = pane.tree_rows;
+    if (t.empty()) return false;
+    int& sel = pane.tree_selected;
+    if (sel < 0) sel = 0;
+    if (sel >= (int)t.size()) sel = (int)t.size() - 1;
+    switch (key) {
+        case SDLK_UP:    if (sel > 0) sel--; return true;
+        case SDLK_DOWN:  if (sel + 1 < (int)t.size()) sel++; return true;
+        case SDLK_HOME:  sel = 0; return true;
+        case SDLK_END:   sel = (int)t.size() - 1; return true;
+        case SDLK_PAGEUP: sel = sel > 20 ? sel - 20 : 0; return true;
+        case SDLK_PAGEDOWN: sel = (sel + 20 < (int)t.size()) ? sel + 20 : (int)t.size() - 1; return true;
+        case SDLK_RIGHT:
+            if (!t[sel].expanded && t[sel].has_children) tree_toggle(pane, sel);
+            return true;
+        case SDLK_LEFT:
+            if (t[sel].expanded) {
+                tree_toggle(pane, sel);
+            } else {
+                for (int i = sel - 1; i >= 0; i--)
+                    if (t[i].depth == t[sel].depth - 1) { sel = i; break; }
+            }
+            return true;
+        case SDLK_RETURN: case SDLK_KP_ENTER: {
+            DIR* probe = opendir(t[sel].path);
+            if (probe) { closedir(probe); navigate_to(app, &pane, t[sel].path); }
+            return true;
+        }
+        default: return false;
     }
 }
 
@@ -1463,27 +1570,8 @@ static void render_tree(AppPanes* app) {
     ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse);
     ImGui::TextDisabled("click a name to go there, +/- to expand");
     ImGui::Separator();
-    for (int i = 0; i < (int)g_tree.size(); i++) {
-        const char* base = strrchr(g_tree[i].path, '/');
-        base = (base && base[1]) ? base + 1 : g_tree[i].path;
-        ImGui::PushID(i);
-        ImGui::Indent(g_tree[i].depth * 12.0f);
-        if (g_tree[i].has_children) {
-            if (ImGui::SmallButton(g_tree[i].expanded ? "-" : "+")) tree_toggle(i);
-            ImGui::SameLine();
-        }
-        if (ImGui::Selectable(base, false)) {
-            Pane& target = app->tree_target == 0 ? app->left : app->right;
-            DIR* probe = opendir(g_tree[i].path);
-            if (probe) { closedir(probe); navigate_to(app, &target, g_tree[i].path); }
-            app->tree_open = false;
-            ImGui::Unindent(g_tree[i].depth * 12.0f);
-            ImGui::PopID();
-            break;
-        }
-        ImGui::Unindent(g_tree[i].depth * 12.0f);
-        ImGui::PopID();
-    }
+    Pane& target = app->tree_target == 0 ? app->left : app->right;
+    render_tree_rows(app, target, true, 0.0f, ImGui::GetContentRegionAvail().y, "##treefloat");
     if (!open) app->tree_open = false;
     ImGui::End();
 }
@@ -1689,10 +1777,9 @@ static void render_columns_dialog(AppPanes* app) {
     ImGui::End();
 }
 
-static void render_file_list(AppPanes* app, Pane& pane, bool focused, float width, float height, const char* id) {
-    ImGui::PushID(id);
-    ImGui::BeginChild(id, ImVec2(width, height));
-
+// The rows of one pane, called with its child window already open. The wrapper
+// at the end decides whether that child holds the list, a tree, or both.
+static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
     float row_h = ImGui::GetTextLineHeightWithSpacing();
     pane.page_size = row_h > 0 ? (int)(ImGui::GetWindowSize().y / row_h) : PAGE_SIZE;
     if (pane.page_size < 1) pane.page_size = PAGE_SIZE;
@@ -1962,7 +2049,31 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
         render_entry_menu_items(app, pane);
         ImGui::EndPopup();
     }
+}
 
+// The content area of a pane: the file list, the TC tree panel (Ctrl+Shift+F8),
+// or a tree + list split (Shift+Tab). The child window opened here is what the
+// body above draws into.
+static void render_file_list(AppPanes* app, Pane& pane, bool focused, float width, float height, const char* id) {
+    if (pane.tree_mode == TREE_EMBED) {
+        render_tree_rows(app, pane, focused, width, height, id);
+        return;
+    }
+    if (pane.tree_mode == TREE_SPLIT) {
+        float tw = width * 0.40f;
+        float gap = ImGui::GetStyle().ItemSpacing.x;
+        ImGui::PushID(id);
+        render_tree_rows(app, pane, focused, tw, height, "##treehalf");
+        ImGui::SameLine();
+        ImGui::BeginChild("##listhalf", ImVec2(width - tw - gap, height));
+        render_file_list_body(app, pane, focused);
+        ImGui::EndChild();
+        ImGui::PopID();
+        return;
+    }
+    ImGui::PushID(id);
+    ImGui::BeginChild(id, ImVec2(width, height));
+    render_file_list_body(app, pane, focused);
     ImGui::EndChild();
     ImGui::PopID();
 }
@@ -2299,7 +2410,8 @@ static void render_about(AppPanes* app) {
         "Alt+F3 open with the default application\n"
         "Shift+F4 new file and edit    Shift+F5 copy in place  Shift+F6 rename in place\n"
         "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n"
-        "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n\n"
+        "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n"
+        "Ctrl+Shift+F8 tree in the panel   Shift+Tab split view: tree + list\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
         "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
     if (!open) app->about_open = false;
@@ -2396,6 +2508,8 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Directory tree", "Alt+F10")) {
         if (app->tree_open) app->tree_open = false; else tree_open(app, active);
     }
+    if (ImGui::MenuItem("Tree in this panel", "Ctrl+Shift+F8")) tree_mode_toggle(app, active, TREE_EMBED);
+    if (ImGui::MenuItem("Split view: tree + list", "Shift+Tab")) tree_mode_toggle(app, active, TREE_SPLIT);
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
     if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
@@ -3418,6 +3532,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
     // TC "F8, Del": plain Del deletes; Shift+Del / Shift+F8 skip the trash
     // (wired up in the trash phase, both confirm first today).
+    // TC Ctrl+Shift+F8: the tree takes over this panel. Shift+Tab splits it.
+    if (key == SDLK_F8 && (mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT)) == (SDL_KMOD_CTRL | SDL_KMOD_SHIFT)) {
+        tree_mode_toggle(app, active, TREE_EMBED);
+        return;
+    }
     if (key == SDLK_F8 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { request_delete(app, shift); return; }
     // Ctrl+F8: the directory tree, like Alt+F10.
     if (key == SDLK_F8 && (mod & SDL_KMOD_CTRL)) {
@@ -3495,6 +3614,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (n >= 0) { active.selected = n; active.scroll_request = true; }
         return;
     }
+    if (key == SDLK_TAB && shift) { tree_mode_toggle(app, active, TREE_SPLIT); return; }
     if (key == SDLK_TAB) { app->left_focus = !app->left_focus; return; }
     if (key == SDLK_BACKSPACE) {
         char parentbuf[4096];
@@ -3504,6 +3624,12 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     // TC Alt+Shift+Enter: compute the size of every directory on screen.
+    // ---- TC tree panel: while a tree replaces the list, the keyboard drives
+    //      the tree instead of the file rows. ----
+    if (active.tree_mode == TREE_EMBED && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+        if (tree_nav(app, active, key)) return;
+    }
+
     if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) && (mod & SDL_KMOD_ALT) && shift) {
         fill_dir_sizes(app);
         return;

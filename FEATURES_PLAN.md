@@ -31,14 +31,17 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | E views & dialogs | done | `Shift+F10`/`Menu` context menu, `Alt+F3` default app, `Ctrl+F1/F2` short/long, `Shift+F2` compare, `Ctrl+Q` quick view pane, `Alt+F10`/`Ctrl+F8` tree, `Ctrl+B` branch view |
 | F file operations | done | `Shift+F4` new file + editor, `Shift+F5` copy in place, `Shift+F6` rename in place, `Shift+Ctrl+F5` link in other pane, `Ctrl+L` count marked, `Alt+Shift+Enter` dir sizes |
 | G delete to trash | done | `trash` in config (default on), `Del`/`F8` via `gio trash`/`trash-put`, `Shift+Del`/`Shift+F8` direct, prompt says which |
-| H big items | partial | quick search (`AltGr+letter`) and `Shift+F1` custom columns done; multi-rename dropped by decision; embedded/split tree panes not started |
+| H big items | done except multi-rename | quick search (`AltGr+letter`), `Shift+F1` custom columns, `Ctrl+Shift+F8` tree panel and `Shift+Tab` split view. Multi-rename dropped by decision |
 
-Config now also persists `view_mode`, `sort_mode`, `show_hidden` and `filter_preset`.
+Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
 
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
-(filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view and
-`fs_list_tree`) run headless: `cmake --build build -j4 && (cd build && ctest)`. It caught one real bug —
-`?` was never handled in the glob matcher. Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
+(filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
+`fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, and the tree model)
+run headless — 155 checks: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
+`?` was never handled in the glob matcher, and `tree_toggle()` kept a `vector` reference across an
+`insert()`, so the `expanded` flag was written to freed memory and the next press duplicated the
+row's children. Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 
 ---
 
@@ -293,8 +296,12 @@ above.
 - `Shift+F1` custom columns — **done**. `columns` in config (comma-separated: name, ext, size,
   date, perms, type). Name is always first and cannot be turned off. The set drives the long
   view (`Ctrl+F2`); the mid view keeps the fixed name/size/date trio, brief stays name-only.
-- Embedded/split tree panes (`Ctrl+Shift+F8`, `Shift+Tab`): structural change to the pane layout.
-  Not started; the `Alt+F10` floating tree window covers the same navigation for now.
+- Embedded/split tree panes (`Ctrl+Shift+F8`, `Shift+Tab`) — **done**. `Ctrl+Shift+F8` replaces the
+  panel's file list with the tree; `Shift+Tab` splits the panel 40/60 into tree + list. Each pane
+  owns its `TreeRows` model, and the floating `Alt+F10` window edits that same model, so the two
+  views never disagree. In embed mode the keyboard drives the tree (arrows, Left/Right collapse and
+  expand, Enter navigates); in split mode the keyboard stays with the file list and the tree is
+  mouse-driven.
 
 ---
 
@@ -308,6 +315,8 @@ above.
 | `Ctrl+O`, `Alt+.`, `Ctrl+1..9`, `Alt+C`, `Alt+PgUp/PgDn` | kept | MC extras not in the TC table; no collisions after Phase 0. |
 | `Ctrl+B` branch view is a full browser | branch view is capped (depth 6, 4000 rows) and `F2`/`F7` are refused inside it | the subtree is a snapshot; rename/mkdir address rows by name only, so they are blocked instead of silently hitting the wrong file. Delete/copy/move/view go through `entry_rel()` and are correct. |
 | `Shift+F2` compares content | compares name + size + type | content compare needs a diff engine; size/type mismatch is the 95% case. Colors come from the new theme slots `diff_missing` / `diff_differ`. |
+| `AltGr+letter` quick search | same, detected as `SDL_KMOD_MODE` or `SDL_KMOD_RALT` | SDL3 has no `SDL_KMOD_ALTGR`. The binding is tested before the `Alt+letter` handlers so `AltGr+Q` searches instead of quitting. |
+| tree panel keyboard | embed mode: keyboard drives the tree; split mode: keyboard stays with the file list | in a split panel there is no third focus to cycle to, and `Tab` already switches panes in TC. The tree is mouse-driven in split mode. |
 
 ---
 
