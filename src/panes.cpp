@@ -1,5 +1,6 @@
 #include "panes.h"
 #include "filesystem.h"
+#include "archive.h"
 #include "theme.h"
 #include "config.h"
 #include <SDL3/SDL.h>
@@ -56,6 +57,8 @@ AppPanes::AppPanes() {
     right.sel_mem_count = 0;
     left.tab_count = 0; left.tab_active = 0;
     right.tab_count = 0; right.tab_active = 0;
+    left.archive_path[0] = '\0'; left.archive_prefix[0] = '\0';
+    right.archive_path[0] = '\0'; right.archive_prefix[0] = '\0';
     left.filter[0] = '\0'; left.last_filter[0] = '\0'; left.filter_applied[0] = '\0';
     left.filter_active = false; left.filter_field_active = false; left.filter_focus_request = false;
     left.filter_exec_only = false;
@@ -88,6 +91,9 @@ AppPanes::AppPanes() {
     search_input_active = false;
     viewer_open = false;
     viewer_path[0] = '\0';
+    viewer_tmp_dir[0] = '\0';
+    clipboard.archive[0] = '\0';
+    pack_and_delete = false;
     props_open = false;
     props_path[0] = '\0';
     props_size = 0;
@@ -164,13 +170,40 @@ static bool glob_match(const char* pat, const char* s) {
 
 // Plain text matches as a case-insensitive substring; a pattern containing
 // '*' or '?' is glob-matched against the whole name, like TC.
-// Path of a row inside its pane: the full relative path in branch view, the
-// plain name otherwise. Every path and every label built from a listing goes
-// through this.
+// Path of a row inside its pane: the full relative path in branch view and in
+// an archive, the plain name otherwise. Every path and every label built from a
+// listing goes through this.
 static const char* entry_rel(const Pane& p, int idx) {
-    if (p.list_mode == LIST_BRANCH && idx >= 0 && idx < (int)p.rel.size())
+    if ((p.list_mode == LIST_BRANCH || p.list_mode == LIST_ARCHIVE) &&
+        idx >= 0 && idx < (int)p.rel.size())
         return p.rel[idx].c_str();
     return p.entries[idx]->name;
+}
+
+// The pane is showing archive members instead of a directory. Everything below
+// that path is virtual, so these guards protect the operations that would
+// otherwise build a real path out of it.
+static bool in_archive(const Pane& pane) { return pane.archive_path[0] != '\0'; }
+
+static bool archive_readonly(AppPanes* app, const Pane& pane) {
+    if (!in_archive(pane)) return false;
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             "Archive contents are read-only: Alt+F9 extracts, Alt+F5 packs");
+    return true;
+}
+
+// Branch view is a flattened snapshot of a subtree, so anything that resolves a
+// row against the pane's directory has to stay out of it. entry_rel() is what
+// makes paths correct in branch view; rename, mkdir and the rest are not.
+static bool branch_blocked(AppPanes* app, const Pane& pane) {
+    if (pane.list_mode == LIST_ARCHIVE) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Not available inside an archive (Backspace leaves it)");
+        return true;
+    }
+    if (pane.list_mode != LIST_BRANCH) return false;
+    snprintf(app->status_msg, sizeof(app->status_msg), "Not available in branch view (Ctrl+B exits)");
+    return true;
 }
 
 static bool filter_matches(const char* name, const char* pat) {
@@ -343,6 +376,70 @@ static void mark_same_ext(Pane& p, bool mark) {
 // Directory listing + history + tabs
 // ---------------------------------------------------------------------------
 
+// Build the rows for one directory level inside an archive. arch_list reports
+// every member with its full path, so the rows are the members that sit at
+// `prefix` plus exactly one component: a folder inside the archive becomes an
+// ordinary row and can be walked into. `rel` is filled parallel to the entries
+// with each member's path inside the archive, which is what entry_rel and the
+// virtual path need.
+struct ArchiveRow {
+    FileEntry* fe;
+    std::string rel;
+};
+
+static void list_archive_dir(const char* archive, const char* prefix,
+                             FileEntry*** out_entries, int* out_count,
+                             StringList* rel) {
+    *out_entries = nullptr;
+    *out_count = 0;
+
+    std::vector<ArchEntry> members;
+    std::string err;
+    if (!arch_list(archive, &members, &err)) return;
+
+    size_t plen = prefix ? strlen(prefix) : 0;
+    std::vector<ArchiveRow> rows;
+    for (const ArchEntry& m : members) {
+        const char* r = m.rel;
+        if (plen) {
+            if (strncmp(r, prefix, plen) != 0 || r[plen] != '/') continue;
+            r += plen + 1;
+        }
+        if (!*r) continue;                     // the level itself
+        if (strchr(r, '/')) continue;          // deeper levels get their own row
+        if (!fs_get_show_hidden() && r[0] == '.') continue;
+        const char* base = strrchr(r, '/');
+        base = base ? base + 1 : r;
+        FileEntry* fe = file_entry_new(base, m.mode, m.size, m.mtime);
+        if (!fe) continue;
+        rows.push_back({ fe, std::string(r) });
+    }
+
+    // Same order a real directory would use, so the cursor and the sort keys
+    // behave identically inside an archive.
+    std::sort(rows.begin(), rows.end(), [](const ArchiveRow& a, const ArchiveRow& b) {
+        const FileEntry* pa = a.fe;
+        const FileEntry* pb = b.fe;
+        return compare_files(&pa, &pb) < 0;
+    });
+
+    // Inside an archive the pane still needs a way out, so ".." is a row.
+    int lead = plen ? 1 : 0;
+    *out_entries = (FileEntry**)calloc(rows.size() + lead, sizeof(FileEntry*));
+    if (!*out_entries) {
+        for (const ArchiveRow& r : rows) file_entry_free(r.fe);
+        return;
+    }
+    int i = 0;
+    if (lead) {
+        (*out_entries)[0] = file_entry_new("..", S_IFDIR | 0755, 0, 0);
+        rel->push_back(std::string());         // ".." is resolved by dirname()
+        i = 1;
+    }
+    for (const ArchiveRow& r : rows) { (*out_entries)[i] = r.fe; rel->push_back(r.rel); i++; }
+    *out_count = i;
+}
+
 void refresh_pane(Pane* pane, const char* path) {
     bool dir_changed = strcmp(pane->current_dir, path) != 0;
     free_entries(pane->entries, pane->entry_count);
@@ -350,7 +447,20 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->current_dir[sizeof(pane->current_dir) - 1] = '\0';
     pane->selected = 0;
     pane->anchor = 0;
-    list_directory(path, &pane->entries, &pane->entry_count);
+    pane->rel.clear();
+    char arch[4096], prefix[1024];
+    if (arch_split_virtual(path, arch, sizeof arch, prefix, sizeof prefix)) {
+        list_archive_dir(arch, prefix, &pane->entries, &pane->entry_count, &pane->rel);
+        snprintf(pane->archive_path, sizeof pane->archive_path, "%s", arch);
+        snprintf(pane->archive_prefix, sizeof pane->archive_prefix, "%s", prefix);
+        pane->list_mode = LIST_ARCHIVE;
+    } else {
+        list_directory(path, &pane->entries, &pane->entry_count);
+        pane->archive_path[0] = '\0';
+        pane->archive_prefix[0] = '\0';
+        // A plain navigation also ends branch view.
+        pane->list_mode = LIST_NORMAL;
+    }
     pane->list_gen++;
     pane->marked.assign(pane->entry_count, false);
     pane->dir_size.assign(pane->entry_count, -1);
@@ -363,9 +473,6 @@ void refresh_pane(Pane* pane, const char* path) {
         pane->filter_active = false;
         pane->filter_field_active = false;
     }
-    // Branch view is a snapshot of a subtree; navigating ends it.
-    pane->list_mode = LIST_NORMAL;
-    pane->rel.clear();
     rebuild_view(*pane);
 }
 
@@ -373,6 +480,7 @@ void refresh_pane(Pane* pane, const char* path) {
 // show a real number instead of "-". Alt+Shift+Enter does it for every dir.
 static void compute_dir_size(Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count || idx >= (int)pane.dir_size.size()) return;
+    if (in_archive(pane)) return;   // a member's packed size is not a tree total
     FileEntry* e = pane.entries[idx];
     if (!is_directory(e->name, e->mode) || strcmp(e->name, "..") == 0) return;
     char full[4100];
@@ -548,12 +656,15 @@ static void tab_close_all(Pane* pane) {
 static void open_cursor_in_new_tab(AppPanes* app, Pane* pane, bool activate) {
     if (pane->selected < 0 || pane->selected >= pane->entry_count) return;
     FileEntry* e = pane->entries[pane->selected];
-    if (strcmp(e->name, "..") == 0 || !is_directory(e->name, e->mode)) {
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", pane->current_dir, entry_rel(*pane, pane->selected));
+    // TC opens an archive the way it opens a directory, so Ctrl+Up on an
+    // archive file opens the archive in a new tab.
+    bool openable = is_directory(e->name, e->mode) || arch_is_archive(full);
+    if (strcmp(e->name, "..") == 0 || !openable) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Not a directory: %s", e->name);
         return;
     }
-    char full[4100];
-    snprintf(full, sizeof(full), "%s/%s", pane->current_dir, entry_rel(*pane, pane->selected));
     tab_new(pane, activate);
     navigate_to(app, pane, full);
 }
@@ -562,12 +673,13 @@ static void open_cursor_in_new_tab(AppPanes* app, Pane* pane, bool activate) {
 static void open_cursor_in_other_pane(AppPanes* app, Pane* src, Pane* dst) {
     if (src->selected < 0 || src->selected >= src->entry_count) return;
     FileEntry* e = src->entries[src->selected];
-    if (strcmp(e->name, "..") == 0 || !is_directory(e->name, e->mode)) {
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", src->current_dir, entry_rel(*src, src->selected));
+    bool openable = is_directory(e->name, e->mode) || arch_is_archive(full);
+    if (strcmp(e->name, "..") == 0 || !openable) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Not a directory: %s", e->name);
         return;
     }
-    char full[4100];
-    snprintf(full, sizeof(full), "%s/%s", src->current_dir, entry_rel(*src, src->selected));
     navigate_to(app, dst, full);
 }
 
@@ -679,6 +791,7 @@ static void search_walk(const char* dir, const char* pattern, std::vector<std::s
 
 static void run_search(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (archive_readonly(app, active)) return;   // a virtual path has nothing to walk
     app->search_results.clear();
     search_walk(active.current_dir, app->search_pattern, app->search_results, 0, app->show_hidden);
     app->search_done = true;
@@ -845,6 +958,7 @@ static void do_delete(AppPanes* app) {
 
 static void request_delete(AppPanes* app, bool force_direct) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (branch_blocked(app, active) || archive_readonly(app, active)) return;
     int n = count_targets(app, active);
     if (n == 0) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to delete");
@@ -921,6 +1035,9 @@ static void render_progress_dialog(AppPanes* app) {
 }
 
 static void pump_progress_ui(AppPanes* app) {
+    // The progress dialog is drawn into the main window, so without one there is
+    // nothing to pump. The operation still runs; it just has no UI to abort.
+    if (!app->sdl_window) return;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) app->quit_request = true;
@@ -970,6 +1087,169 @@ static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move) {
     app->prog_files_total = 0;
     app->prog_t0 = SDL_GetTicks() / 1000.0;
     app->prog_last_pump = 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Archives
+// ---------------------------------------------------------------------------
+
+// The archive an operation applies to: the one the pane is inside, or the
+// archive file under the cursor.
+static bool archive_target(AppPanes* app, const Pane& pane, char* out, size_t cap) {
+    if (in_archive(pane)) { snprintf(out, cap, "%s", pane.archive_path); return true; }
+    if (pane.selected < 0 || pane.selected >= pane.entry_count) return false;
+    std::string full = std::string(pane.current_dir) + "/" + entry_rel(pane, pane.selected);
+    if (!arch_is_archive(full.c_str())) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "No archive under the cursor");
+        return false;
+    }
+    if (!arch_tool_available(arch_kind_of(full.c_str()))) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "No tool installed for %s archives",
+                 arch_kind_name(arch_kind_of(full.c_str())));
+        return false;
+    }
+    snprintf(out, cap, "%s", full.c_str());
+    return true;
+}
+
+// The real directory a pane stands in. Inside an archive that is the directory
+// holding the archive file, which is where extracting there has to land.
+static void pane_real_dir(const Pane& pane, char* out, size_t cap) {
+    if (!in_archive(pane)) { snprintf(out, cap, "%s", pane.current_dir); return; }
+    snprintf(out, cap, "%s", pane.archive_path);
+    char* slash = strrchr(out, '/');
+    if (slash) *slash = '\0';
+    else snprintf(out, cap, "/");
+}
+
+// The rows an operation applies to, named relative to the pane: everything
+// marked, or the row under the cursor when nothing is marked. In archive mode
+// these are member paths, which is exactly what the extract calls want.
+static StringList target_rel(const Pane& pane) {
+    StringList out;
+    int marks = marked_count(pane);
+    for (int i = 0; i < pane.entry_count; i++) {
+        if (marks == 0 && i != pane.selected) continue;
+        if (marks > 0 && !pane.marked[i]) continue;
+        if (strcmp(pane.entries[i]->name, "..") == 0) continue;
+        out.push_back(entry_rel(pane, i));
+    }
+    return out;
+}
+
+// Progress for an archive operation. The callback shape is the copy/move one,
+// so the existing dialog, its rate line and its Abort apply unchanged.
+static void arch_prog_begin(AppPanes* app, const char* src, const char* dst) {
+    app->prog_active = true;
+    app->prog_is_move = false;
+    app->prog_is_delete = false;
+    snprintf(app->prog_src, sizeof(app->prog_src), "%s", src);
+    snprintf(app->prog_dst, sizeof(app->prog_dst), "%s", dst);
+    app->prog_done = 0;
+    app->prog_total = 0;
+    app->prog_files_done = 0;
+    app->prog_files_total = 0;
+    app->prog_t0 = SDL_GetTicks() / 1000.0;
+    app->prog_last_pump = 0.0;
+}
+
+// TC Alt+F5 / Alt+Shift+F5. The archive name comes through the same operation
+// bar rename and mkdir use, so the suffix typed there is what picks the format.
+static void do_pack(AppPanes* app, bool and_delete) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (branch_blocked(app, active) || archive_readonly(app, active)) return;
+    StringList names = target_rel(active);
+    if (names.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to pack");
+        return;
+    }
+    if (!arch_can_pack(ARCH_ZIP)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Packing needs zip, tar or 7z installed");
+        return;
+    }
+    app->op = OP_PACK;
+    app->pack_and_delete = and_delete;
+    app->pack_names = names;
+    // Default name: the single source without its own suffix, else "archive".
+    std::string base = names[0];
+    size_t slash = base.find_last_of('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    snprintf(app->op_name, sizeof(app->op_name), "%s.zip",
+             names.size() == 1 ? base.c_str() : "archive");
+    snprintf(app->status_msg, sizeof(app->status_msg), "Pack %d entr%s",
+             (int)names.size(), names.size() == 1 ? "y" : "ies");
+}
+
+// TC Alt+F6 (into the other pane's directory) and Alt+F9 (into this one's).
+// Inside an archive, "this one's" means the directory holding the archive.
+static void do_extract(AppPanes* app, bool to_other_pane) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    char arch[4096], dest[4096];
+    if (!archive_target(app, active, arch, sizeof(arch))) return;
+    if (to_other_pane) {
+        if (in_archive(other)) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "The target pane is inside an archive");
+            return;
+        }
+        snprintf(dest, sizeof(dest), "%s", other.current_dir);
+    } else {
+        pane_real_dir(active, dest, sizeof(dest));
+    }
+    arch_prog_begin(app, arch, dest);
+    std::string err;
+    bool ok = arch_extract(arch, dest, copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Extracted %s into %s", arch, dest);
+    else snprintf(app->status_msg, sizeof(app->status_msg), "Extract failed: %s", err.c_str());
+    refresh_pane(&active, active.current_dir);
+    refresh_pane(&other, other.current_dir);
+}
+
+// TC Alt+Shift+F9: read every member and verify its CRC without writing anything.
+static void do_archive_test(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    char arch[4096];
+    if (!archive_target(app, active, arch, sizeof(arch))) return;
+    arch_prog_begin(app, arch, "integrity test");
+    std::string err;
+    bool ok = arch_test(arch, copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Archive OK: %s", arch);
+    else snprintf(app->status_msg, sizeof(app->status_msg), "Archive test failed: %s", err.c_str());
+}
+
+// Paste out of an archive: the clipboard holds member paths, so pasting is an
+// extraction of exactly those members.
+static void do_paste_archive_now(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    const char* arch = app->clipboard.archive;
+    std::vector<ArchEntry> members;
+    std::string lerr;
+    arch_list(arch, &members, &lerr);   // best effort: fall back to the display path
+    std::vector<std::string> raws;
+    for (const std::string& m : app->clipboard.paths) {
+        const ArchEntry* e = arch_find(members, m.c_str());
+        raws.push_back(e ? e->raw : m);
+    }
+    arch_prog_begin(app, arch, active.current_dir);
+    std::string err;
+    bool ok = arch_extract_members(arch, active.current_dir, raws, copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (ok) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Extracted %d member%s into %s",
+                 (int)raws.size(), raws.size() == 1 ? "" : "s", active.current_dir);
+        app->clipboard.paths.clear();
+        app->clipboard.archive[0] = '\0';
+    } else {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Extract failed: %s", err.c_str());
+    }
+    refresh_pane(&active, active.current_dir);
+    refresh_pane(&other, other.current_dir);
 }
 
 static int run_on_targets_prog(AppPanes* app, Pane& pane, bool is_move,
@@ -1036,6 +1316,7 @@ static void do_move_now(AppPanes* app) {
 static void do_copy(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
+    if (archive_readonly(app, active) || archive_readonly(app, other)) return;
     int existing = count_existing_targets(app, active, other.current_dir);
     if (existing > 0) {
         app->confirm = CONF_OVERWRITE;
@@ -1049,6 +1330,7 @@ static void do_copy(AppPanes* app) {
 static void do_move(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
+    if (archive_readonly(app, active) || archive_readonly(app, other)) return;
     int existing = count_existing_targets(app, active, other.current_dir);
     if (existing > 0) {
         app->confirm = CONF_OVERWRITE_MOVE;
@@ -1089,6 +1371,35 @@ static void path_parent_dir(const std::string& p, char* out, size_t cap) {
 }
 
 static void clipboard_set(AppPanes* app, Pane& pane, bool cut) {
+    if (in_archive(pane)) {
+        // Ctrl+C inside an archive puts members on the clipboard; pasting into a
+        // real directory extracts them. Cutting is refused because a member
+        // cannot be removed from an archive, and a clipboard that quietly
+        // dropped the delete half of a cut would be worse than one that says no.
+        if (cut) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Cannot cut archive members: an archive cannot be written into");
+            return;
+        }
+        StringList members = target_rel(pane);
+        if (members.empty()) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
+            return;
+        }
+        // The clipboard carries the member's full path inside the archive, not
+        // the level-relative display path: a paste happens somewhere else and
+        // has to name the member unambiguously.
+        if (pane.archive_prefix[0])
+            for (std::string& m : members)
+                m = std::string(pane.archive_prefix) + "/" + m;
+        app->clipboard.paths = members;
+        app->clipboard.cut = false;
+        snprintf(app->clipboard.archive, sizeof(app->clipboard.archive), "%s", pane.archive_path);
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%d member%s on the clipboard (copy)", (int)members.size(),
+                 members.size() == 1 ? "" : "s");
+        return;
+    }
     StringList paths = target_paths(pane);
     if (paths.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to %s",
@@ -1097,6 +1408,7 @@ static void clipboard_set(AppPanes* app, Pane& pane, bool cut) {
     }
     app->clipboard.paths = paths;
     app->clipboard.cut = cut;
+    app->clipboard.archive[0] = '\0';
     snprintf(app->status_msg, sizeof(app->status_msg),
              "%d entr%s on the clipboard (%s)", (int)paths.size(),
              paths.size() == 1 ? "y" : "ies", cut ? "cut" : "copy");
@@ -1111,7 +1423,10 @@ static void cmd_put_path(AppPanes* app, Pane& pane) {
         if (used + 1 < sizeof(app->cmd)) app->cmd[used++] = ' ';
     }
     app->cmd[used] = '\0';
-    snprintf(app->cmd + used, sizeof(app->cmd) - used, "%s", pane.current_dir);
+    // Inside an archive the pane's path is virtual and no shell would accept it,
+    // so the archive file itself is what is useful to put on the line.
+    snprintf(app->cmd + used, sizeof(app->cmd) - used, "%s",
+             in_archive(pane) ? pane.archive_path : pane.current_dir);
     snprintf(app->status_msg, sizeof(app->status_msg), "Path into the command line");
 }
 
@@ -1126,6 +1441,7 @@ static int count_existing_paths(const char* dst_dir, const StringList& paths) {
 }
 
 static void do_paste_now(AppPanes* app) {
+    if (app->clipboard.archive[0]) { do_paste_archive_now(app); return; }
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other  = app->left_focus ? app->right : app->left;
     if (app->clipboard.paths.empty()) return;
@@ -1165,6 +1481,7 @@ static void do_paste_now(AppPanes* app) {
 
 static void do_paste(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (archive_readonly(app, active)) return;
     if (app->clipboard.paths.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Clipboard is empty");
         return;
@@ -1216,6 +1533,19 @@ void app_panes_run_pending(AppPanes* app) {
 static char viewer_buf[256 * 1024];
 static float viewer_scroll = 0.0f;
 static bool  viewer_dirty = false;
+
+// The viewer can be showing a member unpacked into a temporary directory, so
+// closing it has to clean that up. One place so both close paths agree.
+static void close_viewer(AppPanes* app) {
+    app->viewer_open = false;
+    if (app->viewer_tmp_dir[0]) {
+        char cmd[4200];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", app->viewer_tmp_dir);
+        int rc = system(cmd);
+        (void)rc;
+        app->viewer_tmp_dir[0] = '\0';
+    }
+}
 
 static void open_viewer(AppPanes* app, const char* path) {
     snprintf(app->viewer_path, sizeof(app->viewer_path), "%s", path);
@@ -1298,6 +1628,11 @@ static void branch_fill(AppPanes* app, Pane& pane, bool marked_only) {
 }
 
 static void branch_toggle(AppPanes* app, Pane& pane, bool marked_only) {
+    if (in_archive(pane)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Branch view needs a directory (Backspace leaves the archive)");
+        return;
+    }
     if (pane.list_mode == LIST_BRANCH) {
         refresh_pane(&pane, pane.current_dir);
         snprintf(app->status_msg, sizeof(app->status_msg), "Branch view off");
@@ -1306,18 +1641,54 @@ static void branch_toggle(AppPanes* app, Pane& pane, bool marked_only) {
     branch_fill(app, pane, marked_only);
 }
 
-// Path of a row inside its pane is handled by entry_rel(); rename and mkdir are
-// not, so they stay out of branch view.
-static bool branch_blocked(AppPanes* app, const Pane& pane) {
-    if (pane.list_mode != LIST_BRANCH) return false;
-    snprintf(app->status_msg, sizeof(app->status_msg), "Not available in branch view (Ctrl+B exits)");
-    return true;
+// The tool-facing name of a member the pane is showing. A row's rel is relative
+// to the level being listed, which is what the virtual path needs, while the
+// tool wants the member's full path inside the archive (and tar can store that
+// with a "./" prefix, so the listing is re-read to map one onto the other).
+// Ops are rare enough that the extra listing is cheaper than a second parallel
+// vector on every row.
+static std::string member_raw(const Pane& pane, const char* rel) {
+    std::string full = rel ? rel : "";
+    if (pane.archive_prefix[0]) full = std::string(pane.archive_prefix) + "/" + full;
+    std::vector<ArchEntry> members;
+    std::string err;
+    if (arch_list(pane.archive_path, &members, &err)) {
+        const ArchEntry* e = arch_find(members, full.c_str());
+        if (e) return e->raw;
+    }
+    return full;
+}
+
+// Open a row in the viewer. Inside an archive the member is unpacked to a
+// temporary file first, and the viewer takes the temporary directory away when
+// it closes; everywhere else the row's path is already a real file.
+static void view_entry(AppPanes* app, Pane& pane, int idx) {
+    if (idx < 0 || idx >= pane.entry_count) return;
+    const char* rel = entry_rel(pane, idx);
+    if (in_archive(pane)) {
+        char tmp[4300], tmpdir[4096];
+        std::string err;
+        if (arch_extract_temp(pane.archive_path, member_raw(pane, rel).c_str(),
+                              tmp, sizeof(tmp), tmpdir, sizeof(tmpdir), &err)) {
+            snprintf(app->viewer_tmp_dir, sizeof(app->viewer_tmp_dir), "%s", tmpdir);
+            open_viewer(app, tmp);
+        } else {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s: %s",
+                     pane.entries[idx]->name, err.c_str());
+        }
+        return;
+    }
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
+    open_viewer(app, full);
 }
 
 static void activate_entry(AppPanes* app, Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count) return;
     FileEntry* e = pane.entries[idx];
     const char* rel = entry_rel(pane, idx);
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
     if (strcmp(e->name, "..") == 0) {
         char parentbuf[4096];
         snprintf(parentbuf, sizeof(parentbuf), "%s", pane.current_dir);
@@ -1327,14 +1698,20 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
         char path[4100];
         snprintf(path, sizeof(path), "%s/%s", pane.current_dir, rel);
         navigate_to(app, &pane, path);
+    } else if (arch_is_archive(full)) {
+        // TC opens an archive as if it were a directory. The path stays virtual
+        // from here on: everything below it is a member, not a file.
+        navigate_to(app, &pane, full);
+    } else if (pane.archive_path[0]) {
+        // A member of the archive being browsed: unpack just this one rather
+        // than the whole archive.
+        view_entry(app, pane, idx);
     } else if (is_executable(e->name, e->mode)) {
         char full[4300];
         snprintf(full, sizeof(full), "\"%s/%s\" 2>&1", pane.current_dir, rel);
         run_shell_and_show(app, full);
     } else {
-        char full[4100];
-        snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
-        open_viewer(app, full);
+        view_entry(app, pane, idx);
     }
 }
 
@@ -1454,6 +1831,11 @@ static void tree_open(AppPanes* app, Pane& pane) {
 // The model is refilled on the way in so the tree is always rooted at what the
 // pane is showing.
 static void tree_mode_toggle(AppPanes* app, Pane& pane, int mode) {
+    if (in_archive(pane)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "The tree needs a real directory (Backspace leaves the archive)");
+        return;
+    }
     pane.tree_mode = (pane.tree_mode == mode) ? TREE_OFF : mode;
     if (pane.tree_mode != TREE_OFF) {
         tree_fill(pane);
@@ -1610,11 +1992,7 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
         return;
     }
     if (ImGui::MenuItem("Open")) activate_entry(app, pane, pane.selected);
-    if (ImGui::MenuItem("View")) {
-        char full[4100];
-        snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, pane.selected));
-        open_viewer(app, full);
-    }
+    if (ImGui::MenuItem("View")) view_entry(app, pane, pane.selected);
     if (ImGui::MenuItem("Rename")) {
         app->op = OP_RENAME;
         snprintf(app->op_name, sizeof(app->op_name), "%s", e->name);
@@ -1685,6 +2063,14 @@ static char qv_path[4100];
 static void render_quick_view_panel(AppPanes* app, float w, float h, const char* id) {
     Pane& src = app->left_focus ? app->left : app->right;
     ImGui::BeginChild(id, ImVec2(w, h));
+    if (in_archive(src)) {
+        // The preview reads real files; a member has to be unpacked first, which
+        // is what Enter does.
+        qv_path[0] = '\0';
+        ImGui::TextDisabled("(archive member: Enter opens it, Alt+F9 extracts the archive)");
+        ImGui::EndChild();
+        return;
+    }
     if (src.selected < 0 || src.selected >= src.entry_count) {
         ImGui::TextDisabled("(nothing under the cursor)");
         ImGui::EndChild();
@@ -2151,7 +2537,7 @@ static void render_viewer(AppPanes* app) {
         viewer_dirty = false;
     }
     ImGui::EndChild();
-    if (!open) app->viewer_open = false;
+    if (!open) close_viewer(app);
     ImGui::End();
 }
 
@@ -2424,7 +2810,13 @@ static void render_about(AppPanes* app) {
         "Shift+F4 new file and edit    Shift+F5 copy in place  Shift+F6 rename in place\n"
         "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n"
         "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n"
-        "Ctrl+Shift+F8 tree in the panel   Shift+Tab split view: tree + list\n\n"
+        "Ctrl+Shift+F8 tree in the panel   Shift+Tab split view: tree + list\n"
+        "ARCHIVES (zip, tar, tar.gz/bz2/xz, 7z, RAR read-only)\n"
+        "Enter on an archive browses it like a folder; Backspace leaves it\n"
+        "Alt+F5 pack        Alt+Shift+F5 pack and remove the sources\n"
+        "Alt+F6 extract into the other pane   Alt+F9 extract into this one\n"
+        "Alt+Shift+F9 test archive integrity  Ctrl+C/V copy members out\n"
+        "An archive's contents are read-only: extract, change, pack again\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
         "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
     if (!open) app->about_open = false;
@@ -2433,6 +2825,11 @@ static void render_about(AppPanes* app) {
 
 // Properties dialog (Alt+Enter): recursive count + size of the selected entry.
 static void open_properties(AppPanes* app, Pane& pane) {
+    if (in_archive(pane)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Properties need a directory (Backspace leaves the archive)");
+        return;
+    }
     if (pane.selected < 0 || pane.selected >= pane.entry_count) return;
     FileEntry* e = pane.entries[pane.selected];
     char full[4100];
@@ -2524,10 +2921,8 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Tree in this panel", "Ctrl+Shift+F8")) tree_mode_toggle(app, active, TREE_EMBED);
     if (ImGui::MenuItem("Split view: tree + list", "Shift+Tab")) tree_mode_toggle(app, active, TREE_SPLIT);
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
-    // Reserved but not implemented: greyed out so the shortcut is discoverable
-    // without pretending the feature exists.
-    ImGui::MenuItem("Pack archive", "Alt+F5", false, false);
-    ImGui::MenuItem("Extract archive", "Alt+F6", false, false);
+    if (ImGui::MenuItem("Pack archive", "Alt+F5")) do_pack(app, false);
+    if (ImGui::MenuItem("Extract archive", "Alt+F6")) do_extract(app, true);
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
     if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
     if (ImGui::MenuItem("Copy in place", "Shift+F5")) do_copy_in_place(app);
@@ -2737,6 +3132,7 @@ void app_panes_render(AppPanes* app) {
     if (app->op != OP_NONE) {
         const char* label = app->op == OP_RENAME ? "Rename to:"
                           : app->op == OP_NEWFILE ? "New file name:"
+                          : app->op == OP_PACK ? "Pack into:"
                           : "New directory name:";
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
@@ -2910,6 +3306,53 @@ void app_panes_free(AppPanes* app) {
 
 void app_panes_commit_op(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (app->op == OP_PACK) {
+        char dir[4096];
+        snprintf(dir, sizeof(dir), "%s", active.current_dir);
+        std::string arch = std::string(dir) + "/" + app->op_name;
+        ArchKind kind = arch_kind_of(arch.c_str());
+        StringList names = app->pack_names;
+        app->pack_names.clear();
+        if (kind == ARCH_NONE || !arch_can_pack(kind)) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Cannot pack %s: the name has to end in .zip, .tar, .tar.gz, .tar.bz2, "
+                     ".tar.xz or .7z", app->op_name);
+        } else {
+            arch_prog_begin(app, dir, arch.c_str());
+            std::string err;
+            bool ok = arch_pack(arch.c_str(), dir, names, copy_progress_cb, app, &err);
+            app->prog_active = false;
+            if (ok) {
+                int removed = 0;
+                // Alt+Shift+F5 is a move into the archive, so the sources go too.
+                if (app->pack_and_delete) {
+                    for (const std::string& n : names) {
+                        std::string full = std::string(dir) + "/" + n;
+                        if (fs_delete_entry_progress(full.c_str(), copy_progress_cb, app)) removed++;
+                    }
+                }
+                snprintf(app->status_msg, sizeof(app->status_msg), "Packed %d entr%s into %s%s",
+                         (int)names.size(), names.size() == 1 ? "y" : "ies", arch.c_str(),
+                         removed ? ", removed the sources" : "");
+                refresh_pane(&active, active.current_dir);
+                Pane& other = app->left_focus ? app->right : app->left;
+                refresh_pane(&other, other.current_dir);
+            } else {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Pack failed: %s", err.c_str());
+            }
+        }
+        app->pack_and_delete = false;
+        app->op = OP_NONE;
+        app->op_input_active = false;
+        return;
+    }
+    // Rename, mkdir and new file all build a path under the pane's directory, so
+    // they cannot run on archive members.
+    if (archive_readonly(app, active)) {
+        app->op = OP_NONE;
+        app->op_input_active = false;
+        return;
+    }
     if (app->op == OP_MKDIR) {
         char path[4100];
         snprintf(path, sizeof(path), "%s/%s", active.current_dir, app->op_name);
@@ -2961,6 +3404,7 @@ static void unique_copy_name(const char* dir, const char* base, char* out, size_
 
 static void do_copy_in_place(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (archive_readonly(app, active)) return;
     StringList srcs = target_paths(active);
     if (srcs.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
@@ -2982,6 +3426,7 @@ static void do_copy_in_place(AppPanes* app) {
 static void do_symlink_other(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
+    if (archive_readonly(app, active) || archive_readonly(app, other)) return;
     StringList srcs = target_paths(active);
     if (srcs.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to link");
@@ -3021,6 +3466,11 @@ static const int DIRSIZE_PER_PRESS = 200;
 
 static void fill_dir_sizes(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (in_archive(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Directory sizes need a real directory");
+        return;
+    }
     int done = 0, left = 0;
     for (int r = 0; r < (int)active.view.size(); r++) {
         int i = active.view[r];
@@ -3138,7 +3588,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // ---- full viewer keys ----
     if (app->viewer_open) {
         if (key == SDLK_ESCAPE || key == SDLK_RETURN || key == SDLK_KP_ENTER ||
-            key == SDLK_Q) { app->viewer_open = false; return; }
+            key == SDLK_Q) { close_viewer(app); return; }
         if (key == SDLK_PAGEDOWN) { viewer_scroll += 300.0f; viewer_dirty = true; return; }
         if (key == SDLK_PAGEUP)   { viewer_scroll -= 300.0f; viewer_dirty = true; return; }
         if (key == SDLK_DOWN)     { viewer_scroll += 20.0f;  viewer_dirty = true; return; }
@@ -3256,11 +3706,12 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (is_archive_key(key, mod)) {
-        const char* what = (key == SDLK_F5) ? (shift ? "Pack and delete" : "Pack")
-                       : (key == SDLK_F9 && shift) ? "Test archive"
-                       : "Extract from archive";
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "%s: archives are not supported yet", what);
+        // TC's archive keys. Alt+F5 asks for the archive name through the
+        // operation bar; the rest run straight away with the progress dialog.
+        if (key == SDLK_F5) do_pack(app, shift);
+        else if (key == SDLK_F6) do_extract(app, true);
+        else if (shift) do_archive_test(app);
+        else do_extract(app, false);
         return;
     }
     if (key == SDLK_F10) {
@@ -3423,9 +3874,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             if (is_directory(e->name, e->mode)) {
                 snprintf(app->status_msg, sizeof(app->status_msg), "Shift+F3: not a file");
             } else {
-                char full[4100];
-                snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
-                open_viewer(app, full);
+                view_entry(app, active, active.selected);
                 if (marked_count(active) > 1)
                     snprintf(app->status_msg, sizeof(app->status_msg),
                              "Viewing only %s (%d marked ignored)", e->name, marked_count(active));
@@ -3499,9 +3948,14 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // Alt+F3: open the cursor entry with the desktop's default application.
     if (key == SDLK_F3 && (mod & SDL_KMOD_ALT)) {
         if (active.selected >= 0 && active.selected < active.entry_count) {
+            if (in_archive(active)) {
+                snprintf(app->status_msg, sizeof(app->status_msg),
+                         "An archive member has to be extracted first (Alt+F9)");
+                return;
+            }
             char full[4100];
             snprintf(full, sizeof(full), "%s/%s", active.current_dir,
-                     active.entries[active.selected]->name);
+                     entry_rel(active, active.selected));
             open_with_default(app, full);
         }
         return;
@@ -3559,7 +4013,10 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_F4) {
         if (active.selected < active.entry_count) {
             FileEntry* e = active.entries[active.selected];
-            if (!is_directory(e->name, e->mode)) {
+            if (in_archive(active)) {
+                snprintf(app->status_msg, sizeof(app->status_msg),
+                         "Editing an archive member needs a real file (Alt+F9 extracts it)");
+            } else if (!is_directory(e->name, e->mode)) {
                 char full[4100];
                 snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
                 spawn_terminal_editor(app, full);

@@ -40,6 +40,11 @@ bool is_directory(const char* name, mode_t mode);
 // Check if entry is executable
 bool is_executable(const char* name, mode_t mode);
 
+// The comparator list_directory() sorts with: directories first, then by the
+// current fs_get_sort_mode() key. Exposed so a listing built from somewhere
+// other than readdir (archive members) sorts exactly like a real directory.
+int compare_files(const void* a, const void* b);
+
 // File operations (return true on success)
 bool fs_copy_entry(const char* src, const char* dst);   // recursive for directories
 bool fs_delete_entry(const char* path);                 // recursive for directories

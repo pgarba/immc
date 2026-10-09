@@ -9,9 +9,9 @@ Audited against: `src/panes.cpp` (key handler `app_panes_handle_key` @1624-1865,
 1. **TC-faithful bindings.** Where our MC-style key collides with the TC table, TC wins and the MC
    binding is dropped or moved. Migration is done up-front (Phase 0) so later phases land on the
    final keymap once.
-2. **Scope = parity minus archives.** Everything implementable without a new third-party dependency.
-   Pack/unpack/browse (Alt+F5, Alt+Shift+F5, Alt+F6, Alt+F9, Alt+Shift+F9) is deferred, not dropped —
-   see §6.
+2. **Scope = parity, archives included.** Everything implementable without a new third-party
+   dependency. Pack/unpack/browse (Alt+F5, Alt+Shift+F5, Alt+F6, Alt+F9, Alt+Shift+F9) shipped by
+   driving the installed CLI tools instead of linking an archive library — see §6.
 3. Deliberate deviations from the table are listed in §5 with the reason.
 
 Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind that key to something else ·
@@ -36,12 +36,13 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
 
-**Nothing in §2 is open except archives (§6).**
+**Nothing in §2 is open: archives (§6) closed the last gap.**
 
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
-`fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, and the tree model)
-run headless — 196 checks: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
+`fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, and
+the archive pane mode with its guards and operations) run headless — 270 checks in `test-panes` plus
+150 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
 `?` was never handled in the glob matcher, and `tree_toggle()` kept a `vector` reference across an
 `insert()`, so the `expanded` flag was written to freed memory and the next press duplicated the
 row's children. Bindings are now also driven through `app_panes_handle_key` itself, not only through
@@ -86,8 +87,8 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 | Alt+F3 internal/external viewer | unbound | MISS | Alt+F3 → `xdg-open` on cursor entry |
 | Alt+Shift+F3 plugin-less lister | — | OUT | no plugin system |
 | Alt+F4 quit / minimize | Alt+Q only | PART | add `Alt+F4` |
-| Alt+F5 / Alt+Shift+F5 pack | — | OUT | archives (§6) |
-| Alt+F6 / Alt+F9 / Alt+Shift+F9 unpack, test | — | OUT | archives (§6) |
+| Alt+F5 / Alt+Shift+F5 pack | `Alt+F5`, `Alt+Shift+F5` | DONE | name asked through the operation bar; suffix picks the format |
+| Alt+F6 / Alt+F9 / Alt+Shift+F9 unpack, test | `Alt+F6`, `Alt+F9`, `Alt+Shift+F9` | DONE | into the other pane / into this one / CRC check |
 | Alt+F7 search | Shift+F7 | PART | bind `Alt+F7` (keep Shift+F7 as alias) |
 | Alt+F8 command-history popup | Alt+PgUp/PgDn cycling only | MISS | history popup above the command line |
 | Alt+F10 directory tree window | unbound | MISS | tree popup, Enter jumps |
@@ -171,9 +172,10 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 ### Out of scope (Windows/legacy or dependency-bound)
 FTP (`Ctrl+F`, `Ctrl+Shift+F`, `Ctrl+N`, `Ctrl+Shift+M`) · thumbnails (`Ctrl+Shift+F1`) · comments
 (`Ctrl+Z`, `Ctrl+Shift+F2`) · printing (`Ctrl+F9`) · NOCLOSE.PIF · buttonbar (`Alt+Shift+F11`) ·
-drive letters (`Alt+F1/F2` → implemented as mount picker instead) · archives (§6).
+drive letters (`Alt+F1/F2` → implemented as mount picker instead) · writing into RAR (no writer in
+`7z`, so RAR is read-only) · archive *mutations* (rename/delete/move inside an archive).
 
-**Count:** ~30 exact matches, ~14 partial, ~35 missing, 6 conflicts to migrate, ~14 out of scope.
+**Count:** ~34 exact matches, ~14 partial, ~33 missing, 6 conflicts to migrate, ~14 out of scope.
 
 ---
 
@@ -324,23 +326,63 @@ above.
 | `Shift+F2` compares content | compares name + size + type | content compare needs a diff engine; size/type mismatch is the 95% case. Colors come from the new theme slots `diff_missing` / `diff_differ`. |
 | `AltGr+letter` quick search | same, detected as `SDL_KMOD_MODE` or `SDL_KMOD_RALT` | SDL3 has no `SDL_KMOD_ALTGR`. The binding is tested before the `Alt+letter` handlers so `AltGr+Q` searches instead of quitting. |
 | tree panel keyboard | embed mode: keyboard drives the tree; split mode: keyboard stays with the file list | in a split panel there is no third focus to cycle to, and `Tab` already switches panes in TC. The tree is mouse-driven in split mode. |
+| archives use a plugin/packer dialog | CLI tools (`zip`/`unzip`, `tar`, `7z`) through `fork`/`execvp` | no third-party dependency is linked, and the shape matches the helpers we already shell out to (`gio trash`, `xdg-open`). The cost is that a format without its tool installed reports "No tool installed for … archives" instead of working. |
+| unpack asks a dialog (path, overwrite, subdirs) | the destination is a pane directory, and existing members are overwritten (`unzip -o`, `7z -y`, `tar`'s default) | a modal per-file overwrite prompt inside the progress dialog is not implementable at this size, and a tool that prompts on a stdin it cannot answer would hang the operation. Overwrite is also what the other two tools do by default, so all three behave the same. |
+| rename/delete/move inside an archive | refused | a partial implementation would have to rewrite the archive to answer the shortcut. Extract, change, pack again is the TC workflow anyway, and the refusal says so. |
+| RAR read/write | read, extract, test only | `7z` registers Rar and Rar5 decoders but has no writer, and there is no free RAR encoder to shell out to. |
 
 ---
 
-## 6. Deferred: archives
+## 6. Archives
 
-`Alt+F5` pack · `Alt+Shift+F5` pack+delete · `Alt+F6`/`Alt+F9` unpack under cursor ·
-`Alt+Shift+F9` integrity test · browsing an archive as a pane. Needs a dependency (zip-only via
-`miniz` vendored in `extern_dont_commit`, or `libarchive` for zip+tar). Design when picked: an
-`ArchiveBackend` interface behind `list_directory`/`fs_copy_entry` with a pane "inside archive" flag;
-branch/compare/filter then need to skip archive modes. Estimated 2-4 days — the single largest item.
+No archive library is linked. `src/archive.{h,cpp}` drives the CLI tools that are already on the
+machine — `zip`/`unzip`, `tar`, and `7z` — the same way the trash and "open with" features drive
+`gio trash` and `xdg-open`. Formats follow the file suffix: `.zip`, `.tar`, `.tar.gz/.tgz`,
+`.tar.bz2`, `.tar.xz`, `.7z`, and `.rar`/`.rar5` read-only through `7z`, which ships Rar and Rar5
+decoders. There is no RAR writer, so RAR is browse/extract/test only.
 
-**The bindings are reserved anyway.** They used to fall through to the plain `F5`/`F6`/`F9` handlers,
-so `Alt+F5` quietly ran a copy and `Alt+F9` opened the pane menu. `is_archive_key()` now claims all
-five and the status line says which archive operation is missing; the Commands menu shows
-"Pack archive" / "Extract archive" greyed out so the shortcuts are discoverable. The plain `F5`, `F6`
-and `F9` handlers also refuse `Alt`/`Ctrl`, so a future archive implementation cannot regress into a
-copy again.
+**Members are argv, never shell text.** Every operation builds an `argv` array and runs it through
+`fork`/`execvp`, so a member named `a file.txt`, `it's.txt` or `*.txt` behaves like any other. The
+runner merges stdout and stderr, parses progress out of the tool's own lines (one per member for
+`zip`/`unzip`/`tar`, percentages for `7z`), and kills the child when the progress dialog's Abort is
+used — archive operations reuse the copy/move progress dialog and its callback signature unchanged.
+
+**Two names per member.** `ArchEntry` keeps `rel` (normalised: no `./`, no trailing `/`) for display
+and for the virtual tree, and `raw` (exactly what the tool listed) for the extraction argv. They
+differ in real archives: `tar czf x.tgz -C dir .` stores `./a file.txt`. Passing the display name back
+to `tar` would find nothing, so extraction always goes through `raw`.
+
+**Browsing is a pane mode, not a parallel UI.** A pane's `current_dir` may be a *virtual* path —
+`/home/adam/pkg.zip/sub` — and `arch_split_virtual()` finds the first component that is an existing
+regular file with an archive suffix. Everything downstream (tabs, tab labels, directory history, the
+path bar, the hotlist, filters, marks, selection memory, `Ctrl+Left/Right`, `Ctrl+Up`) therefore works
+without knowing archives exist. A directory that merely *looks* like an archive is not a boundary:
+only a regular file with an archive suffix is. `LIST_ARCHIVE` rows carry their level-relative path in
+`Pane::rel`, which is what makes the virtual path compose; the tool-facing member name is that path
+plus the pane's `archive_prefix`.
+
+**Archive contents are read-only, and the guards say so.** Rename, mkdir, new file, delete, cut,
+paste, copy/move in or out, copy-in-place, links, branch view, the tree panel, search, properties,
+directory sizes, the editor and "open with the default application" all refuse inside an archive
+rather than resolving a path that does not exist on disk. The way to change an archive is the way it
+is in TC: extract, change, pack again. `Ctrl+P` puts the *archive file* on the command line, never
+the virtual path.
+
+**Operations.** `Alt+F5` packs the marks (or the cursor row) and asks for the archive name through
+the same operation bar rename and mkdir use, so the suffix typed there chooses the format; `Alt+Shift+F5`
+removes the sources afterwards, which makes it a move into the archive. `Alt+F6` extracts the archive
+under the cursor into the other pane's directory, `Alt+F9` into this pane's (inside an archive, "this
+pane's" means the directory holding the archive file), `Alt+Shift+F9` verifies every member's CRC
+without writing. `Ctrl+C` inside an archive puts members on the clipboard with the archive as their
+context, and `Ctrl+V` in a real directory extracts exactly those; `Ctrl+X` there refuses instead of
+pretending a member can be deleted. `Enter` on a member unpacks only that member into a temporary
+directory and opens the viewer, which removes the directory when it closes.
+
+**The bindings were reserved before they were implemented.** They used to fall through to the plain
+`F5`/`F6`/`F9` handlers, so `Alt+F5` quietly ran a copy and `Alt+F9` opened the pane menu.
+`is_archive_key()` claims all five, and the plain `F5`, `F6` and `F9` handlers refuse `Alt`/`Ctrl`, so
+an archive operation cannot regress into a copy again. `test_archive_keys_live` drives the real key
+handler to keep that honest.
 
 ---
 
@@ -357,7 +399,8 @@ copy again.
 | 7 | F file ops | 3h | 20h |
 | 8 | G trash | 1h | 21h |
 | 9 | H multi-rename / quick search / columns | 2d | — |
-| — | archives | 2-4d | — |
+| 10 | I keymap re-audit (Ctrl+P, Ctrl+I) | 1h | — |
+| 11 | archives (backend, browsing, operations) | 2d | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -371,3 +414,15 @@ Manual checklist (extend per phase):
 5. Branch view on a deep tree stays under the entry cap and Esc returns to list mode.
 6. Compare colours render under all 7 themes.
 7. Command-line text editing still supports `Ctrl+C/X/V` when the command line is non-empty.
+8. `Enter` on a `.zip`/`.tar.gz`/`.7z`/`.rar` browses it; `Tab`, `Ctrl+Tab`, `Ctrl+Left/Right`,
+   `Ctrl+U`, the hotlist and `Alt+Left/Right` all carry the virtual path; `Backspace` leaves one level
+   and then the archive.
+9. Inside an archive every mutation says no: `F2`, `F7`, `Shift+F4`, `F8`, `Ctrl+X`, `Ctrl+V`, `F5`,
+   `F6`, `Ctrl+B`, `Alt+F10`, `Alt+Enter`, `Alt+F7`, `F4`, `Alt+F3`.
+10. `Alt+F5` → name the archive → the file exists and `Alt+F9` on it gives the sources back;
+    `Alt+Shift+F5` leaves only the archive behind; `Alt+F6` lands in the other pane;
+    `Alt+Shift+F9` says "Archive OK".
+11. `Ctrl+C` on two members, `Ctrl+V` in a real directory extracts those two and nothing else;
+    `Ctrl+X` there refuses.
+12. A pack or extract over a large archive still responds to Abort in the progress dialog, and the
+    operation stops without leaving a partial status message claiming success.

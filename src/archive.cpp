@@ -894,20 +894,55 @@ bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string
 }
 
 bool arch_extract_temp(const char* archive, const char* raw_member,
-                       char* out_path, size_t cap, std::string* err) {
+                       char* out_path, size_t cap,
+                       char* out_dir, size_t dcap, std::string* err) {
     char tmpl[] = "/tmp/mc-clone-arch-XXXXXX";
     const char* dir = mkdtemp(tmpl);
     if (!dir) { *err = std::strerror(errno); return false; }
+    snprintf(out_dir, dcap, "%s", dir);
     std::vector<std::string> one{ raw_member };
     if (!arch_extract_members(archive, dir, one, nullptr, nullptr, err)) {
         // Clean up the half-made directory before giving up.
         run_capture({ "rm", "-rf", std::string(dir) }, nullptr, err, err);
+        out_dir[0] = '\0';
         return false;
     }
     snprintf(out_path, cap, "%s/%s", dir, raw_member);
     if (access(out_path, R_OK) != 0) {
-        snprintf(out_path, cap, "%s/%s", dir, raw_member);
-        if (access(out_path, R_OK) != 0) { *err = "the extracted member is missing"; return false; }
+        *err = "the extracted member is missing";
+        return false;
     }
     return true;
+}
+
+bool arch_split_virtual(const char* path, char* archive, size_t acap,
+                        char* prefix, size_t pcap) {
+    if (!path || !*path) return false;
+    std::string p(path);
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+
+    size_t i = 0;
+    while (i < p.size()) {
+        size_t slash = p.find('/', i);
+        size_t end = (slash == std::string::npos) ? p.size() : slash;
+        std::string head = p.substr(0, end);
+        struct stat st;
+        // Only a regular file with an archive extension opens as an archive.
+        if (stat(head.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+            arch_kind_of(head.c_str()) != ARCH_NONE) {
+            snprintf(archive, acap, "%s", head.c_str());
+            std::string rest = (end == p.size()) ? std::string() : p.substr(end + 1);
+            snprintf(prefix, pcap, "%s", rest.c_str());
+            return true;
+        }
+        if (end == p.size()) break;
+        i = end + 1;
+    }
+    return false;
+}
+
+const ArchEntry* arch_find(const std::vector<ArchEntry>& listing, const char* rel) {
+    if (!rel) return nullptr;
+    for (const ArchEntry& e : listing) if (!strcmp(e.rel, rel)) return &e;
+    return nullptr;
 }

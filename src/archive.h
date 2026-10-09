@@ -83,8 +83,23 @@ bool arch_pack(const char* archive, const char* cwd,
 bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string* err);
 
 // Extract one member to a temporary file and return its path, for viewing an
-// archive member without unpacking the whole thing. Caller unlink()s it.
+// archive member without unpacking the whole thing. `out_dir` receives the
+// temporary directory holding it, which the caller removes when it is done.
 bool arch_extract_temp(const char* archive, const char* raw_member,
-                       char* out_path, size_t cap, std::string* err);
+                       char* out_path, size_t cap,
+                       char* out_dir, size_t dcap, std::string* err);
+
+// Split a virtual archive path ("/real/a.zip/inner/dir") into the archive file
+// and the member prefix inside it. A path counts as virtual as soon as one of
+// its components is an existing regular file with an archive extension. That
+// lets tabs, directory history, the path bar and the hotlist carry an archive
+// location without knowing anything about archives. Ordinary directories are
+// never shadowed: a real directory named "x.zip" stays a directory.
+bool arch_split_virtual(const char* path, char* archive, size_t acap,
+                        char* prefix, size_t pcap);
+
+// Look up a member by its display path. Returns null when the listing has no
+// such member.
+const ArchEntry* arch_find(const std::vector<ArchEntry>& listing, const char* rel);
 
 #endif // ARCHIVE_H

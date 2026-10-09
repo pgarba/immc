@@ -29,6 +29,8 @@ static void touch_file(const std::string& dir, const char* name) {
     if (f) { fputs("hello\n", f); fclose(f); }
 }
 
+static void sh(const std::string& cmd) { int rc = system(cmd.c_str()); (void)rc; }
+
 static int idx_of(const Pane& p, const char* name) {
     for (int i = 0; i < p.entry_count; i++)
         if (strcmp(p.entries[i]->name, name) == 0) return i;
@@ -494,49 +496,289 @@ static void test_archive_keys_live(AppPanes* app, const std::string& root) {
     app->left_focus = true;
     refresh_pane(&p, root.c_str());
     int before = p.entry_count;
+    bool copy_existed = fs_exists((root + "/alpha.txt.copy").c_str());
 
     int ai = idx_of(p, "alpha.txt");
     CHECK(ai >= 0);
     p.selected = ai;
     p.marked[ai] = true;
 
+    // Alt+F5 asks for an archive name; it must not fall through to a copy.
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
-    CHECK(strstr(app->status_msg, "Pack") != NULL);
-    CHECK(strstr(app->status_msg, "not supported") != NULL);
+    CHECK(app->op == OP_PACK);
     CHECK(!app->prog_active);
-    CHECK(app->pending_op == 0);
     CHECK(app->clipboard.paths.empty());      // nothing queued for a copy
+    app_panes_cancel_op(app);
 
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
-    CHECK(strstr(app->status_msg, "Pack and delete") != NULL);
+    CHECK(app->op == OP_PACK);
     CHECK(fs_exists((root + "/alpha.txt").c_str()));   // not deleted
+    app_panes_cancel_op(app);
 
+    // With no archive under the cursor the extract keys say so and do nothing.
     app_panes_handle_key(app, SDLK_F6, SDL_KMOD_ALT);
-    CHECK(strstr(app->status_msg, "Extract") != NULL);
+    CHECK(strstr(app->status_msg, "No archive under the cursor") != NULL);
     CHECK(!app->prog_active);
 
-    app->pane_menu_open = false;
     app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT);
-    CHECK(!app->pane_menu_open);              // the pane menu stays shut
-    CHECK(strstr(app->status_msg, "Extract") != NULL);
+    CHECK(strstr(app->status_msg, "No archive under the cursor") != NULL);
 
     app->pane_menu_open = false;
     app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
-    CHECK(!app->pane_menu_open);
-    CHECK(strstr(app->status_msg, "Test archive") != NULL);
+    CHECK(!app->pane_menu_open);              // the pane menu stays shut
+    CHECK(strstr(app->status_msg, "No archive under the cursor") != NULL);
 
     refresh_pane(&p, root.c_str());
     CHECK(p.entry_count == before);           // no copies, no .copy files, no moves
     CHECK(fs_exists((root + "/alpha.txt").c_str()));
+    CHECK(fs_exists((root + "/alpha.txt.copy").c_str()) == copy_existed);
+    clear_marks(p);
 
     // the unmodified key still opens the pane menu
     app_panes_handle_key(app, SDLK_F9, SDL_KMOD_NONE);
     CHECK(app->pane_menu_open);
     app->pane_menu_open = false;
+}
 
-    free_entries(p.entries, p.entry_count);
-    p.entries = nullptr;
-    p.entry_count = 0;
+static bool dir_exists(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// Enter on an archive opens it as a pane, exactly like a directory: rows, a
+// virtual path the rest of the pane can carry, and folders inside it to walk.
+static void test_archive_browse(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+
+    refresh_pane(&p, root.c_str());
+    int zi = idx_of(p, "pkg.zip");
+    CHECK(zi >= 0);
+    CHECK(p.archive_path[0] == '\0');           // still a plain directory listing
+
+    p.selected = zi;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(strcmp(p.current_dir, (root + "/pkg.zip").c_str()) == 0);
+    CHECK(p.list_mode == LIST_ARCHIVE);
+    CHECK(strcmp(p.archive_path, (root + "/pkg.zip").c_str()) == 0);
+    CHECK(p.archive_prefix[0] == '\0');
+    CHECK(idx_of(p, "one.txt") >= 0);
+    CHECK(idx_of(p, "two.txt") >= 0);
+    CHECK(idx_of(p, "sub") >= 0);
+    CHECK(idx_of(p, "..") < 0);                // Backspace leaves the archive
+
+    // A folder inside the archive is an ordinary row that can be walked into.
+    p.selected = idx_of(p, "sub");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(strcmp(p.archive_prefix, "sub") == 0);
+    CHECK(idx_of(p, "..") >= 0);
+    int ii = idx_of(p, "inner.txt");
+    CHECK(ii >= 0);
+    // A row's rel is relative to the level being listed, which is what makes the
+    // virtual path come out right; the tool-facing member name is derived from
+    // it plus the pane's prefix.
+    CHECK(strcmp(p.rel[ii].c_str(), "inner.txt") == 0);
+    CHECK(strcmp(member_raw(p, p.rel[ii].c_str()).c_str(), "sub/inner.txt") == 0);
+
+    // Enter on a member unpacks just that one and opens the viewer; closing the
+    // viewer takes the temporary directory with it.
+    p.selected = ii;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->viewer_open);
+    CHECK(app->viewer_tmp_dir[0] != '\0');
+    CHECK(dir_exists(app->viewer_tmp_dir));
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(!app->viewer_open);
+    CHECK(app->viewer_tmp_dir[0] == '\0');
+    CHECK(!dir_exists(app->viewer_tmp_dir));
+
+    // Shift+F3 (view only the entry under the cursor) unpacks the same way.
+    p.selected = ii;
+    app_panes_handle_key(app, SDLK_F3, SDL_KMOD_SHIFT);
+    CHECK(app->viewer_open);
+    CHECK(app->viewer_tmp_dir[0] != '\0');
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(!dir_exists(app->viewer_tmp_dir));
+
+    // Backspace leaves one level, and again leaves the archive.
+    app_panes_handle_key(app, SDLK_BACKSPACE, SDL_KMOD_NONE);
+    CHECK(p.archive_prefix[0] == '\0');
+    app_panes_handle_key(app, SDLK_BACKSPACE, SDL_KMOD_NONE);
+    CHECK(p.list_mode == LIST_NORMAL);
+    CHECK(p.archive_path[0] == '\0');
+    CHECK(strcmp(p.current_dir, root.c_str()) == 0);
+
+    // The archive is still an ordinary file on disk afterwards.
+    CHECK(fs_exists((root + "/pkg.zip").c_str()));
+}
+
+// Everything that would have to write through a virtual path says no instead of
+// doing something half right.
+static void test_archive_guards(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    refresh_pane(&p, (root + "/pkg.zip").c_str());
+    CHECK(p.archive_path[0] != '\0');
+    int before = p.entry_count;
+    p.selected = idx_of(p, "one.txt");
+
+    app_panes_handle_key(app, SDLK_F8, SDL_KMOD_NONE);              // delete
+    CHECK(strstr(app->status_msg, "archive") != NULL);
+    app->confirm = CONF_NONE;
+
+    app_panes_handle_key(app, SDLK_F2, SDL_KMOD_NONE);              // rename
+    CHECK(app->op == OP_NONE);
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);              // mkdir
+    CHECK(app->op == OP_NONE);
+    app_panes_handle_key(app, SDLK_F4, SDL_KMOD_SHIFT);             // new file
+    CHECK(app->op == OP_NONE);
+
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);              // copy in
+    CHECK(!app->prog_active);
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_NONE);              // move in
+    CHECK(!app->prog_active);
+
+    app->clipboard.paths.clear();
+    app_panes_handle_key(app, SDLK_X, SDL_KMOD_CTRL);               // cut a member
+    CHECK(app->clipboard.paths.empty());
+
+    app_panes_handle_key(app, SDLK_B, SDL_KMOD_CTRL);               // branch view
+    CHECK(p.list_mode == LIST_ARCHIVE);
+    app_panes_handle_key(app, SDLK_F8, SDL_KMOD_CTRL | SDL_KMOD_SHIFT);   // tree panel
+    CHECK(p.tree_mode == TREE_OFF);
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_ALT);           // properties
+    CHECK(!app->props_open);
+    app_panes_handle_key(app, SDLK_F3, SDL_KMOD_ALT);               // open with default app
+    CHECK(strstr(app->status_msg, "extracted first") != NULL);
+    app_panes_handle_key(app, SDLK_F4, SDL_KMOD_NONE);              // edit
+    CHECK(strstr(app->status_msg, "real file") != NULL);
+
+    // Ctrl+P puts the archive file on the command line, never the virtual path.
+    app->cmd[0] = '\0';
+    app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
+    CHECK(strstr(app->cmd, "pkg.zip") != NULL);
+    CHECK(strstr(app->cmd, "pkg.zip/") == NULL);
+
+    refresh_pane(&p, (root + "/pkg.zip").c_str());
+    CHECK(p.entry_count == before);
+    CHECK(fs_exists((root + "/pkg.zip").c_str()));
+}
+
+// Ctrl+C inside an archive puts members on the clipboard; Ctrl+V in a real
+// directory extracts exactly those.
+static void test_archive_copy_out(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    refresh_pane(&p, (root + "/pkg.zip").c_str());
+    p.selected = idx_of(p, "one.txt");
+
+    app_panes_handle_key(app, SDLK_C, SDL_KMOD_CTRL);
+    CHECK(app->clipboard.paths.size() == 1);
+    CHECK(strcmp(app->clipboard.archive, (root + "/pkg.zip").c_str()) == 0);
+
+    sh("rm -rf '" + root + "/out'");
+    sh("mkdir -p '" + root + "/out'");
+    refresh_pane(&app->right, (root + "/out").c_str());
+    app->left_focus = false;
+    app_panes_handle_key(app, SDLK_V, SDL_KMOD_CTRL);
+    CHECK(fs_exists((root + "/out/one.txt").c_str()));
+    CHECK(!fs_exists((root + "/out/two.txt").c_str()));   // only what was copied
+    CHECK(app->clipboard.paths.empty());
+    CHECK(app->clipboard.archive[0] == '\0');
+
+    // A normal copy afterwards clears the archive context, so a paste cannot go
+    // back to extracting from the archive.
+    app->left_focus = true;
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "alpha.txt");
+    app_panes_handle_key(app, SDLK_C, SDL_KMOD_CTRL);
+    CHECK(app->clipboard.archive[0] == '\0');
+    CHECK(app->clipboard.paths.size() == 1);
+    CHECK(app->clipboard.paths[0] == root + "/alpha.txt");
+    app->clipboard.paths.clear();
+}
+
+// The archive operations themselves: pack, pack-and-delete, extract to the
+// other pane, extract here, and the integrity test.
+static void test_archive_ops(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    Pane& q = app->right;
+    app->left_focus = true;
+
+    sh("rm -rf '" + root + "/pack'");
+    sh("mkdir -p '" + root + "/pack'");
+    touch_file(root + "/pack", "a.txt");
+    touch_file(root + "/pack", "b.txt");
+    refresh_pane(&p, (root + "/pack").c_str());
+    for (int i = 0; i < p.entry_count; i++)
+        if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
+
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    CHECK(app->op == OP_PACK);
+    CHECK(strcmp(app->op_name, "archive.zip") == 0);   // several sources: generic name
+    snprintf(app->op_name, sizeof(app->op_name), "packed.zip");
+    app_panes_commit_op(app);
+    CHECK(app->op == OP_NONE);
+    CHECK(fs_exists((root + "/pack/packed.zip").c_str()));
+    std::vector<ArchEntry> members;
+    std::string err;
+    CHECK(arch_list((root + "/pack/packed.zip").c_str(), &members, &err));
+    CHECK(arch_find(members, "a.txt") != NULL);
+    CHECK(arch_find(members, "b.txt") != NULL);
+    CHECK(fs_exists((root + "/pack/a.txt").c_str()));  // a plain pack keeps the sources
+
+    // Alt+Shift+F5 is a move into the archive: the sources go afterwards.
+    refresh_pane(&p, (root + "/pack").c_str());
+    for (int i = 0; i < p.entry_count; i++)
+        if (strcmp(p.entries[i]->name, "..") != 0 && strcmp(p.entries[i]->name, "packed.zip") != 0)
+            p.marked[i] = true;
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
+    CHECK(app->op == OP_PACK);
+    snprintf(app->op_name, sizeof(app->op_name), "moved.zip");
+    app_panes_commit_op(app);
+    CHECK(fs_exists((root + "/pack/moved.zip").c_str()));
+    CHECK(!fs_exists((root + "/pack/a.txt").c_str()));
+    CHECK(!fs_exists((root + "/pack/b.txt").c_str()));
+
+    // Alt+F6 extracts the archive under the cursor into the other pane.
+    sh("rm -rf '" + root + "/out2'");
+    sh("mkdir -p '" + root + "/out2'");
+    refresh_pane(&p, root.c_str());
+    refresh_pane(&q, (root + "/out2").c_str());
+    app->left_focus = true;
+    p.selected = idx_of(p, "pkg.zip");
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_ALT);
+    CHECK(strstr(app->status_msg, "Extracted") != NULL);
+    CHECK(fs_exists((root + "/out2/one.txt").c_str()));
+    CHECK(fs_exists((root + "/out2/sub/inner.txt").c_str()));
+
+    // Alt+F9 extracts into this pane's directory.
+    sh("rm -rf '" + root + "/here'");
+    sh("mkdir -p '" + root + "/here'");
+    sh("cp '" + root + "/pkg.zip' '" + root + "/here/'");
+    refresh_pane(&p, (root + "/here").c_str());
+    p.selected = idx_of(p, "pkg.zip");
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT);
+    CHECK(strstr(app->status_msg, "Extracted") != NULL);
+    CHECK(fs_exists((root + "/here/one.txt").c_str()));
+
+    // Alt+Shift+F9 reads every member without writing anything. The extract
+    // refreshed the pane, so the cursor has to be placed again.
+    p.selected = idx_of(p, "pkg.zip");
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
+    CHECK(strstr(app->status_msg, "Archive OK") != NULL);
+
+    // Extracting while the other pane is also inside an archive is refused
+    // rather than writing a virtual path.
+    refresh_pane(&q, (root + "/pkg.zip").c_str());
+    refresh_pane(&p, root.c_str());
+    app->left_focus = true;
+    p.selected = idx_of(p, "pkg.zip");
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_ALT);
+    CHECK(strstr(app->status_msg, "inside an archive") != NULL);
+    refresh_pane(&q, root.c_str());
+
+    sh("rm -rf '" + root + "/pack' '" + root + "/out2' '" + root + "/here'");
 }
 
 // TC Ctrl+P (path into the command line) and Ctrl+I (switch to the target
@@ -649,7 +891,30 @@ int main() {
     test_tree_panel(&app, p, root);
     test_archive_keys();
     test_ctrl_p_and_i(&app, root);
+
+    // An archive the panes can browse and operate on.
+    sh("mkdir -p '" + root + "/src/sub'");
+    touch_file(root + "/src", "one.txt");
+    touch_file(root + "/src", "two.txt");
+    touch_file(root + "/src/sub", "inner.txt");
+    {
+        StringList names;
+        names.push_back("one.txt");
+        names.push_back("two.txt");
+        names.push_back("sub");
+        std::string err;
+        CHECK(arch_pack((root + "/pkg.zip").c_str(), (root + "/src").c_str(), names,
+                        nullptr, nullptr, &err));
+    }
+    sh("rm -rf '" + root + "/src'");
+    CHECK(fs_exists((root + "/pkg.zip").c_str()));
+
     test_archive_keys_live(&app, root);
+    test_archive_browse(&app, root);
+    test_archive_guards(&app, root);
+    test_archive_copy_out(&app, root);
+    test_archive_ops(&app, root);
+    sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);
     printf("%d checks, %d failures\n", checks, failures);

@@ -26,9 +26,12 @@ using MarkSet = std::vector<bool>;
 // A list of absolute paths.
 using StringList = std::vector<std::string>;
 
-// Pane listing mode: the plain directory, or TC's branch view (Ctrl+B), which
-// flattens the whole subtree below the pane's directory into one list.
-enum PaneListMode { LIST_NORMAL = 0, LIST_BRANCH = 1 };
+// Pane listing mode: the plain directory, TC's branch view (Ctrl+B), which
+// flattens the whole subtree below the pane's directory into one list, or an
+// archive's contents. Archive browsing is a virtual listing: current_dir holds
+// a path whose prefix is the archive file (see arch_split_virtual), so tabs,
+// history and the path bar carry it without knowing archives exist.
+enum PaneListMode { LIST_NORMAL = 0, LIST_BRANCH = 1, LIST_ARCHIVE = 2 };
 
 // TC puts a directory tree inside a panel: Ctrl+Shift+F8 replaces the file
 // list with it, Shift+Tab splits the panel into tree + list.
@@ -80,10 +83,16 @@ struct Pane {
     TreeRows tree_rows;
     int tree_selected = 0;      // cursor row inside tree_rows
     StringList rel;           // branch view: path of each row under current_dir
+                              // archive view: path of each member inside the archive
     int list_gen;             // bumped on every reload; caches key off this
     float cursor_screen_x;    // screen pos of the cursor row, for Shift+F10
     float cursor_screen_y;
     int page_size;            // visible rows, measured during render (0 = fallback)
+
+    // Archive the pane is browsing, when it is inside one: the real path of the
+    // archive file plus the member directory currently shown ("" = top level).
+    char archive_path[4096];
+    char archive_prefix[1024];
 
     // Directory history (Alt+Left / Alt+Right)
     char history[MAX_DIR_HISTORY][4096];
@@ -107,7 +116,8 @@ enum AppOp {
     OP_NONE = 0,
     OP_RENAME,   // op_name = new name for the target entry
     OP_MKDIR,    // op_name = new directory name
-    OP_NEWFILE   // op_name = name of an empty file to create
+    OP_NEWFILE,  // op_name = name of an empty file to create
+    OP_PACK      // op_name = archive file name to create in the pane's directory
 };
 
 // Pending confirmation dialog (Y/N)
@@ -121,9 +131,14 @@ enum AppConfirm {
 
 // Internal file clipboard (TC Ctrl+C / Ctrl+X / Ctrl+V). Absolute source paths
 // are stored rather than pane indices so the source pane can change meanwhile.
+// `archive` is non-empty when the sources are archive members: `paths` then
+// holds member paths inside that archive rather than filesystem paths, and
+// pasting extracts instead of copying. A cut cannot name a member, because
+// there is no way to delete one.
 typedef struct {
     bool cut;   // true = move on paste, false = copy
     StringList paths;
+    char archive[4096];
 } FileClipboard;
 
 // Panel view modes (Ctrl+O cycles): MC-style brief / medium / full
@@ -181,6 +196,9 @@ public:
     // Full file viewer (Enter on a plain file)
     bool viewer_open;
     char viewer_path[4096];
+    // Set when the viewer is showing an archive member: the temporary directory
+    // it was unpacked into, removed when the viewer closes.
+    char viewer_tmp_dir[4096];
 
     // Properties dialog (Alt+Enter): recursive size/count of one entry
     bool props_open;
@@ -206,6 +224,10 @@ public:
     // the ImGui frame so copy/move can pump their own progress UI.
     int  pending_op;          // 0 none, 1 copy, 2 move, 3 paste
     bool pending_confirm_yes;
+    bool pack_and_delete;     // Alt+Shift+F5: remove the sources once packed
+    // The rows the pending pack was asked for, captured before the name bar is
+    // typed into so the marks cannot change underneath it.
+    StringList pack_names;
 
     void* sdl_window;         // SDL_Window*, for pumping the progress UI
 

@@ -350,6 +350,28 @@ static void test_failures(const std::string& root) {
     sh("rm -f '" + fake + "'");
 }
 
+static void test_split_virtual(const std::string& root) {
+    char arch[4096], prefix[1024];
+    // The archive component is found wherever it sits in the path.
+    CHECK(arch_split_virtual((root + "/t.zip").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    CHECK(!strcmp(arch, (root + "/t.zip").c_str()));
+    CHECK(prefix[0] == '\0');
+    CHECK(arch_split_virtual((root + "/t.zip/sub/deep").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    CHECK(!strcmp(arch, (root + "/t.zip").c_str()));
+    CHECK(!strcmp(prefix, "sub/deep"));
+    CHECK(arch_split_virtual((root + "/t.tar.gz/sub/").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    CHECK(!strcmp(prefix, "sub"));
+    // Ordinary directories, and a directory that merely looks like an archive.
+    CHECK(!arch_split_virtual(root.c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    CHECK(!arch_split_virtual((root + "/sub").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    CHECK(!arch_split_virtual("", arch, sizeof(arch), prefix, sizeof(prefix)));
+    sh("mkdir -p '" + root + "/looks.zip'");
+    CHECK(!arch_split_virtual((root + "/looks.zip").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+    sh("rm -rf '" + root + "/looks.zip'");
+    // A non-archive file in the middle of the path is not a boundary either.
+    CHECK(!arch_split_virtual((root + "/a file.txt/x").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
+}
+
 static void test_extract_temp(const std::string& root) {
     std::vector<ArchEntry> v;
     std::string lerr;
@@ -357,13 +379,13 @@ static void test_extract_temp(const std::string& root) {
     const ArchEntry* e = find(v, "sub/b.log");
     CHECK(e != nullptr);
     if (!e) return;
-    char path[4096];
+    char path[4096], dir[4096];
     std::string err;
-    CHECK(arch_extract_temp((root + "/t.zip").c_str(), e->raw, path, sizeof(path), &err));
+    CHECK(arch_extract_temp((root + "/t.zip").c_str(), e->raw, path, sizeof(path),
+                            dir, sizeof(dir), &err));
     CHECK(slurp(path) == "x\n");
-    unlink(path);
-    std::string dir = std::string(path).substr(0, std::string(path).find_last_of('/'));
-    sh("rm -rf '" + dir + "'");
+    CHECK(is_dir(dir));
+    sh("rm -rf '" + std::string(dir) + "'");
 }
 
 int main() {
@@ -410,6 +432,7 @@ int main() {
     test_abort(root);
     test_failures(root);
     test_extract_temp(root);
+    test_split_virtual(root);
 
     sh("rm -rf '" + root + "'");
     printf("%d checks, %d failures\n", checks, failures);
