@@ -36,7 +36,11 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
 
-**Nothing in §2 is open: archives (§6) closed the last gap.**
+**Archives (§6) closed the last missing binding.** Four rows stay partial, each a deliberate shape
+difference rather than an unimplemented shortcut: `F3` toggles the quick view instead of opening the
+internal viewer (`Enter` and Shift+F3 do that), `Ctrl+F1`/`Ctrl+F2` set the view mode instead of a
+short/long quick view, `Ctrl+D` is unbound while the hotlist is on `Shift+F9`, and the mark helpers
+can scope to files but the dirs-only variant is not reachable from the keypad.
 
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
@@ -74,48 +78,48 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 ### Function keys
 | TC | Ours today | Status | Action |
 |---|---|---|---|
-| F1 help | unbound | MISS | F1 → new `render_help()` key reference window |
+| F1 help | `F1` | DONE | F1 → new `render_help()` key reference window |
 | F2 refresh source dir | F2 = rename | see §5 | keep rename; refresh stays `Ctrl+R` |
 | F3 view | F3 toggles floating quick view | PART | F3 → internal viewer (reuse `open_viewer`); quick view moves to `Ctrl+F1/F2`, `Ctrl+Q` |
 | F4 edit | F4 terminal editor | OK | — |
 | F5 copy / F6 move | ✓ + progress | OK | — |
 | F7 mkdir | ✓ | OK | — |
-| F8, Del delete | F8 ✓, Shift+Del ✓, plain Del no-op | PART | bind plain `Del`; add trash-vs-direct config (§4.7) |
-| F9 activate menu | unbound | MISS | F9 → open menu bar / per-pane user menu |
+| F8, Del delete | `F8`, `Del`, `Shift+Del` | DONE | bind plain `Del`; add trash-vs-direct config (§4.7) |
+| F9 activate menu | `F9` | DONE | F9 → open menu bar / per-pane user menu |
 | F10 activate menu | **F10 = quit** | CONFLICT | F10 → menu; quit becomes `Alt+F4` (+ keep `Alt+Q`) |
-| Alt+F1 / Alt+F2 choose drive | unbound | MISS | volumes popup from `/proc/mounts` |
-| Alt+F3 internal/external viewer | unbound | MISS | Alt+F3 → `xdg-open` on cursor entry |
+| Alt+F1 / Alt+F2 choose drive | `Alt+F1 / Alt+F2` | DONE | volumes popup from `/proc/mounts` |
+| Alt+F3 internal/external viewer | `Alt+F3` | DONE | Alt+F3 → `xdg-open` on cursor entry |
 | Alt+Shift+F3 plugin-less lister | — | OUT | no plugin system |
-| Alt+F4 quit / minimize | Alt+Q only | PART | add `Alt+F4` |
+| Alt+F4 quit / minimize | `Alt+F4` | DONE | add `Alt+F4` |
 | Alt+F5 / Alt+Shift+F5 pack | `Alt+F5`, `Alt+Shift+F5` | DONE | name asked through the operation bar; suffix picks the format |
 | Alt+F6 / Alt+F9 / Alt+Shift+F9 unpack, test | `Alt+F6`, `Alt+F9`, `Alt+Shift+F9` | DONE | into the other pane / into this one / CRC check |
-| Alt+F7 search | Shift+F7 | PART | bind `Alt+F7` (keep Shift+F7 as alias) |
-| Alt+F8 command-history popup | Alt+PgUp/PgDn cycling only | MISS | history popup above the command line |
-| Alt+F10 directory tree window | unbound | MISS | tree popup, Enter jumps |
-| Alt+F11 / Alt+F12 focus dir bar | unbound | MISS | focus left/right path `InputText` |
+| Alt+F7 search | `Alt+F7` | DONE | bind `Alt+F7` (keep Shift+F7 as alias) |
+| Alt+F8 command-history popup | `Alt+F8` | DONE | history popup above the command line |
+| Alt+F10 directory tree window | `Alt+F10` | DONE | tree popup, Enter jumps |
+| Alt+F11 / Alt+F12 focus dir bar | `Alt+F11 / Alt+F12` | DONE | focus left/right path `InputText` |
 | Alt+Shift+F11 buttonbar | no buttonbar | OUT | — |
 | Alt+← / Alt+→ history | ✓ | OK | — |
-| Alt+↓ visited-dirs list | unbound | MISS | history popup → jump |
-| Shift+F1 custom columns view | unbound | MISS | low priority: columns/view popup |
-| Shift+F2 compare directories | unbound | MISS | read-only pane compare |
+| Alt+↓ visited-dirs list | `Alt+↓` | DONE | history popup → jump |
+| Shift+F1 custom columns view | `Shift+F1` | DONE | low priority: columns/view popup |
+| Shift+F2 compare directories | `Shift+F2` | DONE | read-only pane compare |
 | Shift+F3 show only cursor file when several marked | **Shift+F3 = cycle sort** | CONFLICT | sort → `Ctrl+F3..F7`; Shift+F3 = view cursor file only |
-| Shift+F4 new text file + edit | unbound | MISS | create empty file, then F4 flow |
-| Shift+F5 copy in same dir w/ rename | unbound | MISS | duplicate + rename prompt |
-| Shift+Ctrl+F5 create links in target dir | unbound | MISS | `fs_symlink` |
-| Shift+F6 rename in same dir | unbound | MISS | move-with-rename in place |
-| Shift+F8 delete | Shift+Del only | PART | bind Shift+F8 |
-| Shift+F10 local menu | right-click only | MISS | Shift+F10 + `SDLK_MENU` open `ctxmenu` |
-| Shift+Esc minimize to tray | unbound | MISS | `SDL_MinimizeWindow` |
+| Shift+F4 new text file + edit | `Shift+F4` | DONE | create empty file, then F4 flow |
+| Shift+F5 copy in same dir w/ rename | `Shift+F5` | DONE | duplicate + rename prompt |
+| Shift+Ctrl+F5 create links in target dir | `Shift+Ctrl+F5` | DONE | `fs_symlink` |
+| Shift+F6 rename in same dir | `Shift+F6` | DONE | move-with-rename in place |
+| Shift+F8 delete | `Shift+F8` | DONE | bind Shift+F8 |
+| Shift+F10 local menu | `Shift+F10` | DONE | Shift+F10 + `SDLK_MENU` open `ctxmenu` |
+| Shift+Esc minimize to tray | `Shift+Esc` | DONE | `SDL_MinimizeWindow` |
 
 ### Marking
 | TC | Ours | Status | Action |
 |---|---|---|---|
 | Num+ extend / Num- shrink | `+`/`-` = select-all / clear (when cmd empty) | CONFLICT | TC semantics: mark/unmark at cursor and step; select-all/clear move to `Ctrl+Num+`/`Ctrl+Num-` |
 | Num* invert | `*` ✓ | OK | — |
-| Num/ restore marks | unbound | MISS | snapshot stack of `marked` before each bulk change |
-| Ctrl+Num+ all / Ctrl+Num- none | Ctrl+A / Ctrl+U | PART | add Num forms; `Ctrl+U` freed for pane swap |
-| Ctrl+Shift+Num+ files+dirs, Ctrl+Shift+Num- files-only, Shift+Num+/-/* dir nuances | unbound | MISS | add `mark_scope(files\|dirs\|both)` to the mark helpers |
-| Alt+Num+ / Alt+Num- mark/unmark same extension | unbound | MISS | ext match on cursor entry |
+| Num/ restore marks | `Num/` | DONE | snapshot stack of `marked` before each bulk change |
+| Ctrl+Num+ all / Ctrl+Num- none | `Ctrl+Num+` | DONE | add Num forms; `Ctrl+U` freed for pane swap |
+| Ctrl+Shift+Num+ files+dirs, Ctrl+Shift+Num- files-only, Shift+Num+/-/* dir nuances | `Ctrl+Shift+Num+` | PART | add `mark_scope(files\|dirs\|both)` to the mark helpers |
+| Alt+Num+ / Alt+Num- mark/unmark same extension | `Alt+Num+ / Alt+Num-` | DONE | ext match on cursor entry |
 | Ins mark | ✓ (marks + advances) | OK | — |
 | Space mark (+ dir size sum) | Ctrl+Space only | CONFLICT | Space marks when cmd line empty, else types a space; Space on unmarked dir fills computed size into the size column |
 | Ctrl+A select all | ✓ | OK | — |
@@ -126,19 +130,19 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 |---|---|---|---|
 | ↤ / Ctrl+PgUp parent dir | Backspace ✓, **Ctrl+PgUp = prev tab** | CONFLICT | Ctrl+PgUp → parent; `\` left unbound (§5); tabs move to `Ctrl+Tab` |
 | Ctrl+PgDn open dir under cursor | **Ctrl+PgDn = next tab** | CONFLICT | Ctrl+PgDn → open under cursor in this pane |
-| Ctrl+← / Ctrl+→ open under cursor in other pane | unbound | MISS | cursor stays put |
-| Ctrl+< root | unbound | MISS | `Ctrl+Shift+Comma` → `/` |
+| Ctrl+← / Ctrl+→ open under cursor in other pane | `Ctrl+← / Ctrl+→` | DONE | cursor stays put |
+| Ctrl+< root | `Ctrl+<` | DONE | `Ctrl+Shift+Comma` → `/` |
 | Ctrl+I switch to target pane | alias of Tab | OK | — |
 | Ctrl+R refresh | ✓ | OK | — |
 | Ctrl+T new tab (active) | ✓ | OK | — |
-| Ctrl+Shift+T new tab (inactive) | unbound | MISS | `tab_new(pane, activate=false)` |
+| Ctrl+Shift+T new tab (inactive) | `Ctrl+Shift+T` | DONE | `tab_new(pane, activate=false)` |
 | Ctrl+W close tab | ✓ | OK | — |
-| Ctrl+Shift+W close all tabs | unbound | MISS | keep ≥1 tab |
+| Ctrl+Shift+W close all tabs | `Ctrl+Shift+W` | DONE | keep ≥1 tab |
 | Ctrl+↹ / Ctrl+Shift+↹ next/prev tab | Ctrl+PgUp/PgDn | CONFLICT | move to Ctrl+Tab; keep Ctrl+1..9 |
 | Ctrl+U swap directories | **Ctrl+U = clear marks** | CONFLICT | Ctrl+U swaps pane dirs; clear marks → Ctrl+Num- |
-| Ctrl+Shift+U swap dirs **and** tabs | unbound | MISS | swap whole tab sets |
-| Ctrl+↑ open cursor in new tab (same pane) | unbound | MISS | |
-| Ctrl+Shift+↓ open cursor in new tab (other pane) | unbound | MISS | |
+| Ctrl+Shift+U swap dirs **and** tabs | `Ctrl+Shift+U` | DONE | swap whole tab sets |
+| Ctrl+↑ open cursor in new tab (same pane) | `Ctrl+↑` | DONE | |
+| Ctrl+Shift+↓ open cursor in new tab (other pane) | `Ctrl+Shift+↓` | DONE | |
 | Tab switch panes | ✓ | OK | — |
 | Backspace → parent | ✓ | extra | keep (not in TC table, additive) |
 | Home → first entry / Shift+Home → $HOME | ✓ | extra | keep |
@@ -147,24 +151,24 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 | TC | Ours | Status | Action |
 |---|---|---|---|
 | Ctrl+F1 quick view short / Ctrl+F2 quick view long | F3 floating quick view | PART | quick view bound to Ctrl+F1 (name+size) / Ctrl+F2 (full columns) |
-| Ctrl+Q quick-view **pane** instead of a file pane | floating window only | PART | replace the inactive pane's list with a quick view |
-| Ctrl+F3..F6 sort name/ext/date/size, Ctrl+F7 unsorted | cycle Shift+F3 | MISS | direct sort keys; add `FS_SORT_NONE` |
-| Ctrl+F8 / Ctrl+Shift+F8 tree | unbound | MISS | toggle the Alt+F10 tree (embedded later) |
-| Ctrl+B branch view / Ctrl+Shift+B marked branch view | unbound | MISS | flat recursive listing in-pane |
-| Ctrl+S quick filter / Ctrl+Shift+S re-apply / Ctrl+F10 clear | unbound | MISS | per-pane live filter |
-| Ctrl+F11 executables-only / Ctrl+F12 user filter | unbound | MISS | filter presets; `filter_presets` in config |
+| Ctrl+Q quick-view **pane** instead of a file pane | `Ctrl+Q` | DONE | replace the inactive pane's list with a quick view |
+| Ctrl+F3..F6 sort name/ext/date/size, Ctrl+F7 unsorted | `Ctrl+F3..F6` | DONE | direct sort keys; add `FS_SORT_NONE` |
+| Ctrl+F8 / Ctrl+Shift+F8 tree | `Ctrl+F8 / Ctrl+Shift+F8` | DONE | toggle the Alt+F10 tree (embedded later) |
+| Ctrl+B branch view / Ctrl+Shift+B marked branch view | `Ctrl+B` | DONE | flat recursive listing in-pane |
+| Ctrl+S quick filter / Ctrl+Shift+S re-apply / Ctrl+F10 clear | `Ctrl+S` | DONE | per-pane live filter |
+| Ctrl+F11 executables-only / Ctrl+F12 user filter | `Ctrl+F11` | DONE | filter presets; `filter_presets` in config |
 | Ctrl+D directory menu (hotlist) | Alt+D add, Shift+F9 list | PART | Ctrl+D opens the hotlist popup |
-| Ctrl+L size of marked | unbound | MISS | reuse `fs_count_tree` |
-| Alt+Shift+Enter sum all dir sizes | unbound | MISS | fill size column for dirs |
+| Ctrl+L size of marked | `Ctrl+L` | DONE | reuse `fs_count_tree` |
+| Alt+Shift+Enter sum all dir sizes | `Alt+Shift+Enter` | DONE | fill size column for dirs |
 | Alt+Enter properties | ✓ | OK | — |
 | Enter open/run/command | ✓ (cmd-first) | OK | — |
-| AltGr+letter / Ctrl+Alt+letter quick search by name | unbound | MISS | type-ahead jump in the pane |
+| AltGr+letter / Ctrl+Alt+letter quick search by name | `AltGr+letter / Ctrl+Alt+letter` | DONE | type-ahead jump in the pane |
 | Shift+Enter `cmd /c` NOCLOSE | — | OUT | Windows-specific |
 
 ### Clipboard & rename
 | TC | Ours | Status | Action |
 |---|---|---|---|
-| Ctrl+C copy to clipboard / Ctrl+X cut / Ctrl+V paste | unbound (no-op) | MISS | app-level file clipboard (§4.4) |
+| Ctrl+C copy to clipboard / Ctrl+X cut / Ctrl+V paste | `Ctrl+C` | DONE | app-level file clipboard (§4.4) |
 | Ctrl+M multi-rename tool | unbound | dropped | user decision: not needed |
 | Ctrl+P current path into command line | `Ctrl+P` appends it; `Alt+C` prefills `cd ` | OK | — |
 | Ctrl+Z comments | — | OUT | no comment store |
@@ -175,7 +179,8 @@ FTP (`Ctrl+F`, `Ctrl+Shift+F`, `Ctrl+N`, `Ctrl+Shift+M`) · thumbnails (`Ctrl+Sh
 drive letters (`Alt+F1/F2` → implemented as mount picker instead) · writing into RAR (no writer in
 `7z`, so RAR is read-only) · archive *mutations* (rename/delete/move inside an archive).
 
-**Count:** ~34 exact matches, ~14 partial, ~33 missing, 6 conflicts to migrate, ~14 out of scope.
+**Count:** 74 bindings in the table — 58 bound (16 already matched at audit time, 42 implemented by
+the phases below), 4 partial, 8 conflicts resolved by the Phase 0 migration, 4 out of scope.
 
 ---
 
