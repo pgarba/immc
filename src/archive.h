@@ -69,6 +69,10 @@ bool arch_extract(const char* archive, const char* dest,
                   arch_progress_fn cb, void* user, std::string* err);
 
 // Extract the named members, given as `raw` paths from a listing, into `dest`.
+// A member that is a directory expands to its whole subtree: the pane shows a
+// folder as one row, and the tools disagree about what naming that folder means
+// (tar and 7z recurse, unzip unpacks an empty directory), so the expansion
+// happens here rather than being left to whichever tool is installed.
 bool arch_extract_members(const char* archive, const char* dest,
                           const std::vector<std::string>& raw_members,
                           arch_progress_fn cb, void* user, std::string* err);

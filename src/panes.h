@@ -142,7 +142,8 @@ enum AppConfirm {
     CONF_DELETE,     // delete marked/current entries from active pane
     CONF_OVERWRITE,  // copy (F5) targets that already exist
     CONF_OVERWRITE_MOVE, // move (F6) targets that already exist
-    CONF_OVERWRITE_PASTE // clipboard paste (Ctrl+V) targets that already exist
+    CONF_OVERWRITE_PASTE, // clipboard paste (Ctrl+V) targets that already exist
+    CONF_OVERWRITE_EXTRACT // copy (F5) out of an archive onto existing files
 };
 
 // Internal file clipboard (TC Ctrl+C / Ctrl+X / Ctrl+V). Absolute source paths

@@ -939,6 +939,9 @@ static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move);
 // Defined with the keyboard handlers; the deferred-action table and the Commands
 // menu both need them earlier.
 static void do_copy_in_place(AppPanes* app);
+// Defined with the archive viewer helpers; F5 inside an archive needs it to turn
+// a row's display path into the member name the tool wrote.
+static std::string member_raw(const Pane& pane, const char* rel);
 static void do_symlink_other(AppPanes* app);
 static void count_marked_sizes(AppPanes* app);
 static void fill_dir_sizes(AppPanes* app);
@@ -1541,6 +1544,74 @@ static void do_paste_archive_now(AppPanes* app) {
     refresh_pane(&other, other.current_dir);
 }
 
+// TC F5 inside an archive: the marked members, or the row under the cursor, are
+// copied into the other pane's directory. A member never exists on disk, so the
+// copy is an extraction of exactly those members, and each row's display path is
+// mapped through the listing to the `raw` name the tool wrote. The archive's
+// internal path is kept, so copying out of a folder inside the archive recreates
+// that folder in the destination — the same rule Alt+F6 extraction follows, and
+// what keeps members from different levels of one archive colliding.
+static void do_copy_out_archive_now(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    if (in_archive(other)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "The target pane is inside an archive");
+        return;
+    }
+    std::vector<std::string> raws;
+    for (const std::string& rel : target_rel(active))
+        raws.push_back(member_raw(active, rel.c_str()));
+    if (raws.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
+        return;
+    }
+    arch_prog_begin(app, active.archive_path, other.current_dir);
+    std::string err;
+    bool ok = arch_extract_members(active.archive_path, other.current_dir, raws,
+                                   copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (ok) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Copied %d member%s into %s%s", (int)raws.size(),
+                 raws.size() == 1 ? "" : "s", other.current_dir,
+                 active.archive_prefix[0] ? " (archive paths preserved)" : "");
+    } else {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Copy failed: %s", err.c_str());
+    }
+    refresh_pane(&other, other.current_dir);
+}
+
+static void do_copy_out_archive(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    if (in_archive(other)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "The target pane is inside an archive");
+        return;
+    }
+    StringList rows = target_rel(active);
+    if (rows.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
+        return;
+    }
+    int existing = 0;
+    for (const std::string& rel : rows) {
+        std::string full = active.archive_prefix[0]
+                               ? std::string(active.archive_prefix) + "/" + rel : rel;
+        char dst[4100];
+        snprintf(dst, sizeof(dst), "%s/%s", other.current_dir, full.c_str());
+        if (fs_exists(dst)) existing++;
+    }
+    if (existing > 0) {
+        app->confirm = CONF_OVERWRITE_EXTRACT;
+        snprintf(app->confirm_text, sizeof(app->confirm_text),
+                 "%d target%s already exist in %s. Overwrite?", existing, existing == 1 ? "" : "s", other.current_dir);
+        return;
+    }
+    do_copy_out_archive_now(app);
+}
+
 static int run_on_targets_prog(AppPanes* app, Pane& pane, bool is_move,
                                const char* dst_dir, fs_progress_fn cb, void* user) {
     int ok = 0;
@@ -1605,7 +1676,10 @@ static void do_move_now(AppPanes* app) {
 static void do_copy(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
-    if (archive_readonly(app, active) || archive_readonly(app, other)) return;
+    // Inside an archive F5 copies members *out* into the other pane. The other
+    // direction stays refused: an archive cannot be written into.
+    if (in_archive(active)) { do_copy_out_archive(app); return; }
+    if (archive_readonly(app, other)) return;
     int existing = count_existing_targets(app, active, other.current_dir);
     if (existing > 0) {
         app->confirm = CONF_OVERWRITE;
@@ -1619,7 +1693,14 @@ static void do_copy(AppPanes* app) {
 static void do_move(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
-    if (archive_readonly(app, active) || archive_readonly(app, other)) return;
+    // A move would have to delete the member afterwards, which no archive format
+    // we can write lets us do. F5 copies it out instead.
+    if (in_archive(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Cannot move archive members: an archive cannot be written into (F5 copies them out)");
+        return;
+    }
+    if (archive_readonly(app, other)) return;
     int existing = count_existing_targets(app, active, other.current_dir);
     if (existing > 0) {
         app->confirm = CONF_OVERWRITE_MOVE;
@@ -1792,6 +1873,7 @@ static void confirm_yes(AppPanes* app) {
     case CONF_OVERWRITE:      do_copy_now(app); break;
     case CONF_OVERWRITE_MOVE: do_move_now(app); break;
     case CONF_OVERWRITE_PASTE: do_paste_now(app); break;
+    case CONF_OVERWRITE_EXTRACT: do_copy_out_archive_now(app); break;
     default: break;
     }
     app->confirm = CONF_NONE;

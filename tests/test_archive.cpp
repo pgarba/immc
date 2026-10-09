@@ -288,6 +288,54 @@ static void test_extract_tar_members(const std::string& root) {
     sh("rm -rf '" + out + "'");
 }
 
+// A folder row in the archive pane is one row standing for a whole subtree, so
+// extracting it has to bring the subtree with it. unzip matches a member name
+// literally and would unpack an empty directory; tar and 7z recurse on their own.
+static void test_extract_directory_member(const std::string& root, const char* arch) {
+    std::string out = root + "/out_dir";
+    sh("rm -rf '" + out + "'");
+    mkdir(out.c_str(), 0755);
+    std::vector<ArchEntry> v;
+    std::string err;
+    CHECK(arch_list((root + "/" + arch).c_str(), &v, &err));
+    std::vector<std::string> raw;
+    for (const ArchEntry& e : v)
+        if (!strcmp(e.rel, "sub")) raw.push_back(e.raw);
+    CHECK(raw.size() == 1);
+    Prog pr;
+    CHECK(arch_extract_members((root + "/" + arch).c_str(), out.c_str(), raw, prog_cb, &pr, &err));
+    CHECK(exists(out + "/sub/b.log"));
+    CHECK(exists(out + "/sub/deep/c.bin"));
+    CHECK(!exists(out + "/a file.txt"));       // still only what was asked for
+    sh("rm -rf '" + out + "'");
+}
+
+// A folder that holds nothing has no file to name, so the directory member
+// itself is what gets handed to the tool, and it still has to come out as a
+// directory rather than nothing at all.
+static void test_extract_empty_directory(const std::string& root) {
+    std::string src = root + "/emptysrc";
+    sh("rm -rf '" + src + "'");
+    sh("mkdir -p '" + src + "/blank'");
+    std::string err;
+    std::vector<std::string> sources{ "blank" };
+    CHECK(arch_pack((root + "/empty.zip").c_str(), src.c_str(), sources, nullptr, nullptr, &err));
+
+    std::vector<ArchEntry> v;
+    CHECK(arch_list((root + "/empty.zip").c_str(), &v, &err));
+    const ArchEntry* blank = find(v, "blank");
+    CHECK(blank && S_ISDIR(blank->mode));
+    std::vector<std::string> raw;
+    if (blank) raw.push_back(blank->raw);
+    std::string out = root + "/out_empty";
+    sh("rm -rf '" + out + "'");
+    mkdir(out.c_str(), 0755);
+    Prog pr;
+    CHECK(arch_extract_members((root + "/empty.zip").c_str(), out.c_str(), raw, prog_cb, &pr, &err));
+    CHECK(is_dir(out + "/blank"));
+    sh("rm -rf '" + out + "' '" + src + "'");
+}
+
 static void test_pack(const std::string& root, const char* ext) {
     std::string arch = root + "/pack" + ext;
     sh("rm -f '" + arch + "'");
@@ -513,6 +561,11 @@ int main() {
     if (arch_tool_available(ARCH_7Z)) test_extract_whole(root, "t.7z");
     test_extract_members_with_tricky_names(root);
     test_extract_tar_members(root);
+    test_extract_directory_member(root, "t.zip");
+    test_extract_directory_member(root, "t.tar.gz");
+    test_extract_directory_member(root, "t.tar");
+    test_extract_directory_member(root, "t.7z");
+    test_extract_empty_directory(root);
     test_pack(root, ".zip");
     test_pack(root, ".tar.gz");
     if (arch_tool_available(ARCH_7Z)) test_pack(root, ".7z");

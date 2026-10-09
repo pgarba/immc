@@ -645,10 +645,26 @@ static void test_archive_guards(AppPanes* app, const std::string& root) {
     app_panes_handle_key(app, SDLK_F4, SDL_KMOD_SHIFT);             // new file
     CHECK(app->op == OP_NONE);
 
-    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);              // copy in
+    // F5 inside an archive copies members out into the other pane, so the guard
+    // that matters is the destination: a second archive cannot be written into.
+    refresh_pane(&app->right, (root + "/pkg.zip").c_str());
+    CHECK(app->right.archive_path[0] != '\0');
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(strstr(app->status_msg, "target pane is inside an archive") != NULL);
     CHECK(!app->prog_active);
-    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_NONE);              // move in
+    // A move would have to delete the member afterwards, which no format we can
+    // write lets us do.
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_NONE);
+    CHECK(strstr(app->status_msg, "cannot be written into") != NULL);
     CHECK(!app->prog_active);
+    // Real files cannot be pasted in either.
+    app->clipboard.paths.clear();
+    app->clipboard.paths.push_back(root + "/pkg.zip");
+    app->clipboard.cut = false;
+    app->clipboard.archive[0] = '\0';
+    app_panes_handle_key(app, SDLK_V, SDL_KMOD_CTRL);
+    CHECK(strstr(app->status_msg, "read-only") != NULL);
+    CHECK(p.entry_count == before);
 
     app->clipboard.paths.clear();
     app_panes_handle_key(app, SDLK_X, SDL_KMOD_CTRL);               // cut a member
@@ -670,10 +686,98 @@ static void test_archive_guards(AppPanes* app, const std::string& root) {
     app_panes_handle_key(app, SDLK_P, SDL_KMOD_CTRL);
     CHECK(strstr(app->cmd, "pkg.zip") != NULL);
     CHECK(strstr(app->cmd, "pkg.zip/") == NULL);
+    app->cmd[0] = '\0';
 
     refresh_pane(&p, (root + "/pkg.zip").c_str());
     CHECK(p.entry_count == before);
     CHECK(fs_exists((root + "/pkg.zip").c_str()));
+}
+
+// F5 inside an archive copies the marked members, or the cursor row, into the
+// other pane's directory. It is an extraction: the archive stays byte for byte
+// what it was, and only what was asked for comes out.
+static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    std::string out = root + "/out_f5";
+    sh("rm -rf '" + out + "'");
+    sh("mkdir -p '" + out + "'");
+    refresh_pane(&app->right, out.c_str());
+    refresh_pane(&p, (root + "/pkg.zip").c_str());
+    CHECK(p.archive_path[0] != '\0');
+
+    // Nothing marked: the row under the cursor alone, and the ".." row is never
+    // a target even when the cursor sits on it.
+    p.selected = idx_of(p, "one.txt");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(fs_exists((out + "/one.txt").c_str()));
+    CHECK(!fs_exists((out + "/two.txt").c_str()));
+    CHECK(strstr(app->status_msg, "Copied 1 member") != NULL);
+
+    // Marked rows, one of them a folder: the folder comes out with its contents,
+    // not as an empty directory, and keeps its path inside the archive.
+    p.marked[idx_of(p, "two.txt")] = true;
+    p.marked[idx_of(p, "sub")] = true;
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(fs_exists((out + "/two.txt").c_str()));
+    CHECK(fs_exists((out + "/sub/inner.txt").c_str()));
+    CHECK(!fs_exists((out + "/inner.txt").c_str()));
+    CHECK(strstr(app->status_msg, "Copied 2 members") != NULL);
+    for (int i = 0; i < p.entry_count; i++) p.marked[i] = false;
+
+    // A level deeper, the member still lands at its archive path rather than in
+    // the destination's top level, and the status line says so.
+    std::string deep = root + "/out_f5_deep";
+    sh("rm -rf '" + deep + "'");
+    sh("mkdir -p '" + deep + "'");
+    refresh_pane(&app->right, deep.c_str());
+    app->cmd[0] = '\0';   // a leftover command line would make Enter run it
+    p.selected = idx_of(p, "sub");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(strcmp(p.archive_prefix, "sub") == 0);
+    p.selected = idx_of(p, "inner.txt");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(fs_exists((deep + "/sub/inner.txt").c_str()));
+    CHECK(!fs_exists((deep + "/inner.txt").c_str()));
+    CHECK(strstr(app->status_msg, "preserved") != NULL);
+
+    // The destination already holds that member, so F5 asks first and writes
+    // nothing until the answer is Yes.
+    refresh_pane(&app->right, out.c_str());
+    sh("mkdir -p '" + out + "/sub' && printf 'OLD\n' > '" + out + "/sub/inner.txt'");
+    long sentinel = 4;   // "OLD\n", against the member's own 6 bytes
+    struct stat st0;
+    CHECK(stat((out + "/sub/inner.txt").c_str(), &st0) == 0 && st0.st_size == sentinel);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(app->confirm == CONF_OVERWRITE_EXTRACT);
+    struct stat st1;
+    CHECK(stat((out + "/sub/inner.txt").c_str(), &st1) == 0 && st1.st_size == sentinel);
+    confirm_yes(app);
+    CHECK(app->confirm == CONF_NONE);
+    struct stat st2;
+    CHECK(stat((out + "/sub/inner.txt").c_str(), &st2) == 0 && st2.st_size != sentinel);
+
+    // The Commands menu route reaches the same operation through the deferred
+    // table, so it copies out as well.
+    std::string out2 = root + "/out_f5_menu";
+    sh("rm -rf '" + out2 + "'");
+    sh("mkdir -p '" + out2 + "'");
+    refresh_pane(&app->right, out2.c_str());
+    refresh_pane(&p, (root + "/pkg.zip").c_str());
+    p.selected = idx_of(p, "two.txt");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_COPY;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((out2 + "/two.txt").c_str()));
+
+    // And the archive itself is untouched by all of it.
+    std::vector<ArchEntry> v;
+    std::string err;
+    CHECK(arch_list((root + "/pkg.zip").c_str(), &v, &err));
+    CHECK(v.size() == 4);   // one.txt, two.txt, sub, sub/inner.txt
+    sh("rm -rf '" + out + "' '" + out2 + "' '" + deep + "'");
 }
 
 // Ctrl+C inside an archive puts members on the clipboard; Ctrl+V in a real
@@ -1219,6 +1323,7 @@ int main() {
     test_archive_keys_live(&app, root);
     test_archive_browse(&app, root);
     test_archive_guards(&app, root);
+    test_archive_f5_copy_out(&app, root);
     test_archive_copy_out(&app, root);
     test_archive_ops(&app, root);
     test_pack_options(&app, root);

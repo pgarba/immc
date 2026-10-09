@@ -813,11 +813,44 @@ bool arch_extract_members(const char* archive, const char* dest,
     std::string lerr;
     arch_list(archive, &members, &lerr);
 
+    // A directory row in the pane stands for a whole subtree, but the tools do
+    // not agree about what naming that directory means: unzip matches names
+    // literally and unpacks an empty directory, while tar recurses and then
+    // reports "not found" for any child named alongside it. So the list handed
+    // to the tool is the subtree's leaves: its files, plus any directory under
+    // it that holds no files. Every tool writes those, creating the parent
+    // directories on the way, and the per-file progress counts what is actually
+    // written instead of one row per folder.
+    std::vector<std::string> names;
+    std::set<std::string> seen;
+    auto push = [&](const std::string& raw) {
+        if (seen.insert(raw).second) names.push_back(raw);
+    };
+    for (const std::string& want : raw_members) {
+        const ArchEntry* hit = nullptr;
+        for (const ArchEntry& m : members)
+            if (want == m.raw) { hit = &m; break; }
+        if (!hit || !S_ISDIR(hit->mode)) { push(want); continue; }
+        std::string pre = std::string(hit->rel) + "/";
+        size_t added = 0;
+        for (const ArchEntry& m : members) {
+            if (strncmp(m.rel, pre.c_str(), pre.size()) != 0) continue;
+            if (!S_ISDIR(m.mode)) { push(m.raw); added++; continue; }
+            std::string under = std::string(m.rel) + "/";
+            bool has_child = false;
+            for (const ArchEntry& c : members)
+                if (strcmp(c.rel, m.rel) != 0 &&
+                    strncmp(c.rel, under.c_str(), under.size()) == 0) { has_child = true; break; }
+            if (!has_child) { push(m.raw); added++; }   // an empty folder still has to appear
+        }
+        if (added == 0) push(hit->raw);                 // the folder itself is empty
+    }
+
     Progress pr;
     pr.cb = cb;
     pr.user = user;
     fill_totals(members, &pr.total_bytes, &pr.total_files);
-    pr.sizes = size_order(members, &raw_members);
+    pr.sizes = size_order(members, &names);
     pr.total_bytes = 0;
     pr.total_files = (int)pr.sizes.size();
     for (off_t s : pr.sizes) pr.total_bytes += (long long)s;
@@ -829,7 +862,7 @@ bool arch_extract_members(const char* archive, const char* dest,
         // unzip takes the member list between the archive and "-d dest".
         pr.mode = UNIT_ANY;
         argv = { "unzip", "-o", a };
-        argv.insert(argv.end(), raw_members.begin(), raw_members.end());
+        argv.insert(argv.end(), names.begin(), names.end());
         argv.push_back("-d");
         argv.push_back(d);
         break;
@@ -839,13 +872,13 @@ bool arch_extract_members(const char* archive, const char* dest,
     case ARCH_TAR_XZ:
         pr.mode = UNIT_ANY;
         argv = { "tar", "-xvf", a, "-C", d, "--" };
-        argv.insert(argv.end(), raw_members.begin(), raw_members.end());
+        argv.insert(argv.end(), names.begin(), names.end());
         break;
     case ARCH_7Z:
     case ARCH_RAR:
         pr.mode = UNIT_PERCENT;
         argv = { "7z", "x", a, "-o" + d, "-y", "--" };
-        argv.insert(argv.end(), raw_members.begin(), raw_members.end());
+        argv.insert(argv.end(), names.begin(), names.end());
         break;
     default: return false;
     }

@@ -36,7 +36,8 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
 
-**Archives (§6) closed the last missing binding.** Four rows stay partial, each a deliberate shape
+**Archives (§6) closed the last missing binding**, and inside an archive `F5` copies the marked
+members out into the other pane, as TC's does. Four rows stay partial, each a deliberate shape
 difference rather than an unimplemented shortcut: `F3` toggles the quick view instead of opening the
 internal viewer (`Enter` and Shift+F3 do that), `Ctrl+F1`/`Ctrl+F2` set the view mode instead of a
 short/long quick view, `Ctrl+D` is unbound while the hotlist is on `Shift+F9`, and the mark helpers
@@ -45,8 +46,9 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
 `fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, the
-archive pane mode with its guards and operations, and the deferred-action table) run headless — 344
-checks in `test-panes` plus 191 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`.
+archive pane mode with its guards and operations including copy-out, and the deferred-action table)
+run headless — 372 checks in `test-panes` plus 220 in `test-archive`: `cmake --build build -j4 &&
+(cd build && ctest)`.
 It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
 reference across an `insert()`, so the `expanded` flag was written to freed memory and the next press
 duplicated the row's children; and every menu item that started a long operation ran it inside the
@@ -86,7 +88,7 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 | F2 refresh source dir | F2 = rename | see §5 | keep rename; refresh stays `Ctrl+R` |
 | F3 view | F3 toggles floating quick view | PART | F3 → internal viewer (reuse `open_viewer`); quick view moves to `Ctrl+F1/F2`, `Ctrl+Q` |
 | F4 edit | F4 terminal editor | OK | — |
-| F5 copy / F6 move | ✓ + progress | OK | — |
+| F5 copy / F6 move | ✓ + progress | OK | — ; inside an archive `F5` copies the members out and `F6` still refuses |
 | F7 mkdir | ✓ | OK | — |
 | F8, Del delete | `F8`, `Del`, `Shift+Del` | DONE | bind plain `Del`; add trash-vs-direct config (§4.7) |
 | F9 activate menu | `F9` | DONE | F9 → open menu bar / per-pane user menu |
@@ -373,11 +375,13 @@ leaves the archive; before that the only way out was `Backspace`, which is invis
 not read the help.
 
 **Archive contents are read-only, and the guards say so.** Rename, mkdir, new file, delete, cut,
-paste, copy/move in or out, copy-in-place, links, branch view, the tree panel, search, properties,
-directory sizes, the editor and "open with the default application" all refuse inside an archive
-rather than resolving a path that does not exist on disk. The way to change an archive is the way it
-is in TC: extract, change, pack again. `Ctrl+P` puts the *archive file* on the command line, never
-the virtual path.
+paste, copy-in-place, links, branch view, the tree panel, search, properties, directory sizes, the
+editor and "open with the default application" all refuse inside an archive rather than resolving a
+path that does not exist on disk. `F5` is the exception, and it is TC's: inside an archive it copies
+the marked members, or the cursor row, **out** into the other pane's directory. `F6` still refuses,
+because a move would have to delete the member afterwards and no format we can write lets us do that.
+The way to change an archive is the way it is in TC: extract, change, pack again. `Ctrl+P` puts the
+*archive file* on the command line, never the virtual path.
 
 **Operations.** `Alt+F5` packs the marks (or the cursor row) and opens a dialog; `Alt+Shift+F5` is
 the same with "delete the sources afterwards" already ticked, which makes it a move into the archive.
@@ -387,6 +391,18 @@ verifies every member's CRC without writing. `Ctrl+C` inside an archive puts mem
 with the archive as their context, and `Ctrl+V` in a real directory extracts exactly those; `Ctrl+X`
 there refuses instead of pretending a member can be deleted. `Enter` on a member unpacks only that
 member into a temporary directory and opens the viewer, which removes the directory when it closes.
+`F5` inside an archive does the same without the clipboard: it extracts the marked members, or the
+cursor row, into the other pane's directory, and keeps each member's path inside the archive, so two
+members called `inner.txt` in different folders of one archive cannot land on each other.
+
+**A folder row asks for its subtree, and the tools disagree about what naming it means.** `unzip`
+matches member names literally, so extracting `sub/` unpacks an empty directory and leaves the files
+behind; `tar` recurses into `sub/` and then reports "Not found in archive" for every child named
+alongside it, exiting non-zero *after* writing everything — which reads to the user as a failed copy
+that actually worked. So `arch_extract_members()` expands a requested directory into its subtree's
+leaves: its files, plus any directory under it that holds no files. Every tool writes those and
+creates the parents on the way, an empty folder still comes out as a folder, and the per-file progress
+counts what is actually written instead of one row per folder.
 
 **Packing asks, and the answer has to be honest.** Packing used to type a name into the operation bar,
 which left the format to whatever suffix the user happened to type. It now opens a dialog offering the
@@ -465,6 +481,7 @@ handler to keep that honest.
 | 11 | archives (backend, browsing, operations) | 2d | — |
 | 12 | archive `..`, pack dialog, pane click focus | 2h | — |
 | 13 | pack dialog layout, deferred operations | 2h | — |
+| 14 | archive `F5` copy-out, folder extraction | 1h | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -481,8 +498,8 @@ Manual checklist (extend per phase):
 8. `Enter` on a `.zip`/`.tar.gz`/`.7z`/`.rar` browses it; `Tab`, `Ctrl+Tab`, `Ctrl+Left/Right`,
    `Ctrl+U`, the hotlist and `Alt+Left/Right` all carry the virtual path; `..` and `Backspace` leave one
    level and then the archive.
-9. Inside an archive every mutation says no: `F2`, `F7`, `Shift+F4`, `F8`, `Ctrl+X`, `Ctrl+V`, `F5`,
-   `F6`, `Ctrl+B`, `Alt+F10`, `Alt+Enter`, `Alt+F7`, `F4`, `Alt+F3`.
+9. Inside an archive every mutation says no: `F2`, `F7`, `Shift+F4`, `F8`, `Ctrl+X`, `Ctrl+V`, `F6`,
+   `Ctrl+B`, `Alt+F10`, `Alt+Enter`, `Alt+F7`, `F4`, `Alt+F3`.
 10. `Alt+F5` → the dialog names the archive and picks a format → the file exists and `Alt+F9` on it
     gives the sources back; `Alt+Shift+F5` leaves only the archive behind; `Alt+F6` lands in the other
     pane; `Alt+Shift+F9` says "Archive OK".
@@ -500,3 +517,6 @@ Manual checklist (extend per phase):
     up and Abort working, instead of closing the menu and doing nothing.
 16. The pack dialog at a narrow window width, with a long archive name and a deep target directory:
     no line runs past the frame, and an elided path keeps both its head and its leaf name.
+17. Inside an archive, `F5` copies the cursor row, and with rows marked it copies those and only those;
+    a marked folder comes out with its contents rather than as an empty directory, a second `F5` over
+    the same target asks before overwriting, `F6` still refuses, and the archive itself is unchanged.
