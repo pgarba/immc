@@ -116,8 +116,7 @@ enum AppOp {
     OP_NONE = 0,
     OP_RENAME,   // op_name = new name for the target entry
     OP_MKDIR,    // op_name = new directory name
-    OP_NEWFILE,  // op_name = name of an empty file to create
-    OP_PACK      // op_name = archive file name to create in the pane's directory
+    OP_NEWFILE   // op_name = name of an empty file to create
 };
 
 // Pending confirmation dialog (Y/N)
@@ -224,10 +223,22 @@ public:
     // the ImGui frame so copy/move can pump their own progress UI.
     int  pending_op;          // 0 none, 1 copy, 2 move, 3 paste
     bool pending_confirm_yes;
-    bool pack_and_delete;     // Alt+Shift+F5: remove the sources once packed
-    // The rows the pending pack was asked for, captured before the name bar is
-    // typed into so the marks cannot change underneath it.
-    StringList pack_names;
+
+    // Pack dialog (TC Alt+F5). Packing has real choices - format, level, a
+    // password, volumes - so it gets a dialog rather than a name in the op bar.
+    // The sources are captured when it opens so marks cannot change underneath
+    // it, and the target directory is remembered so the dialog can be opened
+    // while the pane is showing an unrelated tab.
+    bool pack_open;
+    char pack_name[512];           // without the suffix; the format supplies it
+    char pack_dir[4096];           // directory the archive is written into
+    int  pack_kind_idx;            // index into arch_pack_kinds()
+    int  pack_level;               // 0 store .. 9 best
+    bool pack_use_level;           // false = the tool's own default
+    char pack_password[256];       // empty = no encryption
+    long long pack_volume_bytes;   // 0 = one file; only 7z can split
+    bool pack_delete;              // remove the sources once packed
+    StringList pack_names;         // sources, relative to pack_dir
 
     void* sdl_window;         // SDL_Window*, for pumping the progress UI
 

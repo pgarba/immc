@@ -79,6 +79,36 @@ bool arch_pack(const char* archive, const char* cwd,
                const std::vector<std::string>& rel_sources,
                arch_progress_fn cb, void* user, std::string* err);
 
+// How an archive should be written. Which fields mean anything depends on the
+// format: `level` is 0 (store) to 9 (best) where the format has a scale, a
+// password encrypts member data where the format supports it (zip, 7z), and
+// `volume_bytes` splits the output only where the tools can read the result
+// back (7z). Nothing is silently dropped: arch_pack_supported() says which
+// request a format cannot honour, and arch_pack_opts() refuses instead of
+// quietly producing something other than what was asked for.
+typedef struct {
+    ArchKind kind;
+    int level;              // -1 = the tool's own default
+    std::string password;   // empty = no encryption
+    long long volume_bytes; // 0 = a single file
+} ArchPackOpts;
+
+// Defaults for a format: the tool's own level, no password, no volumes.
+ArchPackOpts arch_pack_opts_default(ArchKind kind);
+
+// False with `why` filled in when `opts` asks for something `kind` cannot do.
+bool arch_pack_supported(const ArchPackOpts& opts, std::string* why);
+
+// The suffix a format writes with (".zip", ".tar.gz", ...), and the formats
+// that can be written at all, in the order a picker should list them.
+const char* arch_kind_suffix(ArchKind kind);
+const std::vector<ArchKind>& arch_pack_kinds();
+
+bool arch_pack_opts(const char* archive, const char* cwd,
+                    const std::vector<std::string>& rel_sources,
+                    const ArchPackOpts& opts,
+                    arch_progress_fn cb, void* user, std::string* err);
+
 // Integrity test (TC Alt+Shift+F9).
 bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string* err);
 

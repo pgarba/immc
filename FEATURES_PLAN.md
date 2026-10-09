@@ -45,8 +45,8 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
 `fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, and
-the archive pane mode with its guards and operations) run headless — 270 checks in `test-panes` plus
-150 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
+the archive pane mode with its guards and operations) run headless — 299 checks in `test-panes` plus
+191 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
 `?` was never handled in the glob matcher, and `tree_toggle()` kept a `vector` reference across an
 `insert()`, so the `expanded` flag was written to freed memory and the next press duplicated the
 row's children. Bindings are now also driven through `app_panes_handle_key` itself, not only through
@@ -364,7 +364,9 @@ path bar, the hotlist, filters, marks, selection memory, `Ctrl+Left/Right`, `Ctr
 without knowing archives exist. A directory that merely *looks* like an archive is not a boundary:
 only a regular file with an archive suffix is. `LIST_ARCHIVE` rows carry their level-relative path in
 `Pane::rel`, which is what makes the virtual path compose; the tool-facing member name is that path
-plus the pane's `archive_prefix`.
+plus the pane's `archive_prefix`. An archive root lists a `..` row like any other directory, so Enter
+leaves the archive; before that the only way out was `Backspace`, which is invisible to anyone who has
+not read the help.
 
 **Archive contents are read-only, and the guards say so.** Rename, mkdir, new file, delete, cut,
 paste, copy/move in or out, copy-in-place, links, branch view, the tree panel, search, properties,
@@ -373,15 +375,46 @@ rather than resolving a path that does not exist on disk. The way to change an a
 is in TC: extract, change, pack again. `Ctrl+P` puts the *archive file* on the command line, never
 the virtual path.
 
-**Operations.** `Alt+F5` packs the marks (or the cursor row) and asks for the archive name through
-the same operation bar rename and mkdir use, so the suffix typed there chooses the format; `Alt+Shift+F5`
-removes the sources afterwards, which makes it a move into the archive. `Alt+F6` extracts the archive
-under the cursor into the other pane's directory, `Alt+F9` into this pane's (inside an archive, "this
-pane's" means the directory holding the archive file), `Alt+Shift+F9` verifies every member's CRC
-without writing. `Ctrl+C` inside an archive puts members on the clipboard with the archive as their
-context, and `Ctrl+V` in a real directory extracts exactly those; `Ctrl+X` there refuses instead of
-pretending a member can be deleted. `Enter` on a member unpacks only that member into a temporary
-directory and opens the viewer, which removes the directory when it closes.
+**Operations.** `Alt+F5` packs the marks (or the cursor row) and opens a dialog; `Alt+Shift+F5` is
+the same with "delete the sources afterwards" already ticked, which makes it a move into the archive.
+`Alt+F6` extracts the archive under the cursor into the other pane's directory, `Alt+F9` into this
+pane's (inside an archive, "this pane's" means the directory holding the archive file), `Alt+Shift+F9`
+verifies every member's CRC without writing. `Ctrl+C` inside an archive puts members on the clipboard
+with the archive as their context, and `Ctrl+V` in a real directory extracts exactly those; `Ctrl+X`
+there refuses instead of pretending a member can be deleted. `Enter` on a member unpacks only that
+member into a temporary directory and opens the viewer, which removes the directory when it closes.
+
+**Packing asks, and the answer has to be honest.** Packing used to type a name into the operation bar,
+which left the format to whatever suffix the user happened to type. It now opens a dialog offering the
+name, the format, a compression level, a password and a volume size, and the sources are captured when
+it opens so marks cannot change underneath it. What the dialog offers is what the installed tools can
+actually do, and nothing is quietly dropped:
+
+| choice | zip | 7z | tar family |
+|---|---|---|---|
+| level 0-9 | `-0`..`-9` | `-mx0`..`-mx9` | `GZIP`/`BZIP2`/`XZ_OPT` in the child's environment |
+| password | `-P` (argv) | `-p` (argv) | impossible — tar has no encryption |
+| volumes | refused | `-v{bytes}`, reads back as one archive | refused |
+| RAR | — | read-only: no writer exists on a normal system | — |
+
+`arch_pack_supported()` is the single place that decides, and it is called both to grey out the dialog's
+Pack button and again before running the tool, so the preview and the operation cannot disagree. A
+format that cannot honour a choice is refused with the reason ("tar cannot encrypt; choose zip or 7z",
+"only 7z writes volumes the tools can read back") rather than producing an archive that is not what was
+asked for — a "password protected" archive that is not encrypted is worse than an error. A split `.zip`
+is refused on purpose: `zip -s` writes `.z01` parts that `unzip` then warns about and mis-extracts.
+The combo owns the suffix, so a name typed as `mismatched.zip` under a `tar.xz` format produces
+`mismatched.tar.xz`, and the dialog shows the file name it will write. A password is cleared each time
+the dialog opens — it is not a preference, and it should not end up in the next archive. The dialog
+also says plainly that the password is handed to the tool, so it is visible in the process list for the
+length of the pack; `zip -e`, which would prompt instead, needs a terminal a GUI process does not have.
+
+**Two details that make volumes usable.** A split archive names its parts after the whole
+(`movies.7z.001`), so `arch_kind_of()` drops a trailing all-digit component and asks again — otherwise
+the pack dialog's own output would not list, browse or extract. And the child's stdin is `/dev/null`:
+a password-protected archive makes `unzip`/`7z` prompt, and with the terminal still attached the child
+waits for typed input while the UI sits on a progress bar that never moves. With `/dev/null` the prompt
+gets EOF and the tool fails with an error the status line can show.
 
 **The bindings were reserved before they were implemented.** They used to fall through to the plain
 `F5`/`F6`/`F9` handlers, so `Alt+F5` quietly ran a copy and `Alt+F9` opened the pane menu.
@@ -406,6 +439,7 @@ handler to keep that honest.
 | 9 | H multi-rename / quick search / columns | 2d | — |
 | 10 | I keymap re-audit (Ctrl+P, Ctrl+I) | 1h | — |
 | 11 | archives (backend, browsing, operations) | 2d | — |
+| 12 | archive `..`, pack dialog, pane click focus | 2h | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -420,13 +454,18 @@ Manual checklist (extend per phase):
 6. Compare colours render under all 7 themes.
 7. Command-line text editing still supports `Ctrl+C/X/V` when the command line is non-empty.
 8. `Enter` on a `.zip`/`.tar.gz`/`.7z`/`.rar` browses it; `Tab`, `Ctrl+Tab`, `Ctrl+Left/Right`,
-   `Ctrl+U`, the hotlist and `Alt+Left/Right` all carry the virtual path; `Backspace` leaves one level
-   and then the archive.
+   `Ctrl+U`, the hotlist and `Alt+Left/Right` all carry the virtual path; `..` and `Backspace` leave one
+   level and then the archive.
 9. Inside an archive every mutation says no: `F2`, `F7`, `Shift+F4`, `F8`, `Ctrl+X`, `Ctrl+V`, `F5`,
    `F6`, `Ctrl+B`, `Alt+F10`, `Alt+Enter`, `Alt+F7`, `F4`, `Alt+F3`.
-10. `Alt+F5` → name the archive → the file exists and `Alt+F9` on it gives the sources back;
-    `Alt+Shift+F5` leaves only the archive behind; `Alt+F6` lands in the other pane;
-    `Alt+Shift+F9` says "Archive OK".
+10. `Alt+F5` → the dialog names the archive and picks a format → the file exists and `Alt+F9` on it
+    gives the sources back; `Alt+Shift+F5` leaves only the archive behind; `Alt+F6` lands in the other
+    pane; `Alt+Shift+F9` says "Archive OK".
+13. In the pack dialog: a 7z with a password does not open without it, a tar with a password is refused
+    in the dialog instead of writing an unencrypted archive, a zip with volumes is refused, and a 7z
+    volume set lists and extracts as one archive.
+14. Clicking below the last row, between rows, or on the scrollbar of the other pane makes that pane
+    the active one; a password-protected archive reports a failure rather than freezing on a prompt.
 11. `Ctrl+C` on two members, `Ctrl+V` in a real directory extracts those two and nothing else;
     `Ctrl+X` there refuses.
 12. A pack or extract over a large archive still responds to Abort in the progress dialog, and the

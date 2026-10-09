@@ -93,7 +93,15 @@ AppPanes::AppPanes() {
     viewer_path[0] = '\0';
     viewer_tmp_dir[0] = '\0';
     clipboard.archive[0] = '\0';
-    pack_and_delete = false;
+    pack_open = false;
+    pack_name[0] = '\0';
+    pack_dir[0] = '\0';
+    pack_kind_idx = 0;
+    pack_level = 6;
+    pack_use_level = false;
+    pack_password[0] = '\0';
+    pack_volume_bytes = 0;
+    pack_delete = false;
     props_open = false;
     props_path[0] = '\0';
     props_size = 0;
@@ -423,8 +431,11 @@ static void list_archive_dir(const char* archive, const char* prefix,
         return compare_files(&pa, &pb) < 0;
     });
 
-    // Inside an archive the pane still needs a way out, so ".." is a row.
-    int lead = plen ? 1 : 0;
+    // ".." is always a row. Inside an archive it steps out one level; at the
+    // archive root it leaves the archive and lands on the directory holding the
+    // archive file. Without that row the only way back out is Backspace, which
+    // is invisible to anyone who has not read the help.
+    const int lead = 1;
     *out_entries = (FileEntry**)calloc(rows.size() + lead, sizeof(FileEntry*));
     if (!*out_entries) {
         for (const ArchiveRow& r : rows) file_entry_free(r.fe);
@@ -1153,8 +1164,10 @@ static void arch_prog_begin(AppPanes* app, const char* src, const char* dst) {
     app->prog_last_pump = 0.0;
 }
 
-// TC Alt+F5 / Alt+Shift+F5. The archive name comes through the same operation
-// bar rename and mkdir use, so the suffix typed there is what picks the format.
+// TC Alt+F5 / Alt+Shift+F5. Packing gets a dialog rather than a name in the op
+// bar, because it has real choices: format, level, a password, volumes. The
+// sources and the target directory are captured here so the dialog cannot be
+// acting on something other than what was asked for.
 static void do_pack(AppPanes* app, bool and_delete) {
     Pane& active = app->left_focus ? app->left : app->right;
     if (branch_blocked(app, active) || archive_readonly(app, active)) return;
@@ -1163,23 +1176,218 @@ static void do_pack(AppPanes* app, bool and_delete) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to pack");
         return;
     }
-    if (!arch_can_pack(ARCH_ZIP)) {
+    bool any_tool = false;
+    for (ArchKind k : arch_pack_kinds()) if (arch_can_pack(k)) { any_tool = true; break; }
+    if (!any_tool) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Packing needs zip, tar or 7z installed");
         return;
     }
-    app->op = OP_PACK;
-    app->pack_and_delete = and_delete;
+    // The dialog carries the choices, so it captures the sources and the target
+    // directory now: marks and tabs cannot change underneath it.
     app->pack_names = names;
+    snprintf(app->pack_dir, sizeof(app->pack_dir), "%s", active.current_dir);
     // Default name: the single source without its own suffix, else "archive".
     std::string base = names[0];
     size_t slash = base.find_last_of('/');
     if (slash != std::string::npos) base = base.substr(slash + 1);
     size_t dot = base.find_last_of('.');
     if (dot != std::string::npos) base = base.substr(0, dot);
-    snprintf(app->op_name, sizeof(app->op_name), "%s.zip",
+    snprintf(app->pack_name, sizeof(app->pack_name), "%s",
              names.size() == 1 ? base.c_str() : "archive");
+    app->pack_delete = and_delete;
+    // A password is not a preference: it must not sit in the dialog and end up
+    // in the next archive the user packs.
+    app->pack_password[0] = '\0';
+    app->pack_open = true;
     snprintf(app->status_msg, sizeof(app->status_msg), "Pack %d entr%s",
              (int)names.size(), names.size() == 1 ? "y" : "ies");
+}
+
+// The format combo owns the suffix, so a half-typed name cannot disagree with
+// the format it is packed in. Longer suffixes are tried first: arch_pack_kinds()
+// lists ".tar.gz" before ".tar".
+static std::string strip_archive_suffix(const std::string& s) {
+    for (ArchKind k : arch_pack_kinds()) {
+        std::string suf = arch_kind_suffix(k);
+        if (s.size() > suf.size() &&
+            s.compare(s.size() - suf.size(), suf.size(), suf) == 0)
+            return s.substr(0, s.size() - suf.size());
+    }
+    return s;
+}
+
+// The dialog state as the backend understands it, so the preview in the dialog
+// and the operation that runs on Pack can never disagree.
+static ArchPackOpts pack_opts(const AppPanes* app) {
+    ArchPackOpts o = arch_pack_opts_default(arch_pack_kinds()[app->pack_kind_idx]);
+    if (app->pack_use_level) o.level = app->pack_level;
+    o.password = app->pack_password;
+    o.volume_bytes = app->pack_volume_bytes;
+    return o;
+}
+
+// The dialog's Pack button, and Enter. Runs the tool with the progress bar the
+// copy operations already use, so abort works the same way here.
+static void pack_commit(AppPanes* app) {
+    ArchKind kind = arch_pack_kinds()[app->pack_kind_idx];
+    ArchPackOpts opts = pack_opts(app);
+
+    std::string name = app->pack_name;
+    while (!name.empty() && isspace((unsigned char)name.back())) name.pop_back();
+    if (name.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Pack cancelled: the archive needs a name");
+        app->pack_open = false;
+        app->pack_names.clear();
+        return;
+    }
+    std::string arch = std::string(app->pack_dir) + "/" +
+                       strip_archive_suffix(name) + arch_kind_suffix(kind);
+
+    std::string why;
+    if (!arch_pack_supported(opts, &why)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot pack: %s", why.c_str());
+        return;                                  // leave the dialog up to fix
+    }
+    if (!arch_can_pack(kind)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Cannot pack %s: %s is not installed", arch.c_str(), arch_kind_name(kind));
+        return;
+    }
+
+    StringList names = app->pack_names;
+    app->pack_names.clear();
+    app->pack_open = false;
+
+    arch_prog_begin(app, app->pack_dir, arch.c_str());
+    std::string err;
+    bool ok = arch_pack_opts(arch.c_str(), app->pack_dir, names, opts,
+                             copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (!ok) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Pack failed: %s", err.c_str());
+        return;
+    }
+    int removed = 0;
+    // Alt+Shift+F5 is a move into the archive, so the sources go too.
+    if (app->pack_delete) {
+        for (const std::string& n : names) {
+            std::string full = std::string(app->pack_dir) + "/" + n;
+            if (fs_delete_entry_progress(full.c_str(), copy_progress_cb, app)) removed++;
+        }
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "Packed %d entr%s into %s%s",
+             (int)names.size(), names.size() == 1 ? "y" : "ies", arch.c_str(),
+             removed ? ", removed the sources" : "");
+    refresh_pane(&app->left, app->left.current_dir);
+    refresh_pane(&app->right, app->right.current_dir);
+}
+
+// Volume sizes worth offering. 7z takes a byte count, so the labels are the
+// only place units appear.
+static const long long kPackVolumes[] = { 0, 1024LL, 1024LL * 1024,
+                                          100LL * 1024 * 1024, 700LL * 1024 * 1024,
+                                          1024LL * 1024 * 1024, 4LL * 1024 * 1024 * 1024 };
+static const char* const kPackVolumeLabels[] = {
+    "one file", "1 KB", "1 MB", "100 MB", "700 MB (CD)", "1 GB", "4 GB" };
+
+static void render_pack_dialog(AppPanes* app) {
+    if (!app->pack_open) return;
+    const std::vector<ArchKind>& kinds = arch_pack_kinds();
+    if (app->pack_kind_idx < 0 || app->pack_kind_idx >= (int)kinds.size())
+        app->pack_kind_idx = 0;
+    ArchKind kind = kinds[app->pack_kind_idx];
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(430, 330), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 215, io.DisplaySize.y * 0.5f - 165),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Pack into archive", &open, ImGuiWindowFlags_NoCollapse);
+
+    char items[256] = { 0 };
+    size_t used = 0;
+    for (ArchKind k : kinds) {
+        const char* n = arch_kind_name(k);
+        size_t nlen = strlen(n);
+        if (used + nlen + 2 >= sizeof(items)) break;
+        memcpy(items + used, n, nlen + 1);
+        used += nlen + 1;
+    }
+    items[used++] = '\0';
+
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("Archive name", app->pack_name, sizeof(app->pack_name));
+    ImGui::TextDisabled("Written as %s%s in %s",
+                        strip_archive_suffix(app->pack_name).c_str(),
+                        arch_kind_suffix(kind), app->pack_dir);
+
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("Format", &app->pack_kind_idx, items)) {
+        // A format that cannot honour a choice drops it, so the dialog never
+        // shows a password box that would be ignored.
+        ArchKind nk = kinds[app->pack_kind_idx];
+        bool is_tar = nk == ARCH_TAR || nk == ARCH_TAR_GZ || nk == ARCH_TAR_BZ2 || nk == ARCH_TAR_XZ;
+        if (is_tar) { app->pack_password[0] = '\0'; app->pack_volume_bytes = 0; }
+        if (nk == ARCH_TAR) app->pack_use_level = false;
+        if (nk != ARCH_7Z) app->pack_volume_bytes = 0;
+    }
+
+    bool is_tar = kind == ARCH_TAR || kind == ARCH_TAR_GZ ||
+                  kind == ARCH_TAR_BZ2 || kind == ARCH_TAR_XZ;
+    ImGui::BeginDisabled(kind == ARCH_TAR);
+    ImGui::Checkbox("Compression level", &app->pack_use_level);
+    if (kind == ARCH_TAR)
+        ImGui::TextDisabled("a plain .tar is not compressed");
+    else {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##level", &app->pack_level, 0, 9, "%d");
+        ImGui::TextDisabled("0 store - 1 fastest - 6 the tool's default - 9 best");
+    }
+    ImGui::EndDisabled();
+
+    if (is_tar) {
+        ImGui::TextDisabled("tar cannot encrypt; pick zip or 7z for a password");
+    } else {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("Password", app->pack_password, sizeof(app->pack_password),
+                         ImGuiInputTextFlags_Password);
+        ImGui::TextDisabled("the password is handed to %s, so it is visible in the "
+                            "process list while packing", arch_kind_name(kind));
+    }
+
+    if (kind != ARCH_7Z) {
+        ImGui::TextDisabled("only 7z writes volumes the tools can read back");
+    } else {
+        int vi = 0;
+        for (int i = 0; i < (int)(sizeof(kPackVolumes) / sizeof(kPackVolumes[0])); i++)
+            if (kPackVolumes[i] == app->pack_volume_bytes) vi = i;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("Volumes", &vi, kPackVolumeLabels,
+                         (int)(sizeof(kPackVolumeLabels) / sizeof(kPackVolumeLabels[0]))))
+            app->pack_volume_bytes = kPackVolumes[vi];
+    }
+
+    ImGui::Checkbox("Delete the sources afterwards", &app->pack_delete);
+
+    std::string why;
+    bool supported = arch_pack_supported(pack_opts(app), &why);
+    ImGui::Separator();
+    if (!arch_can_pack(kind)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s is not installed", arch_kind_name(kind));
+    } else if (!supported) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", why.c_str());
+    }
+    ImGui::Spacing();
+    bool can_pack = arch_can_pack(kind) && supported && app->pack_name[0];
+    ImGui::BeginDisabled(!can_pack);
+    if (ImGui::Button("Pack")) { pack_commit(app); ImGui::End(); return; }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) { app->pack_open = false; app->pack_names.clear(); }
+    ImGui::TextDisabled("Enter packs, Esc cancels");
+    if (!open) { app->pack_open = false; app->pack_names.clear(); }
+    ImGui::End();
 }
 
 // TC Alt+F6 (into the other pane's directory) and Alt+F9 (into this one's).
@@ -1875,7 +2083,10 @@ static void render_tree_rows(AppPanes* app, Pane& pane, bool focused,
                              float width, float height, const char* id) {
     ImGui::PushID(id);
     ImGui::BeginChild(id, ImVec2(width, height));
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0))
+    // Any click inside the tree focuses this pane, not only a click that happens
+    // to land on a row. IsItemHovered() here would look at whatever widget came
+    // before the child window, so it never fired for the pane's own area.
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0))
         app->left_focus = (&pane == &app->left);
     if (pane.tree_rows.empty()) tree_fill(pane);
 
@@ -2183,7 +2394,10 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
     pane.page_size = row_h > 0 ? (int)(ImGui::GetWindowSize().y / row_h) : PAGE_SIZE;
     if (pane.page_size < 1) pane.page_size = PAGE_SIZE;
 
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0))
+    // Clicking anywhere in the pane - below the last row, between rows, on the
+    // scrollbar - makes it the active pane. Checked on the child window, because
+    // IsItemHovered() would refer to the widget before it.
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0))
         app->left_focus = focused;
 
     // The filter field is edited by ImGui, so re-apply the filter here, before
@@ -2812,10 +3026,12 @@ static void render_about(AppPanes* app) {
         "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n"
         "Ctrl+Shift+F8 tree in the panel   Shift+Tab split view: tree + list\n"
         "ARCHIVES (zip, tar, tar.gz/bz2/xz, 7z, RAR read-only)\n"
-        "Enter on an archive browses it like a folder; Backspace leaves it\n"
+        "Enter on an archive browses it like a folder; .. or Backspace leaves it\n"
         "Alt+F5 pack        Alt+Shift+F5 pack and remove the sources\n"
         "Alt+F6 extract into the other pane   Alt+F9 extract into this one\n"
         "Alt+Shift+F9 test archive integrity  Ctrl+C/V copy members out\n"
+        "The pack dialog picks format, level, password and 7z volumes; RAR and\n"
+        "tar cannot be written with a password, and only 7z splits into volumes\n"
         "An archive's contents are read-only: extract, change, pack again\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
         "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
@@ -3132,7 +3348,6 @@ void app_panes_render(AppPanes* app) {
     if (app->op != OP_NONE) {
         const char* label = app->op == OP_RENAME ? "Rename to:"
                           : app->op == OP_NEWFILE ? "New file name:"
-                          : app->op == OP_PACK ? "Pack into:"
                           : "New directory name:";
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
@@ -3191,6 +3406,7 @@ void app_panes_render(AppPanes* app) {
     render_cmdhist(app);
     render_volumes(app);
     render_columns_dialog(app);
+    render_pack_dialog(app);
     render_tree(app);
     render_search(app);
     render_confirm(app);
@@ -3306,46 +3522,6 @@ void app_panes_free(AppPanes* app) {
 
 void app_panes_commit_op(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
-    if (app->op == OP_PACK) {
-        char dir[4096];
-        snprintf(dir, sizeof(dir), "%s", active.current_dir);
-        std::string arch = std::string(dir) + "/" + app->op_name;
-        ArchKind kind = arch_kind_of(arch.c_str());
-        StringList names = app->pack_names;
-        app->pack_names.clear();
-        if (kind == ARCH_NONE || !arch_can_pack(kind)) {
-            snprintf(app->status_msg, sizeof(app->status_msg),
-                     "Cannot pack %s: the name has to end in .zip, .tar, .tar.gz, .tar.bz2, "
-                     ".tar.xz or .7z", app->op_name);
-        } else {
-            arch_prog_begin(app, dir, arch.c_str());
-            std::string err;
-            bool ok = arch_pack(arch.c_str(), dir, names, copy_progress_cb, app, &err);
-            app->prog_active = false;
-            if (ok) {
-                int removed = 0;
-                // Alt+Shift+F5 is a move into the archive, so the sources go too.
-                if (app->pack_and_delete) {
-                    for (const std::string& n : names) {
-                        std::string full = std::string(dir) + "/" + n;
-                        if (fs_delete_entry_progress(full.c_str(), copy_progress_cb, app)) removed++;
-                    }
-                }
-                snprintf(app->status_msg, sizeof(app->status_msg), "Packed %d entr%s into %s%s",
-                         (int)names.size(), names.size() == 1 ? "y" : "ies", arch.c_str(),
-                         removed ? ", removed the sources" : "");
-                refresh_pane(&active, active.current_dir);
-                Pane& other = app->left_focus ? app->right : app->left;
-                refresh_pane(&other, other.current_dir);
-            } else {
-                snprintf(app->status_msg, sizeof(app->status_msg), "Pack failed: %s", err.c_str());
-            }
-        }
-        app->pack_and_delete = false;
-        app->op = OP_NONE;
-        app->op_input_active = false;
-        return;
-    }
     // Rename, mkdir and new file all build a path under the pane's directory, so
     // they cannot run on archive members.
     if (archive_readonly(app, active)) {
@@ -3517,9 +3693,8 @@ static bool quick_search(AppPanes* app, Pane& pane, char ch) {
 }
 
 // TC's archive keys: Alt+F5 pack, Alt+Shift+F5 pack and delete, Alt+F6 and
-// Alt+F9 extract, Alt+Shift+F9 test. Archives are not implemented (they need a
-// third-party backend), but the bindings stay reserved: without this, Alt+F5
-// falls through to plain F5 and quietly copies instead.
+// Alt+F9 extract, Alt+Shift+F9 test. They are matched here so they never fall
+// through to plain F5/F6/F9, which would quietly copy or move instead.
 static bool is_archive_key(SDL_Keycode key, SDL_Keymod mod) {
     if (!(mod & SDL_KMOD_ALT)) return false;
     return key == SDLK_F5 || key == SDLK_F6 || key == SDLK_F9;
@@ -3616,6 +3791,14 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (app->cmdhist_open && key == SDLK_ESCAPE) { app->cmdhist_open = false; return; }
     if (app->tree_open && key == SDLK_ESCAPE) { app->tree_open = false; return; }
     if (app->about_open && key == SDLK_ESCAPE)   { app->about_open = false; return; }
+    // ---- pack dialog (Alt+F5): Enter packs, Esc cancels, and no other key
+    //      reaches the panes while it is up ----
+    if (app->pack_open) {
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) pack_commit(app);
+        else if (key == SDLK_ESCAPE) { app->pack_open = false; app->pack_names.clear(); }
+        return;
+    }
+
     if (app->props_open && (key == SDLK_ESCAPE || key == SDLK_RETURN || key == SDLK_KP_ENTER)) {
         app->props_open = false; return;
     }

@@ -503,17 +503,20 @@ static void test_archive_keys_live(AppPanes* app, const std::string& root) {
     p.selected = ai;
     p.marked[ai] = true;
 
-    // Alt+F5 asks for an archive name; it must not fall through to a copy.
+    // Alt+F5 opens the pack dialog; it must not fall through to a copy.
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
-    CHECK(app->op == OP_PACK);
+    CHECK(app->pack_open);
     CHECK(!app->prog_active);
     CHECK(app->clipboard.paths.empty());      // nothing queued for a copy
-    app_panes_cancel_op(app);
+    app->pack_open = false;
+    app->pack_names.clear();
 
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
-    CHECK(app->op == OP_PACK);
+    CHECK(app->pack_open);
+    CHECK(app->pack_delete);                  // the sources are offered for removal
     CHECK(fs_exists((root + "/alpha.txt").c_str()));   // not deleted
-    app_panes_cancel_op(app);
+    app->pack_open = false;
+    app->pack_names.clear();
 
     // With no archive under the cursor the extract keys say so and do nothing.
     app_panes_handle_key(app, SDLK_F6, SDL_KMOD_ALT);
@@ -565,7 +568,16 @@ static void test_archive_browse(AppPanes* app, const std::string& root) {
     CHECK(idx_of(p, "one.txt") >= 0);
     CHECK(idx_of(p, "two.txt") >= 0);
     CHECK(idx_of(p, "sub") >= 0);
-    CHECK(idx_of(p, "..") < 0);                // Backspace leaves the archive
+    // The archive root carries a ".." row like any other directory. Without it
+    // the only way out of an archive is a key nobody thinks to press.
+    CHECK(idx_of(p, "..") == 0);
+    p.selected = idx_of(p, "..");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.list_mode == LIST_NORMAL);
+    CHECK(strcmp(p.current_dir, root.c_str()) == 0);
+    p.selected = idx_of(p, "pkg.zip");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.list_mode == LIST_ARCHIVE);
 
     // A folder inside the archive is an ordinary row that can be walked into.
     p.selected = idx_of(p, "sub");
@@ -714,11 +726,11 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
         if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
 
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
-    CHECK(app->op == OP_PACK);
-    CHECK(strcmp(app->op_name, "archive.zip") == 0);   // several sources: generic name
-    snprintf(app->op_name, sizeof(app->op_name), "packed.zip");
-    app_panes_commit_op(app);
-    CHECK(app->op == OP_NONE);
+    CHECK(app->pack_open);
+    CHECK(strcmp(app->pack_name, "archive") == 0);   // several sources: generic name
+    snprintf(app->pack_name, sizeof(app->pack_name), "packed");
+    pack_commit(app);
+    CHECK(!app->pack_open);
     CHECK(fs_exists((root + "/pack/packed.zip").c_str()));
     std::vector<ArchEntry> members;
     std::string err;
@@ -733,9 +745,10 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
         if (strcmp(p.entries[i]->name, "..") != 0 && strcmp(p.entries[i]->name, "packed.zip") != 0)
             p.marked[i] = true;
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT | SDL_KMOD_SHIFT);
-    CHECK(app->op == OP_PACK);
-    snprintf(app->op_name, sizeof(app->op_name), "moved.zip");
-    app_panes_commit_op(app);
+    CHECK(app->pack_open);
+    CHECK(app->pack_delete);
+    snprintf(app->pack_name, sizeof(app->pack_name), "moved");
+    pack_commit(app);
     CHECK(fs_exists((root + "/pack/moved.zip").c_str()));
     CHECK(!fs_exists((root + "/pack/a.txt").c_str()));
     CHECK(!fs_exists((root + "/pack/b.txt").c_str()));
@@ -779,6 +792,114 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
     refresh_pane(&q, root.c_str());
 
     sh("rm -rf '" + root + "/pack' '" + root + "/out2' '" + root + "/here'");
+}
+
+static int kind_idx(ArchKind k) {
+    const std::vector<ArchKind>& ks = arch_pack_kinds();
+    for (int i = 0; i < (int)ks.size(); i++) if (ks[i] == k) return i;
+    return -1;
+}
+
+// The dialog's choices have to reach the tool, and a choice the format cannot
+// honour has to be refused in the dialog rather than quietly dropped on the way
+// to it - a "password protected" archive that is not encrypted is worse than an
+// error message.
+static void test_pack_options(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    app->left_focus = true;
+
+    sh("rm -rf '" + root + "/opts' '" + root + "/yes' '" + root + "/nope'");
+    sh("mkdir -p '" + root + "/opts'");
+    // Redundant content, so a compression level has something to bite on.
+    for (int i = 0; i < 3; i++) {
+        std::string path = root + "/opts/f" + std::to_string(i) + ".txt";
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) { for (int k = 0; k < 20000; k++) fwrite("abcdefgh", 1, 8, f); fclose(f); }
+    }
+    auto mark_all = [&]() {
+        refresh_pane(&p, (root + "/opts").c_str());
+        for (int i = 0; i < p.entry_count; i++)
+            if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
+    };
+
+    CHECK(kind_idx(ARCH_7Z) >= 0);
+    CHECK(kind_idx(ARCH_ZIP) >= 0);
+    CHECK(kind_idx(ARCH_TAR_GZ) >= 0);
+
+    // A 7z with a password and a chosen level.
+    mark_all();
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    app->pack_kind_idx = kind_idx(ARCH_7Z);
+    snprintf(app->pack_name, sizeof(app->pack_name), "secret");
+    app->pack_use_level = true;
+    app->pack_level = 9;
+    snprintf(app->pack_password, sizeof(app->pack_password), "hunter2");
+    pack_commit(app);
+    CHECK(!app->pack_open);
+    std::string sev = root + "/opts/secret.7z";
+    CHECK(fs_exists(sev.c_str()));
+
+    // It really is encrypted: the tool cannot read it back without the password.
+    sh("mkdir -p '" + root + "/nope'");
+    std::string err;
+    CHECK(!arch_extract(sev.c_str(), (root + "/nope").c_str(), nullptr, nullptr, &err));
+    CHECK(!fs_exists((root + "/nope/f0.txt").c_str()));
+    sh("mkdir -p '" + root + "/yes'");
+    int rc = system(("7z x '" + sev + "' -o'" + root + "/yes' -p'hunter2' -y > /dev/null 2>&1").c_str());
+    CHECK(rc == 0);
+    CHECK(fs_exists((root + "/yes/f0.txt").c_str()));
+
+    // tar cannot encrypt. The dialog stays open so the choice can be fixed, and
+    // nothing half-made is left behind.
+    mark_all();
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    app->pack_kind_idx = kind_idx(ARCH_TAR_GZ);
+    snprintf(app->pack_name, sizeof(app->pack_name), "plain");
+    snprintf(app->pack_password, sizeof(app->pack_password), "hunter2");
+    pack_commit(app);
+    CHECK(app->pack_open);
+    CHECK(strstr(app->status_msg, "encrypt") != NULL);
+    CHECK(!fs_exists((root + "/opts/plain.tar.gz").c_str()));
+    app->pack_password[0] = '\0';
+    pack_commit(app);                       // same name, now without a password
+    CHECK(!app->pack_open);
+    CHECK(fs_exists((root + "/opts/plain.tar.gz").c_str()));
+
+    // Volumes: refused for zip, because a split .zip comes back unreadable; and
+    // for 7z the set has to read back as one archive.
+    mark_all();
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    app->pack_kind_idx = kind_idx(ARCH_ZIP);
+    snprintf(app->pack_name, sizeof(app->pack_name), "split");
+    app->pack_volume_bytes = 1024 * 1024;
+    pack_commit(app);
+    CHECK(app->pack_open);
+    CHECK(strstr(app->status_msg, "volumes") != NULL);
+    CHECK(!fs_exists((root + "/opts/split.zip").c_str()));
+
+    app->pack_kind_idx = kind_idx(ARCH_7Z);
+    app->pack_password[0] = '\0';
+    pack_commit(app);
+    CHECK(!app->pack_open);
+    CHECK(fs_exists((root + "/opts/split.7z.001").c_str()));
+    sh("mkdir -p '" + root + "/volout'");
+    CHECK(arch_extract((root + "/opts/split.7z.001").c_str(), (root + "/volout").c_str(),
+                       nullptr, nullptr, &err));
+    CHECK(fs_exists((root + "/volout/f0.txt").c_str()));
+
+    // The format owns the suffix, so a name typed with the wrong one still
+    // produces the archive the dialog said it would.
+    mark_all();
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    app->pack_kind_idx = kind_idx(ARCH_TAR_XZ);
+    snprintf(app->pack_name, sizeof(app->pack_name), "mismatched.zip");
+    app->pack_volume_bytes = 0;
+    pack_commit(app);
+    CHECK(!app->pack_open);
+    CHECK(fs_exists((root + "/opts/mismatched.tar.xz").c_str()));
+    CHECK(!fs_exists((root + "/opts/mismatched.zip").c_str()));
+
+    sh("rm -rf '" + root + "/opts' '" + root + "/yes' '" + root + "/nope' '" + root + "/volout'");
 }
 
 // TC Ctrl+P (path into the command line) and Ctrl+I (switch to the target
@@ -914,6 +1035,7 @@ int main() {
     test_archive_guards(&app, root);
     test_archive_copy_out(&app, root);
     test_archive_ops(&app, root);
+    test_pack_options(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

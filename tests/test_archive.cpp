@@ -43,6 +43,10 @@ static void write_file(const std::string& path, const std::string& content) {
 }
 
 static bool exists(const std::string& p) { struct stat st; return lstat(p.c_str(), &st) == 0; }
+static off_t bytes_of(const std::string& p) {
+    struct stat st;
+    return lstat(p.c_str(), &st) == 0 ? st.st_size : -1;
+}
 
 static bool is_dir(const std::string& p) {
     struct stat st;
@@ -118,6 +122,11 @@ static void test_kind_of(void) {
     // rar has no writer
     CHECK(!arch_can_pack(ARCH_RAR));
     CHECK(arch_can_extract(ARCH_RAR));
+    // A split archive names its parts after the whole, so the part number is not
+    // the format. Without this the pack dialog's own volumes would be unreadable.
+    CHECK(arch_kind_of("a.7z.001") == ARCH_7Z);
+    CHECK(arch_kind_of("a.tar.gz.002") == ARCH_TAR_GZ);
+    CHECK(arch_kind_of("movie.mkv.001") == ARCH_NONE);
 }
 
 static void test_list_zip(const std::string& root) {
@@ -372,6 +381,85 @@ static void test_split_virtual(const std::string& root) {
     CHECK(!arch_split_virtual((root + "/a file.txt/x").c_str(), arch, sizeof(arch), prefix, sizeof(prefix)));
 }
 
+// The options a pack dialog can ask for: a level, a password, volumes. Each one
+// has to reach the tool, and a format that cannot honour one has to say so
+// before it writes an archive that is not what was asked for.
+static void test_pack_options(const std::string& root) {
+    std::string src = root + "/opts";
+    sh("rm -rf " + q(src) + " && mkdir -p " + q(src));
+    std::string filler;
+    for (int i = 0; i < 20000; i++) filler += "abcdefgh";
+    write_file(src + "/f0.txt", filler);
+    write_file(src + "/f1.txt", filler);
+    const std::vector<std::string> one{ "f0.txt" };
+    const std::vector<std::string> two{ "f0.txt", "f1.txt" };
+    std::string err, why;
+
+    // A level reaches the compressor: level 0 stores, so the archive is bigger
+    // than the same content at level 9.
+    ArchPackOpts store = arch_pack_opts_default(ARCH_ZIP);
+    store.level = 0;
+    CHECK(arch_pack_opts((src + "/s.zip").c_str(), src.c_str(), two, store, nullptr, nullptr, &err));
+    ArchPackOpts best = arch_pack_opts_default(ARCH_ZIP);
+    best.level = 9;
+    CHECK(arch_pack_opts((src + "/b.zip").c_str(), src.c_str(), two, best, nullptr, nullptr, &err));
+    CHECK(bytes_of(src + "/s.zip") > bytes_of(src + "/b.zip"));
+
+    // A password really encrypts: the tool cannot read the archive back without it.
+    ArchPackOpts pw = arch_pack_opts_default(ARCH_ZIP);
+    pw.password = "hunter2";
+    CHECK(arch_pack_opts((src + "/p.zip").c_str(), src.c_str(), one, pw, nullptr, nullptr, &err));
+    sh("mkdir -p " + q(src + "/out"));
+    CHECK(!arch_extract((src + "/p.zip").c_str(), (src + "/out").c_str(), nullptr, nullptr, &err));
+    CHECK(!exists(src + "/out/f0.txt"));
+    sh("cd " + q(src) + " && unzip -q -o -P hunter2 p.zip -d out > /dev/null 2>&1");
+    CHECK(exists(src + "/out/f0.txt"));
+
+    // Refusals happen before anything is written.
+    ArchPackOpts bad = arch_pack_opts_default(ARCH_TAR_GZ);
+    bad.password = "hunter2";
+    CHECK(!arch_pack_supported(bad, &why));
+    CHECK(why.find("encrypt") != std::string::npos);
+    CHECK(!arch_pack_opts((src + "/bad.tar.gz").c_str(), src.c_str(), one, bad, nullptr, nullptr, &err));
+    CHECK(!exists(src + "/bad.tar.gz"));
+
+    ArchPackOpts vol = arch_pack_opts_default(ARCH_ZIP);
+    vol.volume_bytes = 1024 * 1024;
+    CHECK(!arch_pack_supported(vol, &why));
+    CHECK(why.find("volumes") != std::string::npos);
+
+    ArchPackOpts lvl = arch_pack_opts_default(ARCH_TAR);
+    lvl.level = 9;
+    CHECK(!arch_pack_supported(lvl, &why));
+
+    // 7z volumes read back as one archive, by name and by extraction. The
+    // content has to be incompressible or the set never reaches a second volume.
+    std::string noise;
+    unsigned x = 12345u;
+    for (int i = 0; i < 200000; i++) { x = x * 1103515245u + 12345u; noise.push_back((char)((x >> 16) & 0xFF)); }
+    write_file(src + "/n0.bin", noise);
+    const std::vector<std::string> noisy{ "n0.bin" };
+    ArchPackOpts v7 = arch_pack_opts_default(ARCH_7Z);
+    v7.volume_bytes = 100 * 1024;
+    CHECK(arch_pack_supported(v7, &why));
+    CHECK(arch_pack_opts((src + "/v.7z").c_str(), src.c_str(), noisy, v7, nullptr, nullptr, &err));
+    CHECK(exists(src + "/v.7z.001"));
+    CHECK(exists(src + "/v.7z.002"));
+    std::vector<ArchEntry> members;
+    CHECK(arch_list((src + "/v.7z.001").c_str(), &members, &err));
+    CHECK(arch_find(members, "n0.bin") != nullptr);
+    sh("mkdir -p " + q(src + "/vout"));
+    CHECK(arch_extract((src + "/v.7z.001").c_str(), (src + "/vout").c_str(), nullptr, nullptr, &err));
+    CHECK(bytes_of(src + "/vout/n0.bin") == (off_t)noise.size());
+
+    // The name has to carry the format being written.
+    ArchPackOpts zipped = arch_pack_opts_default(ARCH_7Z);
+    CHECK(!arch_pack_opts((src + "/wrong.zip").c_str(), src.c_str(), one, zipped, nullptr, nullptr, &err));
+    CHECK(!exists(src + "/wrong.zip"));
+
+    sh("rm -rf " + q(src));
+}
+
 static void test_extract_temp(const std::string& root) {
     std::vector<ArchEntry> v;
     std::string lerr;
@@ -432,6 +520,7 @@ int main() {
     test_abort(root);
     test_failures(root);
     test_extract_temp(root);
+    test_pack_options(root);
     test_split_virtual(root);
 
     sh("rm -rf '" + root + "'");

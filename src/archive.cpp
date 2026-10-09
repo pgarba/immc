@@ -75,7 +75,15 @@ ArchKind arch_kind_of(const char* path) {
         size_t n = strlen(k.suffix);
         if (p.size() >= n && p.compare(p.size() - n, n, k.suffix) == 0) return k.kind;
     }
-    return ARCH_NONE;
+    // A split archive names its parts after the whole: "movies.7z.001". Those
+    // digits are a part number, not a format, so drop them and ask again. This
+    // is what lets the browser and the extractor read back a volume set the
+    // pack dialog just made.
+    size_t dot = p.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= p.size()) return ARCH_NONE;
+    for (size_t i = dot + 1; i < p.size(); i++)
+        if (!isdigit((unsigned char)p[i])) return ARCH_NONE;
+    return arch_kind_of(p.substr(0, dot).c_str());
 }
 
 bool arch_is_archive(const char* path) { return arch_kind_of(path) != ARCH_NONE; }
@@ -148,6 +156,65 @@ bool arch_can_pack(ArchKind k) {
 
 bool arch_can_extract(ArchKind k) { return arch_tool_available(k); }
 
+const char* arch_kind_suffix(ArchKind k) {
+    switch (k) {
+    case ARCH_ZIP:     return ".zip";
+    case ARCH_TAR:     return ".tar";
+    case ARCH_TAR_GZ:  return ".tar.gz";
+    case ARCH_TAR_BZ2: return ".tar.bz2";
+    case ARCH_TAR_XZ:  return ".tar.xz";
+    case ARCH_7Z:      return ".7z";
+    default:           return "";
+    }
+}
+
+// What a pack dialog should offer, in the order it reads naturally: the two
+// formats that can carry encryption and options first, then the tar family.
+// RAR is deliberately absent - there is no writer for it on a normal system.
+const std::vector<ArchKind>& arch_pack_kinds() {
+    static const std::vector<ArchKind> k = { ARCH_ZIP, ARCH_7Z, ARCH_TAR_GZ,
+                                             ARCH_TAR_XZ, ARCH_TAR_BZ2, ARCH_TAR };
+    return k;
+}
+
+ArchPackOpts arch_pack_opts_default(ArchKind k) {
+    ArchPackOpts o;
+    o.kind = k;
+    o.level = -1;
+    o.password.clear();
+    o.volume_bytes = 0;
+    return o;
+}
+
+bool arch_pack_supported(const ArchPackOpts& opts, std::string* why) {
+    const bool is_tar = opts.kind == ARCH_TAR || opts.kind == ARCH_TAR_GZ ||
+                        opts.kind == ARCH_TAR_BZ2 || opts.kind == ARCH_TAR_XZ;
+    if (!arch_can_pack(opts.kind)) {
+        *why = std::string(arch_kind_name(opts.kind)) + " cannot be written (read-only format)";
+        return false;
+    }
+    if (opts.level < -1 || opts.level > 9) {
+        *why = "compression level must be between 0 and 9";
+        return false;
+    }
+    if (opts.level >= 0 && opts.kind == ARCH_TAR) {
+        *why = "a plain .tar is not compressed, so a level means nothing";
+        return false;
+    }
+    if (!opts.password.empty() && !is_tar) {
+        // fine for zip/7z
+    } else if (!opts.password.empty() && is_tar) {
+        *why = "tar cannot encrypt; choose zip or 7z for a password";
+        return false;
+    }
+    if (opts.volume_bytes > 0 && opts.kind != ARCH_7Z) {
+        *why = "only 7z writes volumes the tools can read back; "
+               "a split .zip comes out unreadable by unzip";
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // process runner
 // ---------------------------------------------------------------------------
@@ -157,7 +224,10 @@ struct Proc {
     int fd = -1;
 };
 
+static const std::vector<std::string> kNoEnv;
+
 static bool proc_start(const std::vector<std::string>& argv, const char* cwd,
+                       const std::vector<std::string>& env,
                        Proc* p, std::string* err) {
     int pfd[2];
     if (pipe(pfd) != 0) { *err = std::strerror(errno); return false; }
@@ -170,7 +240,18 @@ static bool proc_start(const std::vector<std::string>& argv, const char* cwd,
     if (pid == 0) {
         dup2(pfd[1], STDOUT_FILENO);
         dup2(pfd[1], STDERR_FILENO);   // errors belong in the same stream
+        // A tool that wants a password asks on stdin. We never read that prompt,
+        // so leaving the terminal attached would leave the child waiting and the
+        // UI frozen with a progress bar that never moves. /dev/null turns the
+        // prompt into an immediate failure the caller can report.
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, STDIN_FILENO); close(nul); }
         close(pfd[0]); close(pfd[1]);
+        for (const std::string& e : env) {
+            size_t eq = e.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            setenv(e.substr(0, eq).c_str(), e.substr(eq + 1).c_str(), 1);
+        }
         if (cwd && *cwd && chdir(cwd) != 0) _exit(127);
         std::vector<char*> cs;
         for (const std::string& s : argv) cs.push_back(const_cast<char*>(s.c_str()));
@@ -317,9 +398,10 @@ static void feed(Progress* pr, const std::string& line) {
 // Run a tool, streaming its output through `pr`. Returns the exit status, or
 // -1 if the process could not be started. `out` collects everything printed.
 static int run_stream(const std::vector<std::string>& argv, const char* cwd,
+                      const std::vector<std::string>& env,
                       Progress* pr, std::string* out, std::string* err) {
     Proc p;
-    if (!proc_start(argv, cwd, &p, err)) return -1;
+    if (!proc_start(argv, cwd, env, &p, err)) return -1;
 
     std::string pending;   // partial line across reads
     char buf[4096];
@@ -381,7 +463,7 @@ static int run_capture(const std::vector<std::string>& argv, const char* cwd,
                        std::string* out, std::string* err) {
     Progress pr;
     pr.mode = UNIT_ANY;
-    return run_stream(argv, cwd, &pr, out, err);
+    return run_stream(argv, cwd, kNoEnv, &pr, out, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +789,7 @@ bool arch_extract(const char* archive, const char* dest,
     }
 
     std::string out;
-    int st = run_stream(argv, nullptr, &pr, &out, err);
+    int st = run_stream(argv, nullptr, kNoEnv, &pr, &out, err);
     if (pr.aborted) return false;
     if (st == 127) { *err = "the archive tool is not installed"; return false; }
     if (st != 0) {
@@ -769,7 +851,7 @@ bool arch_extract_members(const char* archive, const char* dest,
     }
 
     std::string out;
-    int st = run_stream(argv, nullptr, &pr, &out, err);
+    int st = run_stream(argv, nullptr, kNoEnv, &pr, &out, err);
     if (pr.aborted) return false;
     if (st != 0) {
         std::string why = last_meaningful_line(out);
@@ -784,10 +866,24 @@ bool arch_extract_members(const char* archive, const char* dest,
 bool arch_pack(const char* archive, const char* cwd,
                const std::vector<std::string>& rel_sources,
                arch_progress_fn cb, void* user, std::string* err) {
-    ArchKind k = arch_kind_of(archive);
-    if (k == ARCH_NONE) { *err = "choose a name ending in .zip, .tar, .tar.gz, .tar.bz2, .tar.xz or .7z"; return false; }
-    if (!arch_can_pack(k)) { *err = std::string(arch_kind_name(k)) + " cannot be written (read-only format)"; return false; }
+    return arch_pack_opts(archive, cwd, rel_sources,
+                          arch_pack_opts_default(arch_kind_of(archive)),
+                          cb, user, err);
+}
+
+bool arch_pack_opts(const char* archive, const char* cwd,
+                    const std::vector<std::string>& rel_sources,
+                    const ArchPackOpts& opts,
+                    arch_progress_fn cb, void* user, std::string* err) {
+    std::string why;
+    if (!arch_pack_supported(opts, &why)) { *err = why; return false; }
+    if (arch_kind_of(archive) != opts.kind) {
+        *err = std::string("a ") + arch_kind_name(opts.kind) +
+               " archive must be named with " + arch_kind_suffix(opts.kind);
+        return false;
+    }
     if (rel_sources.empty()) { *err = "nothing to pack"; return false; }
+    const ArchKind k = opts.kind;
 
     // Rough totals so the bar has a denominator: stat the sources recursively.
     long long bytes = 0;
@@ -826,20 +922,43 @@ bool arch_pack(const char* archive, const char* cwd,
 
     std::string a(archive);
     std::vector<std::string> argv;
+    std::vector<std::string> env;
     switch (k) {
     case ARCH_ZIP: pr.mode = UNIT_MARKERED; pr.markers = { "adding:", "updating:", "freshening:" };
-                   argv = { "zip", "-r", a }; break;
+                   argv = { "zip", "-r", a };
+                   // zip's own interactive prompt (-e) needs a terminal, which a
+                   // GUI process does not have, so the password goes on the
+                   // command line. That makes it visible in the process list for
+                   // the length of the pack; the dialog says so.
+                   if (opts.level >= 0) argv.push_back("-" + std::to_string(opts.level));
+                   if (!opts.password.empty()) { argv.push_back("-P"); argv.push_back(opts.password); }
+                   break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
-    case ARCH_TAR_XZ: pr.mode = UNIT_ANY; argv = { "tar", "-cvf", a }; break;
-    case ARCH_7Z: pr.mode = UNIT_PERCENT; argv = { "7z", "a", a }; break;
+    case ARCH_TAR_XZ: {
+        pr.mode = UNIT_ANY;
+        argv = { "tar", "-cvf", a };
+        // tar hands the stream to gzip/bzip2/xz; those read their level from the
+        // environment, which keeps it out of the argument vector.
+        if (opts.level >= 0) {
+            const char* var = k == ARCH_TAR_GZ ? "GZIP" : k == ARCH_TAR_BZ2 ? "BZIP2" : "XZ_OPT";
+            env.push_back(std::string(var) + "=-" + std::to_string(opts.level));
+        }
+        break;
+    }
+    case ARCH_7Z:  pr.mode = UNIT_PERCENT;
+                   argv = { "7z", "a", a };
+                   if (opts.level >= 0) argv.push_back("-mx" + std::to_string(opts.level));
+                   if (!opts.password.empty()) argv.push_back("-p" + opts.password);
+                   if (opts.volume_bytes > 0) argv.push_back("-v" + std::to_string(opts.volume_bytes));
+                   break;
     default: return false;
     }
     argv.insert(argv.end(), rel_sources.begin(), rel_sources.end());
 
     std::string out;
-    int st = run_stream(argv, cwd, &pr, &out, err);
+    int st = run_stream(argv, cwd, env, &pr, &out, err);
     if (pr.aborted) return false;
     if (st == 127) { *err = "the archive tool is not installed"; return false; }
     if (st != 0) {
@@ -881,7 +1000,7 @@ bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string
     }
 
     std::string out;
-    int st = run_stream(argv, nullptr, &pr, &out, err);
+    int st = run_stream(argv, nullptr, kNoEnv, &pr, &out, err);
     if (pr.aborted) return false;
     if (st != 0) {
         std::string why = last_meaningful_line(out);
