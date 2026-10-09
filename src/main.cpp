@@ -112,13 +112,11 @@ int main(int, char**)
                     continue;
                 }
 
-                // Rename / mkdir prompt active: Enter commits, Esc cancels,
-                // everything else (typing) goes to ImGui.
-                if (panes->op_input_active) {
-                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER)
-                        app_panes_commit_op(panes);
-                    else if (k == SDLK_ESCAPE)
-                        app_panes_cancel_op(panes);
+                // An operation dialog is up (F5/F6/F7/F2/Shift+F4): Enter runs it,
+                // Esc cancels, everything else (typing, caret keys) goes to ImGui.
+                if (panes->op != OP_NONE) {
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE)
+                        app_panes_handle_key(panes, k, m);
                     else
                         ImGui_ImplSDL3_ProcessEvent(&event);
                     continue;

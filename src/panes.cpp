@@ -71,7 +71,8 @@ AppPanes::AppPanes() {
     active_path_pane = -1;
     op = OP_NONE;
     op_name[0] = '\0';
-    op_input_active = false;
+    op_error[0] = '\0';
+    op_focus_request = false;
     status_msg[0] = '\0';
     cmd[0] = '\0';
     cmd_hist_count = 0;
@@ -935,7 +936,7 @@ static int count_existing_targets(AppPanes* app, Pane& pane, const char* dst_dir
 
 // Progress helpers are defined below with the copy/move operations.
 static bool copy_progress_cb(long long done, long long total, int fd, int ft, void* user);
-static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move);
+static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_move);
 // Defined with the keyboard handlers; the deferred-action table and the Commands
 // menu both need them earlier.
 static void do_copy_in_place(AppPanes* app);
@@ -949,7 +950,7 @@ static void fill_dir_sizes(AppPanes* app);
 static void do_delete(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     bool to_trash = app->delete_trash != 0;
-    prog_begin(app, active, active, false);
+    prog_begin(app, active.current_dir, active.current_dir, false);
     app->prog_is_delete = true;
     int ok = 0;
     int marks = marked_count(active);
@@ -1095,12 +1096,12 @@ static bool copy_progress_cb(long long done, long long total, int fd, int ft, vo
     return !app->quit_request;                 // closing the window aborts
 }
 
-static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move) {
+static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_move) {
     app->prog_active = true;
     app->prog_is_move = is_move;
     app->prog_is_delete = false;
-    snprintf(app->prog_src, sizeof(app->prog_src), "%s", active.current_dir);
-    snprintf(app->prog_dst, sizeof(app->prog_dst), "%s", other.current_dir);
+    snprintf(app->prog_src, sizeof(app->prog_src), "%s", src);
+    snprintf(app->prog_dst, sizeof(app->prog_dst), "%s", dst);
     app->prog_done = 0;
     app->prog_total = 0;
     app->prog_files_done = 0;
@@ -1474,6 +1475,122 @@ static void render_pack_dialog(AppPanes* app) {
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// The operation dialog: F5 copy, F6 move, F7 folder, Shift+F4 file, F2 rename
+// ---------------------------------------------------------------------------
+
+static const char* op_title(AppOp op) {
+    switch (op) {
+    case OP_COPY:    return "Copy";
+    case OP_MOVE:    return "Move";
+    case OP_RENAME:  return "Rename";
+    case OP_NEWFILE: return "New file";
+    case OP_MKDIR:   return "Create directory";
+    default:         return "Operation";
+    }
+}
+
+// The verb on the button is the operation, so the dialog reads as a sentence:
+// the field above it is what gets copied, moved, renamed or created.
+static const char* op_button_label(AppOp op) {
+    switch (op) {
+    case OP_COPY:    return "Copy";
+    case OP_MOVE:    return "Move";
+    case OP_RENAME:  return "Rename";
+    case OP_NEWFILE: return "Create";
+    case OP_MKDIR:   return "Create";
+    default:         return "OK";
+    }
+}
+
+// One dialog for all five operations, because they are the same shape: a source
+// that is already decided, one name or destination to type, and a target
+// directory that has to be visible while typing it. Copy and move add the
+// destination as an editable path, which is what makes renaming or redirecting a
+// copy possible instead of an all-or-nothing drop into the other pane.
+static void render_op_dialog(AppPanes* app) {
+    if (app->op == OP_NONE) return;
+    ImGuiIO& io = ImGui::GetIO();
+    const bool copy_move = app->op == OP_COPY || app->op == OP_MOVE;
+    ImGui::SetNextWindowSize(ImVec2(620, copy_move ? 260 : 170), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 310, io.DisplaySize.y * 0.5f - 120),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin(op_title(app->op), &open, ImGuiWindowFlags_NoCollapse);
+
+    const OpPlan& plan = app->op_plan;
+    if (copy_move) {
+        // What is being operated on, in full. A mark set that the user cannot
+        // see would make the destination field a guess about unknown sources.
+        ImGui::TextDisabled("From:");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(elide_middle((plan.archive.empty() ? plan.src_dir : plan.archive).c_str(),
+                                           ImGui::GetContentRegionAvail().x).c_str());
+        std::string items;
+        for (size_t i = 0; i < plan.names.size(); i++) {
+            if (i >= 4) { items += "  (+" + std::to_string(plan.names.size() - i) + " more)"; break; }
+            if (!items.empty()) items += ",  ";
+            items += plan.names[i];
+        }
+        ImGui::TextDisabled("%d item%s:", (int)plan.names.size(), plan.names.size() == 1 ? "" : "s");
+        ImGui::SameLine();
+        text_wrap_disabled("%s", items.c_str());
+        ImGui::Spacing();
+
+        pack_fill("To:");
+        if (app->op_focus_request) {
+            ImGui::SetKeyboardFocusHere();
+            app->op_focus_request = false;
+        }
+        ImGui::InputText("To:", app->op_name, sizeof(app->op_name));
+        if (plan.archive.empty())
+            text_wrap_disabled("End with / (or name a folder that exists) and every item keeps its "
+                               "own name. With one item, the field is the target itself, so it can "
+                               "also be a new name.");
+        else
+            text_wrap_disabled("The members come out under this folder with the paths they have "
+                               "inside the archive. End with / to make the folder if it is missing.");
+    } else {
+        const std::string& in_dir = app->op_plan.src_dir.empty()
+                                       ? (app->left_focus ? app->left : app->right).current_dir
+                                       : app->op_plan.src_dir;
+        if (app->op == OP_RENAME) {
+            ImGui::TextDisabled("Renaming:");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(app->op_plan.names.empty() ? "(nothing selected)"
+                                                              : app->op_plan.names[0].c_str());
+        }
+        ImGui::TextDisabled("In:");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(elide_middle(in_dir.c_str(), ImGui::GetContentRegionAvail().x).c_str());
+        ImGui::Spacing();
+        const char* field = app->op == OP_RENAME ? "New name:"
+                          : app->op == OP_NEWFILE ? "File name:" : "Directory name:";
+        pack_fill(field);
+        if (app->op_focus_request) {
+            ImGui::SetKeyboardFocusHere();
+            app->op_focus_request = false;
+        }
+        ImGui::InputText(field, app->op_name, sizeof(app->op_name));
+    }
+
+    if (app->op_error[0]) {
+        ImGui::Spacing();
+        text_wrap_colored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", app->op_error);
+    }
+
+    ImGui::Spacing();
+    // The button only records the request: copy and move block and pump their own
+    // ImGui frames, which cannot happen while this dialog's frame is open.
+    if (ImGui::Button(op_button_label(app->op))) app->pending_op = DEFER_OP_COMMIT;
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) app_panes_cancel_op(app);
+    ImGui::SameLine();
+    text_wrap_disabled("Enter runs it, Esc cancels.");
+    if (!open) app_panes_cancel_op(app);
+    ImGui::End();
+}
+
 // TC Alt+F6 (into the other pane's directory) and Alt+F9 (into this one's).
 // Inside an archive, "this one's" means the directory holding the archive.
 static void do_extract(AppPanes* app, bool to_other_pane) {
@@ -1551,164 +1668,198 @@ static void do_paste_archive_now(AppPanes* app) {
 // internal path is kept, so copying out of a folder inside the archive recreates
 // that folder in the destination — the same rule Alt+F6 extraction follows, and
 // what keeps members from different levels of one archive colliding.
-static void do_copy_out_archive_now(AppPanes* app) {
+// ---------------------------------------------------------------------------
+// The operation plan: what F5/F6 asked for, decided once and then run
+// ---------------------------------------------------------------------------
+
+// Fill a plan from the active pane's targets: everything marked, or the row
+// under the cursor when nothing is marked. Inside an archive the targets are
+// members, so the plan carries the archive and the names the tool wants too,
+// which are not always the names the pane shows.
+static bool plan_from_pane(AppPanes* app, OpPlan& plan, bool is_move) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
-    if (in_archive(other)) {
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "The target pane is inside an archive");
-        return;
-    }
-    std::vector<std::string> raws;
-    for (const std::string& rel : target_rel(active))
-        raws.push_back(member_raw(active, rel.c_str()));
-    if (raws.empty()) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
-        return;
-    }
-    arch_prog_begin(app, active.archive_path, other.current_dir);
-    std::string err;
-    bool ok = arch_extract_members(active.archive_path, other.current_dir, raws,
-                                   copy_progress_cb, app, &err);
-    app->prog_active = false;
-    if (ok) {
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "Copied %d member%s into %s%s", (int)raws.size(),
-                 raws.size() == 1 ? "" : "s", other.current_dir,
-                 active.archive_prefix[0] ? " (archive paths preserved)" : "");
+    plan = OpPlan();
+    plan.is_move = is_move;
+
+    if (in_archive(active)) {
+        // Only copy-out exists here: a move would have to delete the member
+        // afterwards, and no format we can write lets us do that.
+        if (is_move) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Cannot move archive members: an archive cannot be written into (F5 copies them out)");
+            return false;
+        }
+        if (in_archive(other)) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "The target pane is inside an archive");
+            return false;
+        }
+        plan.archive = active.archive_path;
+        plan.archive_prefix = active.archive_prefix;
+        plan.src_dir = active.archive_path;
+        plan.dst_dir = other.current_dir;
+        plan.names = target_rel(active);
+        for (const std::string& rel : plan.names)
+            plan.raw_names.push_back(member_raw(active, rel.c_str()));
     } else {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Copy failed: %s", err.c_str());
+        if (archive_readonly(app, other)) return false;
+        plan.src_dir = active.current_dir;
+        plan.dst_dir = other.current_dir;
+        plan.names = target_rel(active);
     }
-    refresh_pane(&other, other.current_dir);
+    if (plan.names.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to %s", is_move ? "move" : "copy");
+        return false;
+    }
+    return true;
 }
 
-static void do_copy_out_archive(AppPanes* app) {
-    Pane& active = app->left_focus ? app->left : app->right;
-    Pane& other = app->left_focus ? app->right : app->left;
-    if (in_archive(other)) {
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "The target pane is inside an archive");
-        return;
-    }
-    StringList rows = target_rel(active);
-    if (rows.empty()) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
-        return;
-    }
-    int existing = 0;
-    for (const std::string& rel : rows) {
-        std::string full = active.archive_prefix[0]
-                               ? std::string(active.archive_prefix) + "/" + rel : rel;
-        char dst[4100];
-        snprintf(dst, sizeof(dst), "%s/%s", other.current_dir, full.c_str());
-        if (fs_exists(dst)) existing++;
-    }
-    if (existing > 0) {
-        app->confirm = CONF_OVERWRITE_EXTRACT;
-        snprintf(app->confirm_text, sizeof(app->confirm_text),
-                 "%d target%s already exist in %s. Overwrite?", existing, existing == 1 ? "" : "s", other.current_dir);
-        return;
-    }
-    do_copy_out_archive_now(app);
+// Where a target lands: the destination directory plus the name it keeps, or
+// the one the dialog typed. Archive members keep their path inside the archive,
+// which is what the extraction tools write and what the user sees in the pane.
+static std::string plan_target(const OpPlan& plan, size_t i) {
+    std::string rel = plan.names[i];
+    if (!plan.archive.empty() && !plan.archive_prefix.empty())
+        rel = plan.archive_prefix + "/" + rel;
+    if (!plan.name_override.empty()) rel = plan.name_override;
+    return plan.dst_dir + "/" + rel;
 }
 
-static int run_on_targets_prog(AppPanes* app, Pane& pane, bool is_move,
-                               const char* dst_dir, fs_progress_fn cb, void* user) {
+static int plan_existing(const OpPlan& plan) {
+    int n = 0;
+    for (size_t i = 0; i < plan.names.size(); i++)
+        if (fs_exists(plan_target(plan, i).c_str())) n++;
+    return n;
+}
+
+// Run one copy or move over the plan's names. The names, not the pane's marks,
+// decide what gets touched: the dialog showed a list, and a click while the
+// overwrite confirm is up must not change what the operation acts on.
+static int run_names_prog(AppPanes* app, const OpPlan& plan, fs_progress_fn cb, void* user) {
     int ok = 0;
-    int marks = marked_count(pane);
-    for (int i = 0; i < pane.entry_count; i++) {
-        if (marks == 0 && i != pane.selected) continue;
-        if (marks > 0 && !pane.marked[i]) continue;
-        FileEntry* e = pane.entries[i];
-        if (strcmp(e->name, "..") == 0) continue;
-        char src[4100];
-        snprintf(src, sizeof(src), "%s/%s", pane.current_dir, entry_rel(pane, i));
-        char dst[4100];
-        snprintf(dst, sizeof(dst), "%s/%s", dst_dir, e->name);
-        bool r = is_move ? fs_move_entry_progress(src, dst, cb, user)
-                         : fs_copy_entry_progress(src, dst, cb, user);
+    for (size_t i = 0; i < plan.names.size(); i++) {
+        std::string src = plan.src_dir + "/" + plan.names[i];
+        std::string dst = plan_target(plan, i);
+        bool r = plan.is_move ? fs_move_entry_progress(src.c_str(), dst.c_str(), cb, user)
+                              : fs_copy_entry_progress(src.c_str(), dst.c_str(), cb, user);
         if (r) ok++;
         if (app->quit_request) break;
     }
     return ok;
 }
 
-static void do_copy_now(AppPanes* app) {
-    Pane& active = app->left_focus ? app->left : app->right;
-    Pane& other = app->left_focus ? app->right : app->left;
-    prog_begin(app, active, other, false);
-    int ok = run_on_targets_prog(app, active, false, other.current_dir, copy_progress_cb, app);
-    app->prog_active = false;
-    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d entries to %s", ok, other.current_dir);
-    else    snprintf(app->status_msg, sizeof(app->status_msg), "Copy failed: %s", strerror(errno));
-    refresh_pane(&other, other.current_dir);
+// Show the result wherever it was typed to land: whichever pane is looking at
+// the destination, or at a directory that holds it, gets refreshed.
+static void refresh_for_destination(AppPanes* app, const std::string& dst) {
+    Pane* panes[2] = { &app->left, &app->right };
+    for (Pane* p : panes) {
+        if (in_archive(*p)) continue;
+        std::string cur = p->current_dir;
+        if (dst == cur ||
+            (dst.size() > cur.size() && dst.compare(0, cur.size(), cur) == 0 && dst[cur.size()] == '/'))
+            refresh_pane(p, p->current_dir);
+    }
 }
 
-static void do_move_now(AppPanes* app) {
+// The one runner for copy, move and copying out of an archive. The dialog, the
+// overwrite confirm and the progress dialog all describe this same plan, so
+// they cannot end up talking about different operations.
+static void run_op_plan(AppPanes* app) {
+    OpPlan plan = app->op_plan;
+    app->op_plan = OpPlan();
     Pane& active = app->left_focus ? app->left : app->right;
-    Pane& other = app->left_focus ? app->right : app->left;
 
-    // Remember the slot being vacated so the cursor can land on the entry
-    // that moves up into it (or the one above if the list got shorter).
+    // Remember the slot being vacated so the cursor can land on the entry that
+    // moves up into it (or the one above if the list got shorter).
     int slot = active.selected;
-    if (marked_count(active) > 0) {
+    if (plan.is_move && marked_count(active) > 0)
         for (int i = 0; i < active.entry_count; i++)
             if (active.marked[i]) { slot = i; break; }
+
+    if (!plan.archive.empty()) {
+        arch_prog_begin(app, plan.archive.c_str(), plan.dst_dir.c_str());
+        std::string err;
+        bool ok = arch_extract_members(plan.archive.c_str(), plan.dst_dir.c_str(), plan.raw_names,
+                                       copy_progress_cb, app, &err);
+        app->prog_active = false;
+        if (ok)
+            snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d member%s into %s%s",
+                     (int)plan.names.size(), plan.names.size() == 1 ? "" : "s", plan.dst_dir.c_str(),
+                     plan.archive_prefix.empty() ? "" : " (archive paths preserved)");
+        else
+            snprintf(app->status_msg, sizeof(app->status_msg), "Copy failed: %s", err.c_str());
+        refresh_for_destination(app, plan.dst_dir);
+        return;
     }
 
-    prog_begin(app, active, other, true);
-    int ok = run_on_targets_prog(app, active, true, other.current_dir, copy_progress_cb, app);
+    prog_begin(app, plan.src_dir.c_str(), plan.dst_dir.c_str(), plan.is_move);
+    int ok = run_names_prog(app, plan, copy_progress_cb, app);
     app->prog_active = false;
-    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Moved %d entries to %s", ok, other.current_dir);
-    else    snprintf(app->status_msg, sizeof(app->status_msg), "Move failed: %s", strerror(errno));
-    refresh_pane(&active, active.current_dir);
-    refresh_pane(&other, other.current_dir);
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             ok ? (plan.is_move ? "Moved %d item%s to %s" : "Copied %d item%s to %s")
+                : (plan.is_move ? "Move failed: %s" : "Copy failed: %s"),
+             ok ? ok : 0, ok == 1 ? "" : "s", ok ? plan.dst_dir.c_str() : strerror(errno));
 
-    if (ok && active.entry_count > 0) {
-        if (slot > active.entry_count - 1) slot = active.entry_count - 1;
-        if (slot < 0) slot = 0;
-        active.selected = slot;
-        active.anchor = slot;
-        active.scroll_request = true;
+    // Afterwards, not before: a pane that is looking at the destination has to
+    // show what landed there, and the pane the entries left has to lose them.
+    refresh_for_destination(app, plan.dst_dir);
+    if (plan.is_move) {
+        refresh_pane(&active, active.current_dir);
+        if (ok && active.entry_count > 0) {
+            if (slot > active.entry_count - 1) slot = active.entry_count - 1;
+            if (slot < 0) slot = 0;
+            active.selected = slot;
+            active.anchor = slot;
+            active.scroll_request = true;
+        }
     }
+}
+
+// F5 and F6 open a dialog instead of acting: it names the sources, shows where
+// they are going, and lets the destination - or a new name for a single entry -
+// be edited before anything is written.
+static void open_op_dialog(AppPanes* app, const OpPlan& plan) {
+    app->op_plan = plan;
+    app->op = plan.is_move ? OP_MOVE : OP_COPY;
+    app->op_error[0] = '\0';
+    app->op_focus_request = true;
+    // One entry: the field holds the whole target, so changing just the name is
+    // one edit. Several, or members coming out of an archive: it holds the
+    // directory, which keeps every entry's own name.
+    if (plan.names.size() == 1 && plan.archive.empty())
+        snprintf(app->op_name, sizeof(app->op_name), "%s/%s", plan.dst_dir.c_str(), plan.names[0].c_str());
+    else
+        snprintf(app->op_name, sizeof(app->op_name), "%s", plan.dst_dir.c_str());
+}
+
+// Open the dialog for a name-taking operation (F7 folder, Shift+F4 file, F2
+// rename). The field is prefilled so the common case is Enter rather than
+// typing: rename starts from the current name, mkdir and new file start empty.
+static void open_name_dialog(AppPanes* app, AppOp op, const char* prefill) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    app->op = op;
+    snprintf(app->op_name, sizeof(app->op_name), "%s", prefill ? prefill : "");
+    // The folder the name lands in, and for a rename the entry being renamed, are
+    // fixed here rather than read back at commit time: clicking the other pane
+    // while the dialog is up must not move the operation underneath it.
+    app->op_plan = OpPlan();
+    app->op_plan.src_dir = active.current_dir;
+    if (op == OP_RENAME && active.selected >= 0 && active.selected < active.entry_count)
+        app->op_plan.names.push_back(active.entries[active.selected]->name);
+    app->op_error[0] = '\0';
+    app->op_focus_request = true;
 }
 
 static void do_copy(AppPanes* app) {
-    Pane& active = app->left_focus ? app->left : app->right;
-    Pane& other = app->left_focus ? app->right : app->left;
-    // Inside an archive F5 copies members *out* into the other pane. The other
-    // direction stays refused: an archive cannot be written into.
-    if (in_archive(active)) { do_copy_out_archive(app); return; }
-    if (archive_readonly(app, other)) return;
-    int existing = count_existing_targets(app, active, other.current_dir);
-    if (existing > 0) {
-        app->confirm = CONF_OVERWRITE;
-        snprintf(app->confirm_text, sizeof(app->confirm_text),
-                 "%d target%s already exist in %s. Overwrite?", existing, existing == 1 ? "" : "s", other.current_dir);
-        return;
-    }
-    do_copy_now(app);
+    OpPlan plan;
+    if (!plan_from_pane(app, plan, false)) return;
+    open_op_dialog(app, plan);
 }
 
 static void do_move(AppPanes* app) {
-    Pane& active = app->left_focus ? app->left : app->right;
-    Pane& other = app->left_focus ? app->right : app->left;
-    // A move would have to delete the member afterwards, which no archive format
-    // we can write lets us do. F5 copies it out instead.
-    if (in_archive(active)) {
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "Cannot move archive members: an archive cannot be written into (F5 copies them out)");
-        return;
-    }
-    if (archive_readonly(app, other)) return;
-    int existing = count_existing_targets(app, active, other.current_dir);
-    if (existing > 0) {
-        app->confirm = CONF_OVERWRITE_MOVE;
-        snprintf(app->confirm_text, sizeof(app->confirm_text),
-                 "%d target%s already exist in %s. Overwrite?", existing, existing == 1 ? "" : "s", other.current_dir);
-        return;
-    }
-    do_move_now(app);
+    OpPlan plan;
+    if (!plan_from_pane(app, plan, true)) return;
+    open_op_dialog(app, plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,7 +1967,7 @@ static void do_paste_now(AppPanes* app) {
     Pane& other  = app->left_focus ? app->right : app->left;
     if (app->clipboard.paths.empty()) return;
 
-    prog_begin(app, active, active, app->clipboard.cut);
+    prog_begin(app, active.current_dir, active.current_dir, app->clipboard.cut);
     path_parent_dir(app->clipboard.paths[0], app->prog_src, sizeof(app->prog_src));
     snprintf(app->prog_dst, sizeof(app->prog_dst), "%s", active.current_dir);
 
@@ -1870,10 +2021,10 @@ static void do_paste(AppPanes* app) {
 static void confirm_yes(AppPanes* app) {
     switch (app->confirm) {
     case CONF_DELETE:         do_delete(app); break;
-    case CONF_OVERWRITE:      do_copy_now(app); break;
-    case CONF_OVERWRITE_MOVE: do_move_now(app); break;
+    case CONF_OVERWRITE:
+    case CONF_OVERWRITE_MOVE:
+    case CONF_OVERWRITE_EXTRACT: run_op_plan(app); break;
     case CONF_OVERWRITE_PASTE: do_paste_now(app); break;
-    case CONF_OVERWRITE_EXTRACT: do_copy_out_archive_now(app); break;
     default: break;
     }
     app->confirm = CONF_NONE;
@@ -1892,8 +2043,10 @@ void app_panes_run_pending(AppPanes* app) {
     int op = app->pending_op;
     app->pending_op = DEFER_NONE;
     switch (op) {
-    case DEFER_COPY:          do_copy(app); break;
-    case DEFER_MOVE:          do_move(app); break;
+    case DEFER_COPY:          do_copy(app); break;   // opens the dialog
+    case DEFER_MOVE:          do_move(app); break;   // opens the dialog
+    case DEFER_OP_COMMIT:     app_panes_commit_op(app); break;
+    case DEFER_OP_RUN:        run_op_plan(app); break;
     case DEFER_PASTE:         do_paste(app); break;
     case DEFER_EXTRACT:       do_extract(app, true); break;
     case DEFER_PACK:          pack_commit(app); break;
@@ -2374,10 +2527,7 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     }
     if (ImGui::MenuItem("Open")) activate_entry(app, pane, pane.selected);
     if (ImGui::MenuItem("View")) view_entry(app, pane, pane.selected);
-    if (ImGui::MenuItem("Rename")) {
-        app->op = OP_RENAME;
-        snprintf(app->op_name, sizeof(app->op_name), "%s", e->name);
-    }
+    if (ImGui::MenuItem("Rename")) open_name_dialog(app, OP_RENAME, e->name);
     bool marked = pane.selected < (int)pane.marked.size() && pane.marked[pane.selected];
     if (ImGui::MenuItem(marked ? "Unmark" : "Mark")) toggle_mark(pane, pane.selected);
     ImGui::Separator();
@@ -3305,7 +3455,7 @@ static void render_commands_items(AppPanes* app) {
     // Anything below that blocks runs between frames, not here.
     if (ImGui::MenuItem("Extract archive", "Alt+F6")) app->pending_op = DEFER_EXTRACT;
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
-    if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
+    if (ImGui::MenuItem("New file", "Shift+F4")) open_name_dialog(app, OP_NEWFILE, nullptr);
     if (ImGui::MenuItem("Copy in place", "Shift+F5")) app->pending_op = DEFER_COPY_IN_PLACE;
     if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) app->pending_op = DEFER_SYMLINK_OTHER;
     if (ImGui::MenuItem("Count marked", "Ctrl+L")) count_marked_sizes(app);
@@ -3506,25 +3656,12 @@ void app_panes_render(AppPanes* app) {
 
     ImGui::EndTable();
 
-    // Bottom bar: pinned to the window bottom so it can never overflow.
-    // Shows the operation prompt when active, otherwise the command line.
+    // Bottom bar: pinned to the window bottom so it can never overflow. The op
+    // prompt used to live here as a one-line field; the operations are real
+    // dialogs now, so the bar is the command line again.
     ImGui::SetCursorPosY(win_h - bar_h);
     ImGui::Separator();
-    if (app->op != OP_NONE) {
-        const char* label = app->op == OP_RENAME ? "Rename to:"
-                          : app->op == OP_NEWFILE ? "New file name:"
-                          : "New directory name:";
-        ImGui::TextUnformatted(label);
-        ImGui::SameLine();
-        ImGui::SetKeyboardFocusHere(-1);
-        ImGui::SetNextItemWidth(320);
-        ImGui::InputText("##opname", app->op_name, sizeof(app->op_name));
-        app->op_input_active = ImGui::IsItemActive();
-        if (app->status_msg[0]) {
-            ImGui::SameLine();
-            ImGui::TextUnformatted(app->status_msg);
-        }
-    } else {
+    {
         // Command line (MC-style: always focused). Status messages show as
         // dimmed text after the input while the command is empty.
         // With no status message the line reports marks and the clipboard,
@@ -3546,7 +3683,8 @@ void app_panes_render(AppPanes* app) {
         float status_w = shown[0] ? ImGui::CalcTextSize(shown).x + 24.0f : 0.0f;
         ImGui::TextUnformatted("$");
         ImGui::SameLine();
-        bool allow_cmd_focus = (app->confirm == CONF_NONE) && (app->active_path_pane < 0) && !app->search_input_active;
+        bool allow_cmd_focus = (app->confirm == CONF_NONE) && (app->active_path_pane < 0) &&
+                               !app->search_input_active && (app->op == OP_NONE);
         if (allow_cmd_focus)
             ImGui::SetKeyboardFocusHere(-1);
         ImGui::SetNextItemWidth(-status_w - 1.0f);
@@ -3572,6 +3710,7 @@ void app_panes_render(AppPanes* app) {
     render_volumes(app);
     render_columns_dialog(app);
     render_pack_dialog(app);
+    render_op_dialog(app);
     render_tree(app);
     render_search(app);
     render_confirm(app);
@@ -3685,51 +3824,195 @@ void app_panes_free(AppPanes* app) {
     delete app;
 }
 
+// Split a typed path into the directory part and the name part.
+static void split_path(const std::string& path, std::string* dir, std::string* base) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) { dir->clear(); *base = path; return; }
+    if (slash == 0) { *dir = "/"; *base = path.substr(1); return; }
+    *dir = path.substr(0, slash);
+    *base = path.substr(slash + 1);
+}
+
+// A destination typed with a trailing slash is a promise about a directory, so
+// creating it is what the user asked for. Without the slash the directory has to
+// be there already: a typo in a typed path must not quietly make a second one.
+static bool make_dest_dirs(const std::string& path) {
+    size_t i = 0;
+    while (i <= path.size()) {
+        size_t slash = path.find('/', i);
+        std::string head = (slash == std::string::npos) ? path : path.substr(0, slash);
+        struct stat st;
+        if (!head.empty() && (stat(head.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) &&
+            !fs_make_dir(head.c_str()))
+            return false;
+        if (slash == std::string::npos) break;
+        i = slash + 1;
+    }
+    return true;
+}
+
+// Read the dialog's field as a destination and turn it into the plan's
+// destination directory plus an optional name. The field means one of two
+// things and the difference has to be obvious: a directory (every entry keeps
+// its own name) or the target itself (one entry, renamed). Anything that does
+// not resolve gets a reason in the dialog instead of a status line the user has
+// already stopped reading.
+static bool resolve_destination(AppPanes* app) {
+    OpPlan& plan = app->op_plan;
+    char value[4096];
+    snprintf(value, sizeof(value), "%s", app->op_name);
+    size_t len = strlen(value);
+    while (len && value[len - 1] == ' ') value[--len] = '\0';   // trailing spaces are never meant
+    if (!len) {
+        snprintf(app->op_error, sizeof(app->op_error), "Enter a destination.");
+        return false;
+    }
+
+    // Coming out of an archive, the field can only be a directory: the members
+    // keep the paths they have inside the archive, and a folder row names a
+    // whole subtree, which has no single new name to be given.
+    struct stat st;
+    bool slash = value[len - 1] == '/';
+    if (!plan.archive.empty() || slash || (stat(value, &st) == 0 && S_ISDIR(st.st_mode))) {
+        plan.dst_dir = (slash && len > 1) ? std::string(value).substr(0, len - 1) : value;
+        plan.name_override.clear();
+        if (slash && stat(plan.dst_dir.c_str(), &st) != 0) {
+            if (!make_dest_dirs(plan.dst_dir)) {
+                snprintf(app->op_error, sizeof(app->op_error), "Cannot create %s: %s",
+                         plan.dst_dir.c_str(), strerror(errno));
+                return false;
+            }
+        }
+    } else if (plan.names.size() == 1) {
+        std::string dir, base;
+        split_path(value, &dir, &base);
+        if (base.empty()) {
+            snprintf(app->op_error, sizeof(app->op_error), "That destination has no name in it.");
+            return false;
+        }
+        if (dir.empty()) dir = ".";
+        plan.dst_dir = dir;
+        plan.name_override = base;
+    } else {
+        snprintf(app->op_error, sizeof(app->op_error),
+                 "%d entries are selected, so the destination has to be a directory.",
+                 (int)plan.names.size());
+        return false;
+    }
+
+    if (stat(plan.dst_dir.c_str(), &st) != 0) {
+        snprintf(app->op_error, sizeof(app->op_error), "There is no directory %s.", plan.dst_dir.c_str());
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        snprintf(app->op_error, sizeof(app->op_error), "%s is a file, not a directory.",
+                 plan.dst_dir.c_str());
+        return false;
+    }
+    char arch[4096], prefix[1024];
+    if (arch_split_virtual(plan.dst_dir.c_str(), arch, sizeof(arch), prefix, sizeof(prefix))) {
+        snprintf(app->op_error, sizeof(app->op_error), "An archive cannot be written into.");
+        return false;
+    }
+    // Copying a file onto itself loses it: the copy opens the target for writing
+    // before it reads the source. A move that names its own source does nothing.
+    // Comparing per entry rather than per directory also catches the case where
+    // the destination is spelled differently but means the same file.
+    if (plan.archive.empty()) {
+        for (size_t i = 0; i < plan.names.size(); i++) {
+            if (plan.src_dir + "/" + plan.names[i] != plan_target(plan, i)) continue;
+            snprintf(app->op_error, sizeof(app->op_error),
+                     "%s is already there. Type a different name, or a different folder.",
+                     plan.names[i].c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 void app_panes_commit_op(AppPanes* app) {
-    Pane& active = app->left_focus ? app->left : app->right;
-    // Rename, mkdir and new file all build a path under the pane's directory, so
-    // they cannot run on archive members.
-    if (archive_readonly(app, active)) {
+    if (app->op == OP_NONE) return;
+
+    if (app->op == OP_COPY || app->op == OP_MOVE) {
+        if (!resolve_destination(app)) return;      // the dialog stays up, with the reason
+        OpPlan& plan = app->op_plan;
+        int existing = plan_existing(plan);
+        if (existing > 0) {
+            app->confirm = plan.is_move ? CONF_OVERWRITE_MOVE
+                         : (!plan.archive.empty() ? CONF_OVERWRITE_EXTRACT : CONF_OVERWRITE);
+            snprintf(app->confirm_text, sizeof(app->confirm_text),
+                     "%d target%s in %s already exist%s. Overwrite?", existing,
+                     existing == 1 ? "" : "s", plan.dst_dir.c_str(), existing == 1 ? "s" : "");
+        }
         app->op = OP_NONE;
-        app->op_input_active = false;
+        app->op_name[0] = '\0';
+        if (!existing) app->pending_op = DEFER_OP_RUN;   // the confirm's Yes runs the same plan
+        return;
+    }
+
+    Pane& active = app->left_focus ? app->left : app->right;
+    // Rename, mkdir and new file build a path under the folder captured when the
+    // dialog opened, so they cannot run on archive members.
+    const std::string dir = app->op_plan.src_dir.empty() ? std::string(active.current_dir)
+                                                         : app->op_plan.src_dir;
+    char virt_archive[4096], virt_prefix[4096];
+    if (arch_split_virtual(dir.c_str(), virt_archive, sizeof(virt_archive),
+                           virt_prefix, sizeof(virt_prefix))) {
+        app_panes_cancel_op(app);
         return;
     }
     if (app->op == OP_MKDIR) {
         char path[4100];
-        snprintf(path, sizeof(path), "%s/%s", active.current_dir, app->op_name);
+        snprintf(path, sizeof(path), "%s/%s", dir.c_str(), app->op_name);
         if (fs_make_dir(path)) {
             snprintf(app->status_msg, sizeof(app->status_msg), "Created %s", path);
             refresh_pane(&active, active.current_dir);
         } else {
-            snprintf(app->status_msg, sizeof(app->status_msg), "mkdir failed: %s", strerror(errno));
+            snprintf(app->op_error, sizeof(app->op_error), "Cannot create that folder: %s",
+                     strerror(errno));
+            return;   // the name is still wrong or taken; let the user fix it in place
         }
     } else if (app->op == OP_NEWFILE) {
         char path[4100];
-        snprintf(path, sizeof(path), "%s/%s", active.current_dir, app->op_name);
-        if (fs_touch(path)) {
-            snprintf(app->status_msg, sizeof(app->status_msg), "Created %s", path);
-            refresh_pane(&active, active.current_dir);
-            spawn_terminal_editor(app, path);
-        } else {
-            snprintf(app->status_msg, sizeof(app->status_msg), "Cannot create %s: %s",
-                     path, strerror(errno));
+        snprintf(path, sizeof(path), "%s/%s", dir.c_str(), app->op_name);
+        if (!fs_touch(path)) {
+            snprintf(app->op_error, sizeof(app->op_error), "Cannot create %s: %s", path, strerror(errno));
+            return;
         }
+        snprintf(app->status_msg, sizeof(app->status_msg), "Created %s", path);
+        refresh_pane(&active, active.current_dir);
+        app_panes_cancel_op(app);
+        spawn_terminal_editor(app, path);
+        return;
     } else if (app->op == OP_RENAME) {
-        char dst_dir[4096];
-        snprintf(dst_dir, sizeof(dst_dir), "%s", active.current_dir);
-        int ok = run_on_targets(app, active, fs_move_entry, dst_dir, app->op_name);
-        snprintf(app->status_msg, sizeof(app->status_msg), ok ? "Renamed to %s" : "Rename failed: %s",
-                 ok ? app->op_name : strerror(errno));
+        // The entry named on the dialog's "Renaming:" line, and nothing else:
+        // several entries cannot take one name.
+        if (app->op_plan.names.empty()) {
+            app_panes_cancel_op(app);
+            return;
+        }
+        char src[4100], dst[4100];
+        snprintf(src, sizeof(src), "%s/%s", dir.c_str(), app->op_plan.names[0].c_str());
+        snprintf(dst, sizeof(dst), "%s/%s", dir.c_str(), app->op_name);
+        if (!fs_move_entry(src, dst)) {
+            snprintf(app->op_error, sizeof(app->op_error), "Cannot rename to %s: %s",
+                     app->op_name, strerror(errno));
+            return;
+        }
+        snprintf(app->status_msg, sizeof(app->status_msg), "Renamed to %s", app->op_name);
         refresh_pane(&active, active.current_dir);
     }
-    app->op = OP_NONE;
-    app->op_input_active = false;
+    app_panes_cancel_op(app);
 }
 
+// Drop the operation and everything it captured. Nothing has been written at
+// this point: the dialog is the only place copy, move and the name operations
+// are agreed to.
 void app_panes_cancel_op(AppPanes* app) {
     app->op = OP_NONE;
     app->op_name[0] = '\0';
-    app->op_input_active = false;
+    app->op_error[0] = '\0';
+    app->op_plan = OpPlan();
 }
 
 // TC Shift+F5: copy the targets alongside themselves in the same directory.
@@ -3877,6 +4160,17 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     auto filter_focused = [app]() {
         return app->left.filter_field_active || app->right.filter_field_active;
     };
+    // While the op dialog is up its field owns the text keys: arrows, Home, End
+    // and Delete move the caret inside a long typed path instead of walking the
+    // file list.
+    if (app && app->op != OP_NONE) {
+        switch (key) {
+        case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
+            return false;
+        default: break;
+        }
+    }
     switch (key) {
     case SDLK_UP: case SDLK_DOWN:
     case SDLK_PAGEUP: case SDLK_PAGEDOWN:
@@ -3922,6 +4216,18 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             app->confirm = CONF_NONE;
             app->confirm_text[0] = '\0';
         }
+        return;
+    }
+
+    // ---- the operation dialog (F5, F6, F7, Shift+F4, F2) ----
+    // Enter runs what the dialog describes and Esc drops it; every other key is
+    // either text for the field or nothing. Text keys never reach here -
+    // app_key_is_special lets the editing keys through so the caret, selection
+    // and clipboard in the field keep working - so a stray 'd' cannot delete a
+    // file while a destination is being typed.
+    if (app->op != OP_NONE) {
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) app_panes_commit_op(app);
+        else if (key == SDLK_ESCAPE) app_panes_cancel_op(app);
         return;
     }
 
@@ -4056,8 +4362,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (is_archive_key(key, mod)) {
-        // TC's archive keys. Alt+F5 asks for the archive name through the
-        // operation bar; the rest run straight away with the progress dialog.
+        // TC's archive keys. Alt+F5 asks for the archive name in the pack
+        // dialog; the rest run straight away with the progress dialog.
         if (key == SDLK_F5) do_pack(app, shift);
         else if (key == SDLK_F6) do_extract(app, true);
         else if (shift) do_archive_test(app);
@@ -4342,22 +4648,21 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_F2 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) {
         if (branch_blocked(app, active)) return;
         if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
-            app->op = OP_RENAME;
-            snprintf(app->op_name, sizeof(app->op_name), "%s", active.entries[active.selected]->name);
+            open_name_dialog(app, OP_RENAME, active.entries[active.selected]->name);
         }
         return;
     }
+    // TC F7: a dialog, not a prompt in the bar, so the folder name is typed into
+    // a field that already has the keyboard and Enter is the whole operation.
     if (key == SDLK_F7) {
         if (branch_blocked(app, active)) return;
-        app->op = OP_MKDIR;
-        app->op_name[0] = '\0';
+        open_name_dialog(app, OP_MKDIR, nullptr);
         return;
     }
     // TC Shift+F4: create an empty file and open it in the editor.
     if (key == SDLK_F4 && shift) {
         if (branch_blocked(app, active)) return;
-        app->op = OP_NEWFILE;
-        app->op_name[0] = '\0';
+        open_name_dialog(app, OP_NEWFILE, nullptr);
         return;
     }
     if (key == SDLK_F4) {
@@ -4396,8 +4701,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_F6 && shift) {
         if (branch_blocked(app, active)) return;
         if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
-            app->op = OP_RENAME;
-            snprintf(app->op_name, sizeof(app->op_name), "%s", active.entries[active.selected]->name);
+            open_name_dialog(app, OP_RENAME, active.entries[active.selected]->name);
         }
         return;
     }

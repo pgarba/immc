@@ -37,6 +37,14 @@ static int idx_of(const Pane& p, const char* name) {
     return -1;
 }
 
+// F5 and F6 stop at the operation dialog instead of acting, so a test that wants
+// the operation to happen has to accept the destination and then pump the
+// deferred table, which is what the main loop does between frames.
+static void accept_op(AppPanes* app) {
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    app_panes_run_pending(app);
+}
+
 // Walk the list with nav_step the way the arrow keys do.
 static std::vector<int> walk(const Pane& p, int from, int dir) {
     std::vector<int> out;
@@ -711,6 +719,9 @@ static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
     p.selected = idx_of(p, "one.txt");
     CHECK(p.selected >= 0);
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(app->op == OP_COPY);          // F5 asks first, it does not act
+    accept_op(app);
+    CHECK(app->op == OP_NONE);
     CHECK(fs_exists((out + "/one.txt").c_str()));
     CHECK(!fs_exists((out + "/two.txt").c_str()));
     CHECK(strstr(app->status_msg, "Copied 1 member") != NULL);
@@ -720,6 +731,7 @@ static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
     p.marked[idx_of(p, "two.txt")] = true;
     p.marked[idx_of(p, "sub")] = true;
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    accept_op(app);
     CHECK(fs_exists((out + "/two.txt").c_str()));
     CHECK(fs_exists((out + "/sub/inner.txt").c_str()));
     CHECK(!fs_exists((out + "/inner.txt").c_str()));
@@ -739,6 +751,10 @@ static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
     p.selected = idx_of(p, "inner.txt");
     CHECK(p.selected >= 0);
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    // Out of an archive the field is the folder the members land in, never a new
+    // name: a member keeps the path it has inside the archive.
+    CHECK(strcmp(app->op_name, deep.c_str()) == 0);
+    accept_op(app);
     CHECK(fs_exists((deep + "/sub/inner.txt").c_str()));
     CHECK(!fs_exists((deep + "/inner.txt").c_str()));
     CHECK(strstr(app->status_msg, "preserved") != NULL);
@@ -751,7 +767,8 @@ static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
     struct stat st0;
     CHECK(stat((out + "/sub/inner.txt").c_str(), &st0) == 0 && st0.st_size == sentinel);
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
-    CHECK(app->confirm == CONF_OVERWRITE_EXTRACT);
+    accept_op(app);                     // Enter accepts the destination...
+    CHECK(app->confirm == CONF_OVERWRITE_EXTRACT);   // ...and the existing file asks first
     struct stat st1;
     CHECK(stat((out + "/sub/inner.txt").c_str(), &st1) == 0 && st1.st_size == sentinel);
     confirm_yes(app);
@@ -770,6 +787,8 @@ static void test_archive_f5_copy_out(AppPanes* app, const std::string& root) {
     CHECK(p.selected >= 0);
     app->pending_op = DEFER_COPY;
     app_panes_run_pending(app);
+    CHECK(app->op == OP_COPY);          // the menu route opens the same dialog
+    accept_op(app);
     CHECK(fs_exists((out2 + "/two.txt").c_str()));
 
     // And the archive itself is untouched by all of it.
@@ -1164,6 +1183,9 @@ static void test_deferred_ops(AppPanes* app, const std::string& root) {
     CHECK(p.selected >= 0);
     app->pending_op = DEFER_COPY;
     app_panes_run_pending(app);
+    CHECK(app->op == OP_COPY);          // the menu item opens the dialog, it does not copy
+    accept_op(app);
+    CHECK(app->op == OP_NONE);
     CHECK(fs_exists((root + "/defer/dst/one.txt").c_str()));
     CHECK(fs_exists((root + "/defer/src/one.txt").c_str()));   // a copy keeps the source
 
@@ -1171,6 +1193,8 @@ static void test_deferred_ops(AppPanes* app, const std::string& root) {
     CHECK(p.selected >= 0);
     app->pending_op = DEFER_MOVE;
     app_panes_run_pending(app);
+    CHECK(app->op == OP_MOVE);
+    accept_op(app);
     CHECK(fs_exists((root + "/defer/dst/two.txt").c_str()));
     CHECK(!fs_exists((root + "/defer/src/two.txt").c_str()));
 
@@ -1245,6 +1269,187 @@ static void test_deferred_ops(AppPanes* app, const std::string& root) {
     CHECK(fs_exists((root + "/defer/src/deferred.zip").c_str()));
 
     sh("rm -rf '" + root + "/defer'");
+}
+
+// The operation dialog. F7 puts a folder name in a field that already has the
+// keyboard, F5 and F6 show where the operation is going and let that be changed,
+// and nothing reaches the filesystem until Enter is pressed.
+static void test_op_dialog(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    Pane& q = app->right;
+    app->left_focus = true;
+    app->cmd[0] = '\0';   // a leftover command line would make Enter run it
+    refresh_pane(&p, root.c_str());
+    refresh_pane(&q, root.c_str());
+    p.selected = idx_of(p, "alpha.txt");
+
+    // ---- F7: the dialog opens ready to type ----
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);
+    CHECK(app->op == OP_MKDIR);
+    CHECK(app->op_focus_request);          // the field takes the keyboard on the frame it opens
+    CHECK(app->op_name[0] == '\0');
+    app->op_focus_request = false;         // a real frame would have consumed it
+
+    // Enter on an empty field is a mistake, not a request for a nameless folder.
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_MKDIR);            // the dialog stays up
+    CHECK(app->op_error[0] != '\0');
+
+    snprintf(app->op_name, sizeof(app->op_name), "made");
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(app->op == OP_NONE);
+    CHECK(!fs_exists((root + "/made").c_str()));   // Esc really abandons the operation
+
+    // And again, this time answered: Enter is the whole operation.
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);
+    snprintf(app->op_name, sizeof(app->op_name), "made");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_NONE);
+    CHECK(fs_exists((root + "/made").c_str()));
+    CHECK(strstr(app->status_msg, "Created") != NULL);
+
+    // A name that cannot be taken keeps the dialog and the reason in it, so the
+    // fix is typed in place instead of the whole operation being restarted.
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);
+    snprintf(app->op_name, sizeof(app->op_name), "made");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_MKDIR);
+    CHECK(strstr(app->op_error, "Cannot create") != NULL);
+    snprintf(app->op_name, sizeof(app->op_name), "made2");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_NONE);
+    CHECK(fs_exists((root + "/made2").c_str()));
+
+    // The OK button only records the request; the run happens between frames.
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);
+    snprintf(app->op_name, sizeof(app->op_name), "viabutton");
+    app->pending_op = DEFER_OP_COMMIT;
+    app_panes_run_pending(app);
+    CHECK(app->op == OP_NONE);
+    CHECK(fs_exists((root + "/viabutton").c_str()));
+    sh("rmdir '" + root + "/made' '" + root + "/made2' '" + root + "/viabutton'");
+
+    // While the dialog is up the arrows and Delete belong to the field: a long
+    // typed path has to be editable, and Down must not walk the file list.
+    int sel = p.selected;
+    CHECK(app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));     // normally the pane's key
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_NONE);
+    CHECK(!app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));    // now the field's
+    CHECK(!app_key_is_special(SDLK_HOME, SDL_KMOD_NONE, app));
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(p.selected == sel);              // the pane's cursor did not move
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));   // and back to normal after
+
+    // ---- F5: the destination is shown, and it is what runs ----
+    std::string dst = root + "/dst";
+    sh("rm -rf '" + dst + "'");
+    sh("mkdir -p '" + dst + "'");
+    refresh_pane(&q, dst.c_str());
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "alpha.txt");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(app->op == OP_COPY);
+    CHECK(app->op_plan.names.size() == 1);
+    CHECK(strcmp(app->op_name, (dst + "/alpha.txt").c_str()) == 0);   // the whole target, prefilled
+    CHECK(!fs_exists((dst + "/alpha.txt").c_str()));                  // nothing written yet
+
+    // Renaming while copying is the same keystrokes as copying.
+    snprintf(app->op_name, sizeof(app->op_name), "%s/renamed.txt", dst.c_str());
+    accept_op(app);
+    CHECK(fs_exists((dst + "/renamed.txt").c_str()));
+    CHECK(!fs_exists((dst + "/alpha.txt").c_str()));
+    CHECK(strstr(app->status_msg, "Copied 1 item to") != NULL);
+    // The pane that is looking at the destination shows what landed there, so
+    // the result of the operation is visible without a manual refresh.
+    CHECK(idx_of(q, "renamed.txt") >= 0);
+
+    // Several items have to land in a directory: a name would silently drop one.
+    refresh_pane(&p, root.c_str());
+    p.marked[idx_of(p, "alpha.txt")] = true;
+    p.marked[idx_of(p, "beta.txt")] = true;
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(app->op_plan.names.size() == 2);
+    CHECK(strcmp(app->op_name, dst.c_str()) == 0);       // several: the field is the directory
+    snprintf(app->op_name, sizeof(app->op_name), "%s/both.txt", dst.c_str());
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_COPY);
+    CHECK(strstr(app->op_error, "has to be a directory") != NULL);
+    CHECK(!fs_exists((dst + "/both.txt").c_str()));
+    for (int i = 0; i < p.entry_count; i++) p.marked[i] = false;
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(app->op == OP_NONE);
+
+    // A destination whose folder is missing is refused: a typo in a typed path
+    // must not quietly create a second one. The trailing slash is what says a
+    // folder is meant, and then making it is the whole point.
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "gamma.log");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    snprintf(app->op_name, sizeof(app->op_name), "%s/nosuch/gamma.log", dst.c_str());
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_COPY);
+    CHECK(strstr(app->op_error, "no directory") != NULL);
+    CHECK(!fs_exists((dst + "/nosuch").c_str()));
+    snprintf(app->op_name, sizeof(app->op_name), "%s/made/sub/", dst.c_str());
+    accept_op(app);
+    CHECK(app->op == OP_NONE);
+    CHECK(fs_exists((dst + "/made/sub/gamma.log").c_str()));
+
+    // Copying a file onto itself is refused: the copy opens the target for
+    // writing before it reads the source, so the file would be lost.
+    refresh_pane(&q, root.c_str());
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "alpha.txt");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_NONE);
+    CHECK(strcmp(app->op_name, (root + "/alpha.txt").c_str()) == 0);
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_COPY);
+    CHECK(strstr(app->op_error, "is already there") != NULL);
+    CHECK(fs_exists((root + "/alpha.txt").c_str()));
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+
+    // The dialog is authoritative. It renames the entry on its own "Renaming:"
+    // line, so marks and a click on the other pane cannot move the operation
+    // underneath it while it is open.
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "gamma.log");
+    CHECK(p.selected >= 0);
+    p.marked[idx_of(p, "alpha.txt")] = true;
+    app_panes_handle_key(app, SDLK_F2, SDL_KMOD_NONE);
+    CHECK(app->op == OP_RENAME);
+    CHECK(strcmp(app->op_name, "gamma.log") == 0);
+    app->left_focus = false;                 // as if the other pane had been clicked
+    snprintf(app->op_name, sizeof(app->op_name), "gamma2.log");
+    accept_op(app);
+    CHECK(fs_exists((root + "/gamma2.log").c_str()));
+    CHECK(fs_exists((root + "/alpha.txt").c_str()));   // the marked entry keeps its own name
+    app->left_focus = true;
+    for (int i = 0; i < p.entry_count; i++) p.marked[i] = false;
+    sh("mv '" + root + "/gamma2.log' '" + root + "/gamma.log'");
+
+    // ---- F6: the same dialog, moving ----
+    refresh_pane(&p, root.c_str());
+    p.selected = idx_of(p, "beta.txt");
+    CHECK(p.selected >= 0);
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_NONE);
+    CHECK(app->op == OP_MOVE);
+    snprintf(app->op_name, sizeof(app->op_name), "%s/beta2.txt", root.c_str());
+    accept_op(app);
+    CHECK(!fs_exists((root + "/beta.txt").c_str()));
+    CHECK(fs_exists((root + "/beta2.txt").c_str()));
+    CHECK(strstr(app->status_msg, "Moved 1 item to") != NULL);
+    // The source pane lost the row and the cursor stayed in the list rather than
+    // running off the end of it.
+    CHECK(idx_of(p, "beta.txt") < 0);
+    CHECK(p.selected >= 0 && p.selected < p.entry_count);
+    // And the pane looking at the destination gained it.
+    CHECK(idx_of(q, "beta2.txt") >= 0);
+    sh("mv '" + root + "/beta2.txt' '" + root + "/beta.txt'");
+    sh("rm -rf '" + dst + "'");
 }
 
 int main() {
@@ -1328,6 +1533,7 @@ int main() {
     test_archive_ops(&app, root);
     test_pack_options(&app, root);
     test_deferred_ops(&app, root);
+    test_op_dialog(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

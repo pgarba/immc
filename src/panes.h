@@ -111,12 +111,30 @@ struct Pane {
     int tab_active;
 };
 
-// Pending file operation shown in the bottom op bar
+// A file operation the op dialog decided, carried out by run_op_plan(). The
+// sources are captured as names relative to `src_dir` - or as member paths when
+// `archive` is non-empty - instead of being re-read from the pane's marks at run
+// time, so what the dialog showed is what runs even if a click changes the pane
+// while a confirm dialog is up.
+struct OpPlan {
+    std::string src_dir;         // real directory the source names resolve against
+    StringList names;            // sources, relative to src_dir (members inside archive)
+    StringList raw_names;        // archive only: those members as the tool named them
+    std::string dst_dir;         // destination directory
+    std::string name_override;   // non-empty: the one source lands under this name
+    std::string archive;         // non-empty: the sources are members of this archive
+    std::string archive_prefix;  // level inside that archive, when the pane was deeper
+    bool is_move = false;
+};
+
+// Pending file operation, shown as a dialog with an editable destination
 enum AppOp {
     OP_NONE = 0,
     OP_RENAME,   // op_name = new name for the target entry
     OP_MKDIR,    // op_name = new directory name
-    OP_NEWFILE   // op_name = name of an empty file to create
+    OP_NEWFILE,  // op_name = name of an empty file to create
+    OP_COPY,     // op_name = destination, sources in op_plan
+    OP_MOVE      // as OP_COPY, moving instead of copying
 };
 
 // An action a widget asked for. The widget fires inside the ImGui frame, but
@@ -126,8 +144,10 @@ enum AppOp {
 // frames. Anything that can reach pump_progress_ui() belongs here.
 enum AppDeferred {
     DEFER_NONE = 0,
-    DEFER_COPY,
-    DEFER_MOVE,
+    DEFER_COPY,           // F5 / the menu item: opens the copy dialog
+    DEFER_MOVE,           // F6 / the menu item: opens the move dialog
+    DEFER_OP_COMMIT,        // the op dialog's Enter or OK button
+    DEFER_OP_RUN,         // run the plan the op dialog settled on
     DEFER_PASTE,
     DEFER_EXTRACT,        // Alt+F6 from the Commands menu
     DEFER_PACK,           // the pack dialog's Pack button
@@ -173,8 +193,10 @@ public:
     int active_path_pane; // -1 = none, 0 = left, 1 = right (path InputText has focus)
 
     AppOp op = OP_NONE;
-    char op_name[256];    // name input for rename/mkdir
-    bool op_input_active; // true while the op bar InputText has focus
+    char op_name[4096];   // the dialog's field: a name, or a destination path
+    OpPlan op_plan;       // sources and resolved destination for OP_COPY/OP_MOVE
+    bool op_focus_request;   // focus the dialog's field on the frame it opens
+    char op_error[512];   // the dialog's own error line, cleared on open
     char status_msg[512]; // last operation result, shown in the status bar
 
     // Command line (bottom bar). Focused by default; special keys are routed
@@ -245,7 +267,8 @@ public:
     bool pending_confirm_yes;
 
     // Pack dialog (TC Alt+F5). Packing has real choices - format, level, a
-    // password, volumes - so it gets a dialog rather than a name in the op bar.
+    // password, volumes - so it gets a dialog rather than one line in the
+    // bottom bar.
     // The sources are captured when it opens so marks cannot change underneath
     // it, and the target directory is remembered so the dialog can be opened
     // while the pane is showing an unrelated tab.
@@ -300,7 +323,7 @@ void app_panes_free(AppPanes* app);
 void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod);
 bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app);
 void app_panes_commit_path(AppPanes* app); // navigate to the typed path in the focused path bar
-void app_panes_commit_op(AppPanes* app);   // execute the pending op (rename/mkdir) from the op bar
+void app_panes_commit_op(AppPanes* app);   // carry out the op the dialog is showing
 void app_panes_cancel_op(AppPanes* app);   // cancel a pending op
 void app_panes_run_pending(AppPanes* app); // run deferred menu/dialog actions
 void app_panes_set_sdl_window(AppPanes* app, void* window);
