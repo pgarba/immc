@@ -958,6 +958,191 @@ static void test_ctrl_p_and_i(AppPanes* app, const std::string& root) {
     refresh_pane(&p, root.c_str());
 }
 
+// The pack dialog is laid out by ImGui, so "does the text fit" is measurable
+// without a display: render one frame and compare how far the content reached
+// with the window's own right edge. Every format is checked because each one
+// swaps in different hint and refusal text.
+static void test_pack_dialog_layout(AppPanes* app) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    // ImGui would write its window layout to imgui.ini in the working directory
+    // on Render(); a layout test has no layout to keep.
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1280, 800);
+    // No renderer in a headless test, so build the font atlas on the CPU: layout
+    // needs glyph metrics, not a texture upload.
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+    CHECK(fw > 0 && fh > 0);
+
+    snprintf(app->pack_dir, sizeof(app->pack_dir),
+             "/home/adam/documents/projects/work/quarterly-reports-and-forecasts/2026");
+    snprintf(app->pack_name, sizeof(app->pack_name),
+             "quarterly-report-final-revised-with-comments");
+    app->pack_open = true;
+    const std::vector<ArchKind>& kinds = arch_pack_kinds();
+    for (int k = 0; k < (int)kinds.size(); k++) {
+        app->pack_kind_idx = k;
+        // A password on a format that cannot encrypt it puts the refusal text in
+        // the dialog, so the refusal has to fit too.
+        snprintf(app->pack_password, sizeof(app->pack_password), "hunter2");
+        ImGui::NewFrame();
+        render_pack_dialog(app);
+        ImGui::Render();
+        ImGuiWindow* w = ImGui::FindWindowByName("Pack into archive");
+        CHECK(w != nullptr);
+        if (!w) continue;
+        float right = w->Pos.x + w->Size.x;
+        if (w->DC.CursorMaxPos.x > right) {
+            printf("pack dialog overflows for %s: content reaches %.0f, window ends at %.0f\n",
+                   arch_kind_name(kinds[k]), w->DC.CursorMaxPos.x, right);
+        }
+        CHECK(w->DC.CursorMaxPos.x <= right + 0.5f);
+    }
+
+    // The elision keeps both ends, and only kicks in when it has to.
+    snprintf(app->pack_dir, sizeof(app->pack_dir), "/tmp");
+    ImGui::NewFrame();
+    render_pack_dialog(app);
+    ImGui::Render();
+    ImGuiWindow* w = ImGui::FindWindowByName("Pack into archive");
+    CHECK(w != nullptr);
+    if (w) CHECK(w->DC.CursorMaxPos.x <= w->Pos.x + w->Size.x + 0.5f);
+
+    ImGui::NewFrame();
+    const char* deep = "/home/adam/documents/projects/work/quarterly-reports-and-forecasts/2026";
+    CHECK(elide_middle(deep, 1e9f) == deep);            // fits untouched
+    std::string cut = elide_middle(deep, 120.0f);
+    CHECK(cut != deep);
+    CHECK(ImGui::CalcTextSize(cut.c_str()).x <= 120.0f);
+    // The head keeps the root of the path, the tail keeps the leaf name.
+    if (!cut.starts_with("/home/adam") || !cut.ends_with("2026"))
+        printf("elided to fit 120px: %s\n", cut.c_str());
+    CHECK(cut.starts_with("/home/adam"));
+    CHECK(cut.ends_with("2026"));
+    CHECK(cut.find("...") != std::string::npos);
+    ImGui::Render();
+
+    app->pack_open = false;
+    app->pack_password[0] = '\0';
+    app->pack_kind_idx = 0;
+    ImGui::DestroyContext(ctx);
+}
+
+// The deferred-action table. A menu item, a context-menu entry or a dialog
+// button fires inside the ImGui frame, so it can only record a request; the
+// operation itself runs between frames, in app_panes_run_pending(). A constant
+// that falls through to the default case does nothing at all while the widget
+// that set it still looks like it worked, so every constant is driven here and
+// the effect it is supposed to have is checked on disk.
+static void test_deferred_ops(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    Pane& q = app->right;
+    app->left_focus = true;
+
+    sh("rm -rf '" + root + "/defer'");
+    sh("mkdir -p '" + root + "/defer/src' '" + root + "/defer/dst' "
+       "'" + root + "/defer/paste' '" + root + "/defer/links' '" + root + "/defer/out'");
+    touch_file(root + "/defer/src", "one.txt");
+    touch_file(root + "/defer/src", "two.txt");
+    {
+        StringList names;
+        names.push_back("one.txt");
+        std::string err;
+        CHECK(arch_pack((root + "/defer/pkg.zip").c_str(), (root + "/defer/src").c_str(),
+                        names, nullptr, nullptr, &err));
+    }
+
+    // DEFER_COPY and DEFER_MOVE: the entry menu's two plain items.
+    refresh_pane(&p, (root + "/defer/src").c_str());
+    refresh_pane(&q, (root + "/defer/dst").c_str());
+    p.selected = idx_of(p, "one.txt");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_COPY;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((root + "/defer/dst/one.txt").c_str()));
+    CHECK(fs_exists((root + "/defer/src/one.txt").c_str()));   // a copy keeps the source
+
+    p.selected = idx_of(p, "two.txt");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_MOVE;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((root + "/defer/dst/two.txt").c_str()));
+    CHECK(!fs_exists((root + "/defer/src/two.txt").c_str()));
+
+    // The request is consumed, so the next frame does not run it a second time.
+    CHECK(app->pending_op == DEFER_NONE);
+    int rows = p.entry_count;
+    app_panes_run_pending(app);
+    CHECK(p.entry_count == rows);
+
+    // DEFER_PASTE: the clipboard is the source and the focused pane is where it
+    // lands, which is why both the Commands menu and "Paste here" defer.
+    refresh_pane(&p, (root + "/defer/src").c_str());
+    p.selected = idx_of(p, "one.txt");
+    CHECK(p.selected >= 0);
+    clipboard_set(app, p, false);
+    CHECK(!app->clipboard.paths.empty());
+    refresh_pane(&q, (root + "/defer/paste").c_str());
+    app->left_focus = false;
+    app->pending_op = DEFER_PASTE;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((root + "/defer/paste/one.txt").c_str()));
+    app->clipboard.paths.clear();
+    app->left_focus = true;
+
+    // DEFER_COPY_IN_PLACE (Shift+F5) and DEFER_SYMLINK_OTHER (Shift+Ctrl+F5).
+    refresh_pane(&p, (root + "/defer/src").c_str());
+    p.selected = idx_of(p, "one.txt");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_COPY_IN_PLACE;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((root + "/defer/src/one.txt.copy").c_str()));
+
+    refresh_pane(&q, (root + "/defer/links").c_str());
+    p.selected = idx_of(p, "one.txt");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_SYMLINK_OTHER;
+    app_panes_run_pending(app);
+    struct stat st;
+    CHECK(lstat((root + "/defer/links/one.txt").c_str(), &st) == 0 && S_ISLNK(st.st_mode));
+
+    // DEFER_FILL_SIZES (Alt+Shift+Enter) fills the size column for directories.
+    refresh_pane(&p, root.c_str());
+    CHECK(p.dir_size[idx_of(p, "sub")] == -1);
+    app->pending_op = DEFER_FILL_SIZES;
+    app_panes_run_pending(app);
+    CHECK(p.dir_size[idx_of(p, "sub")] >= 0);
+
+    // DEFER_EXTRACT (Alt+F6 from the Commands menu) and DEFER_PACK (the Pack
+    // button and Enter in the pack dialog). Both pump the progress UI, so both
+    // have to arrive here rather than running inside the frame.
+    refresh_pane(&p, (root + "/defer").c_str());
+    refresh_pane(&q, (root + "/defer/out").c_str());
+    p.selected = idx_of(p, "pkg.zip");
+    CHECK(p.selected >= 0);
+    app->pending_op = DEFER_EXTRACT;
+    app_panes_run_pending(app);
+    CHECK(fs_exists((root + "/defer/out/one.txt").c_str()));
+    CHECK(strstr(app->status_msg, "Extracted") != NULL);
+
+    refresh_pane(&p, (root + "/defer/src").c_str());
+    for (int i = 0; i < p.entry_count; i++)
+        if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
+    do_pack(app, false);
+    CHECK(app->pack_open);
+    // The dialog keeps the last format chosen, so name one instead of trusting
+    // what an earlier test left in the combo.
+    app->pack_kind_idx = kind_idx(ARCH_ZIP);
+    snprintf(app->pack_name, sizeof(app->pack_name), "deferred");
+    app->pending_op = DEFER_PACK;
+    app_panes_run_pending(app);
+    CHECK(!app->pack_open);
+    CHECK(fs_exists((root + "/defer/src/deferred.zip").c_str()));
+
+    sh("rm -rf '" + root + "/defer'");
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -987,6 +1172,7 @@ int main() {
     AppPanes app;
 
     test_matcher();
+    test_pack_dialog_layout(&app);
 
     refresh_pane(&p, root.c_str());
     CHECK(p.entry_count == 5);   // ..  alpha.txt  beta.txt  gamma.log  sub
@@ -1036,6 +1222,7 @@ int main() {
     test_archive_copy_out(&app, root);
     test_archive_ops(&app, root);
     test_pack_options(&app, root);
+    test_deferred_ops(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

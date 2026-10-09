@@ -119,6 +119,23 @@ enum AppOp {
     OP_NEWFILE   // op_name = name of an empty file to create
 };
 
+// An action a widget asked for. The widget fires inside the ImGui frame, but
+// these operations block and pump their own progress UI, which opens a new
+// ImGui frame; doing that with a frame already open corrupts ImGui. So the
+// widget records the request and app_panes_run_pending() carries it out between
+// frames. Anything that can reach pump_progress_ui() belongs here.
+enum AppDeferred {
+    DEFER_NONE = 0,
+    DEFER_COPY,
+    DEFER_MOVE,
+    DEFER_PASTE,
+    DEFER_EXTRACT,        // Alt+F6 from the Commands menu
+    DEFER_PACK,           // the pack dialog's Pack button
+    DEFER_COPY_IN_PLACE,  // Shift+F5
+    DEFER_SYMLINK_OTHER,  // Shift+Ctrl+F5
+    DEFER_FILL_SIZES      // Alt+Shift+Enter
+};
+
 // Pending confirmation dialog (Y/N)
 enum AppConfirm {
     CONF_NONE = 0,
@@ -219,9 +236,11 @@ public:
     double    prog_t0;
     double    prog_last_pump;
 
-    // Deferred actions: menu/context-menu/dialog-button triggers run outside
-    // the ImGui frame so copy/move can pump their own progress UI.
-    int  pending_op;          // 0 none, 1 copy, 2 move, 3 paste
+    // Deferred actions: menu/context-menu/dialog-button triggers fire inside
+    // the ImGui frame, but a long operation pumps its own progress UI, and that
+    // starts a new ImGui frame. Starting one while a frame is open corrupts
+    // ImGui, so these run between frames instead.
+    int  pending_op;          // AppDeferred
     bool pending_confirm_yes;
 
     // Pack dialog (TC Alt+F5). Packing has real choices - format, level, a

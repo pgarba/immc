@@ -44,13 +44,17 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 
 **Verification harness.** `tests/test_panes.cpp` includes `src/panes.cpp`, so the file-static helpers
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
-`fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, and
-the archive pane mode with its guards and operations) run headless — 299 checks in `test-panes` plus
-191 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`. It caught two real bugs:
-`?` was never handled in the glob matcher, and `tree_toggle()` kept a `vector` reference across an
-`insert()`, so the `expanded` flag was written to freed memory and the next press duplicated the
-row's children. Bindings are now also driven through `app_panes_handle_key` itself, not only through
-the classifiers — that is the path on which `Alt+F5` used to reach the plain copy handler.
+`fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, the
+archive pane mode with its guards and operations, and the deferred-action table) run headless — 344
+checks in `test-panes` plus 191 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`.
+It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
+reference across an `insert()`, so the `expanded` flag was written to freed memory and the next press
+duplicated the row's children; and every menu item that started a long operation ran it inside the
+ImGui frame, which opens a second frame from inside the first and corrupts ImGui. Bindings are now
+also driven through `app_panes_handle_key` itself, not only through the classifiers — that is the path
+on which `Alt+F5` used to reach the plain copy handler. Layout is measurable headless too: one frame
+of the pack dialog against a long path settles whether the text reaches past the window, so a clipped
+dialog is a failing check rather than a screenshot someone has to notice.
 Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 
 ---
@@ -416,6 +420,26 @@ a password-protected archive makes `unzip`/`7z` prompt, and with the terminal st
 waits for typed input while the UI sits on a progress bar that never moves. With `/dev/null` the prompt
 gets EOF and the tool fails with an error the status line can show.
 
+**A dialog is a layout, and a path is one unbreakable word.** The pack dialog filled its fields to
+`-FLT_MIN` and let its hint text run to the window edge, so a long archive name or a deep directory
+came out clipped: this ImGui wraps only `TextWrapped()`/`PushTextWrapPos()`, never `Text()`, and a path
+contains no space for a wrap to break at. Every sentence in the dialog now goes through a wrapping
+helper; a labelled field fills to the edge with its own label width subtracted, because `-FLT_MIN`
+measures from the cursor, which the label has already pushed past the edge; and the two path lines are
+shortened in the middle by `elide_middle()`, which binary-searches the widest split that fits and
+keeps two characters of the head for one of the tail — the head says which project the path belongs
+to, the tail names the leaf. `test_pack_dialog_layout` renders the dialog once per format and compares
+`DC.CursorMaxPos.x` against the window's right edge.
+
+**Long operations run between frames, never inside one.** A menu item, a context-menu entry or a
+dialog button fires while its own ImGui frame is open, but copy, move, paste, extract, pack,
+copy-in-place, links and directory sizes block and pump a progress UI of their own, which opens a
+second frame inside the first and corrupts ImGui. They record an `AppDeferred` instead, and
+`app_panes_run_pending()` carries it out between frames. That table is the only place a request becomes
+an operation, and `test_deferred_ops` drives every constant in it and checks the result on disk: a
+constant that falls through to the default case does nothing at all while the menu item that set it
+still looks like it worked.
+
 **The bindings were reserved before they were implemented.** They used to fall through to the plain
 `F5`/`F6`/`F9` handlers, so `Alt+F5` quietly ran a copy and `Alt+F9` opened the pane menu.
 `is_archive_key()` claims all five, and the plain `F5`, `F6` and `F9` handlers refuse `Alt`/`Ctrl`, so
@@ -440,6 +464,7 @@ handler to keep that honest.
 | 10 | I keymap re-audit (Ctrl+P, Ctrl+I) | 1h | — |
 | 11 | archives (backend, browsing, operations) | 2d | — |
 | 12 | archive `..`, pack dialog, pane click focus | 2h | — |
+| 13 | pack dialog layout, deferred operations | 2h | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -461,12 +486,17 @@ Manual checklist (extend per phase):
 10. `Alt+F5` → the dialog names the archive and picks a format → the file exists and `Alt+F9` on it
     gives the sources back; `Alt+Shift+F5` leaves only the archive behind; `Alt+F6` lands in the other
     pane; `Alt+Shift+F9` says "Archive OK".
+11. `Ctrl+C` on two members, `Ctrl+V` in a real directory extracts those two and nothing else;
+    `Ctrl+X` there refuses.
+12. A pack or extract over a large archive still responds to Abort in the progress dialog, and the
+    operation stops without leaving a partial status message claiming success.
 13. In the pack dialog: a 7z with a password does not open without it, a tar with a password is refused
     in the dialog instead of writing an unencrypted archive, a zip with volumes is refused, and a 7z
     volume set lists and extracts as one archive.
 14. Clicking below the last row, between rows, or on the scrollbar of the other pane makes that pane
     the active one; a password-protected archive reports a failure rather than freezing on a prompt.
-11. `Ctrl+C` on two members, `Ctrl+V` in a real directory extracts those two and nothing else;
-    `Ctrl+X` there refuses.
-12. A pack or extract over a large archive still responds to Abort in the progress dialog, and the
-    operation stops without leaving a partial status message claiming success.
+15. Every Commands-menu and context-menu entry for a long operation — copy, move, paste, extract, pack,
+    copy in place, link in other pane, directory sizes — runs from the menu with the progress dialog
+    up and Abort working, instead of closing the menu and doing nothing.
+16. The pack dialog at a narrow window width, with a long archive name and a deep target directory:
+    no line runs past the frame, and an elided path keeps both its head and its leaf name.

@@ -131,7 +131,7 @@ AppPanes::AppPanes() {
     prog_files_total = 0;
     prog_t0 = 0;
     prog_last_pump = 0;
-    pending_op = 0;
+    pending_op = DEFER_NONE;
     pending_confirm_yes = false;
     sdl_window = nullptr;
     view_mode = VIEW_MID;
@@ -936,6 +936,12 @@ static int count_existing_targets(AppPanes* app, Pane& pane, const char* dst_dir
 // Progress helpers are defined below with the copy/move operations.
 static bool copy_progress_cb(long long done, long long total, int fd, int ft, void* user);
 static void prog_begin(AppPanes* app, Pane& active, Pane& other, bool is_move);
+// Defined with the keyboard handlers; the deferred-action table and the Commands
+// menu both need them earlier.
+static void do_copy_in_place(AppPanes* app);
+static void do_symlink_other(AppPanes* app);
+static void count_marked_sizes(AppPanes* app);
+static void fill_dir_sizes(AppPanes* app);
 
 static void do_delete(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
@@ -1290,6 +1296,74 @@ static const long long kPackVolumes[] = { 0, 1024LL, 1024LL * 1024,
 static const char* const kPackVolumeLabels[] = {
     "one file", "1 KB", "1 MB", "100 MB", "700 MB (CD)", "1 GB", "4 GB" };
 
+
+
+// A path has no spaces, and ImGui's word wrap only breaks at spaces, so a long
+// one is a single unbreakable word that runs off the window and gets clipped.
+// Shorten it in the middle instead: both ends stay, which is what identifies a
+// directory, and the line always fits.
+//
+// The kept characters are split unevenly, two to the head for one to the tail.
+// The tail only has to be long enough to name the leaf, but the head has to say
+// which project that leaf belongs to: "quarterly...2026" is guesswork where
+// "/home/adam/docu...2026" is not. An even split gets neither right.
+static void elide_split(int keep, int* head, int* tail) {
+    *head = (keep * 2 + 2) / 3;
+    *tail = keep - *head;
+}
+
+static std::string elide_middle(const char* s, float max_w) {
+    if (ImGui::CalcTextSize(s).x <= max_w) return s;
+    const char* gap = "...";
+    const int n = (int)strlen(s);
+    // The candidate only gets narrower as fewer characters are kept - the split
+    // does not change its length - so binary search for the largest split that
+    // fits rather than walking every length.
+    int lo = 1, hi = n - 1, best = 1;
+    while (lo <= hi) {
+        int keep = (lo + hi) / 2;
+        int head, tail;
+        elide_split(keep, &head, &tail);
+        std::string cand = std::string(s, head) + gap + std::string(s + (n - tail));
+        if (ImGui::CalcTextSize(cand.c_str()).x <= max_w) { best = keep; lo = keep + 1; }
+        else hi = keep - 1;
+    }
+    int head, tail;
+    elide_split(best, &head, &tail);
+    return std::string(s, head) + gap + std::string(s + (n - tail));
+}
+
+
+// -FLT_MIN fills from the cursor to the right edge, but a labelled widget draws
+// its label first and starts the frame after it, so the frame ends up past the
+// edge by exactly the label's width. Fill to the edge with the label counted.
+static void pack_fill(const char* label) {
+    float label_w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemInnerSpacing.x;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - label_w);
+}
+
+// This ImGui does not wrap Text()/TextDisabled() at the window edge - only
+// PushTextWrapPos()/TextWrapped() do - so a long sentence in a dialog runs
+// straight past the frame and gets clipped. Every sentence in these dialogs goes
+// through one of the two helpers below.
+static void text_wrap_disabled(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushTextWrapPos(0.0f);          // 0 = wrap at the window's work rect
+    ImGui::TextDisabledV(fmt, args);
+    ImGui::PopTextWrapPos();
+    va_end(args);
+}
+
+static void text_wrap_colored(ImVec4 c, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextColoredV(c, fmt, args);
+    ImGui::PopTextWrapPos();
+    va_end(args);
+}
+
 static void render_pack_dialog(AppPanes* app) {
     if (!app->pack_open) return;
     const std::vector<ArchKind>& kinds = arch_pack_kinds();
@@ -1315,13 +1389,18 @@ static void render_pack_dialog(AppPanes* app) {
     }
     items[used++] = '\0';
 
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    pack_fill("Archive name");
     ImGui::InputText("Archive name", app->pack_name, sizeof(app->pack_name));
-    ImGui::TextDisabled("Written as %s%s in %s",
-                        strip_archive_suffix(app->pack_name).c_str(),
-                        arch_kind_suffix(kind), app->pack_dir);
+    // Two lines, each measured as it will be drawn: the file name and the
+    // directory are both unbounded, and a path has no spaces for the wrap to
+    // break on, so it is shortened in the middle rather than clipped.
+    float avail = ImGui::GetContentRegionAvail().x;
+    std::string written = "Written as " + strip_archive_suffix(app->pack_name) + arch_kind_suffix(kind);
+    std::string into = std::string("into ") + app->pack_dir;
+    text_wrap_disabled("%s", elide_middle(written.c_str(), avail).c_str());
+    text_wrap_disabled("%s", elide_middle(into.c_str(), avail).c_str());
 
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    pack_fill("Format");
     if (ImGui::Combo("Format", &app->pack_kind_idx, items)) {
         // A format that cannot honour a choice drops it, so the dialog never
         // shows a password box that would be ignored.
@@ -1337,32 +1416,32 @@ static void render_pack_dialog(AppPanes* app) {
     ImGui::BeginDisabled(kind == ARCH_TAR);
     ImGui::Checkbox("Compression level", &app->pack_use_level);
     if (kind == ARCH_TAR)
-        ImGui::TextDisabled("a plain .tar is not compressed");
+        text_wrap_disabled("a plain .tar is not compressed");
     else {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderInt("##level", &app->pack_level, 0, 9, "%d");
-        ImGui::TextDisabled("0 store - 1 fastest - 6 the tool's default - 9 best");
+        text_wrap_disabled("0 store - 1 fastest - 6 the tool's default - 9 best");
     }
     ImGui::EndDisabled();
 
     if (is_tar) {
-        ImGui::TextDisabled("tar cannot encrypt; pick zip or 7z for a password");
+        text_wrap_disabled("tar cannot encrypt; pick zip or 7z for a password");
     } else {
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        pack_fill("Password");
         ImGui::InputText("Password", app->pack_password, sizeof(app->pack_password),
                          ImGuiInputTextFlags_Password);
-        ImGui::TextDisabled("the password is handed to %s, so it is visible in the "
-                            "process list while packing", arch_kind_name(kind));
+        text_wrap_disabled("the password is handed to %s, so it is visible in the "
+                           "process list while packing", arch_kind_name(kind));
     }
 
     if (kind != ARCH_7Z) {
-        ImGui::TextDisabled("only 7z writes volumes the tools can read back");
+        text_wrap_disabled("only 7z writes volumes the tools can read back");
     } else {
         int vi = 0;
         for (int i = 0; i < (int)(sizeof(kPackVolumes) / sizeof(kPackVolumes[0])); i++)
             if (kPackVolumes[i] == app->pack_volume_bytes) vi = i;
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        pack_fill("Volumes");
         if (ImGui::Combo("Volumes", &vi, kPackVolumeLabels,
                          (int)(sizeof(kPackVolumeLabels) / sizeof(kPackVolumeLabels[0]))))
             app->pack_volume_bytes = kPackVolumes[vi];
@@ -1374,18 +1453,20 @@ static void render_pack_dialog(AppPanes* app) {
     bool supported = arch_pack_supported(pack_opts(app), &why);
     ImGui::Separator();
     if (!arch_can_pack(kind)) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s is not installed", arch_kind_name(kind));
+        text_wrap_colored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s is not installed", arch_kind_name(kind));
     } else if (!supported) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", why.c_str());
+        text_wrap_colored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", why.c_str());
     }
     ImGui::Spacing();
     bool can_pack = arch_can_pack(kind) && supported && app->pack_name[0];
     ImGui::BeginDisabled(!can_pack);
-    if (ImGui::Button("Pack")) { pack_commit(app); ImGui::End(); return; }
+    // The button only records the request: packing blocks and pumps its own
+    // ImGui frames, which cannot happen while this dialog's frame is open.
+    if (ImGui::Button("Pack")) app->pending_op = DEFER_PACK;
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) { app->pack_open = false; app->pack_names.clear(); }
-    ImGui::TextDisabled("Enter packs, Esc cancels");
+    text_wrap_disabled("Enter packs, Esc cancels");
     if (!open) { app->pack_open = false; app->pack_names.clear(); }
     ImGui::End();
 }
@@ -1718,19 +1799,26 @@ static void confirm_yes(AppPanes* app) {
 }
 
 // Deferred actions from menu/context-menu/dialog widgets: these fire inside
-// the ImGui frame, but copy/move pump their own frames, so they must run
-// between frames instead.
+// the ImGui frame, but the operations below block and pump their own progress
+// frames, so they must run between frames.
 void app_panes_run_pending(AppPanes* app) {
     if (app->pending_confirm_yes) {
         app->pending_confirm_yes = false;
         confirm_yes(app);
     }
-    if (app->pending_op) {
-        int op = app->pending_op;
-        app->pending_op = 0;
-        if (op == 1)      do_copy(app);
-        else if (op == 2) do_move(app);
-        else if (op == 3) do_paste(app);
+    if (!app->pending_op) return;
+    int op = app->pending_op;
+    app->pending_op = DEFER_NONE;
+    switch (op) {
+    case DEFER_COPY:          do_copy(app); break;
+    case DEFER_MOVE:          do_move(app); break;
+    case DEFER_PASTE:         do_paste(app); break;
+    case DEFER_EXTRACT:       do_extract(app, true); break;
+    case DEFER_PACK:          pack_commit(app); break;
+    case DEFER_COPY_IN_PLACE: do_copy_in_place(app); break;
+    case DEFER_SYMLINK_OTHER: do_symlink_other(app); break;
+    case DEFER_FILL_SIZES:    fill_dir_sizes(app); break;
+    default: break;
     }
 }
 
@@ -2211,9 +2299,9 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     bool marked = pane.selected < (int)pane.marked.size() && pane.marked[pane.selected];
     if (ImGui::MenuItem(marked ? "Unmark" : "Mark")) toggle_mark(pane, pane.selected);
     ImGui::Separator();
-    if (ImGui::MenuItem("Copy to other pane")) app->pending_op = 1;
-    if (ImGui::MenuItem("Move to other pane")) app->pending_op = 2;
-    if (ImGui::MenuItem("Paste here", "Ctrl+V")) app->pending_op = 3;
+    if (ImGui::MenuItem("Copy to other pane")) app->pending_op = DEFER_COPY;
+    if (ImGui::MenuItem("Move to other pane")) app->pending_op = DEFER_MOVE;
+    if (ImGui::MenuItem("Paste here", "Ctrl+V")) app->pending_op = DEFER_PASTE;
     ImGui::Separator();
     if (ImGui::MenuItem("Delete")) request_delete(app, false);
     if (ImGui::MenuItem(app->trash_mode ? "Deletes go to trash" : "Deletes are always direct"))
@@ -2398,7 +2486,7 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
     // scrollbar - makes it the active pane. Checked on the child window, because
     // IsItemHovered() would refer to the widget before it.
     if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0))
-        app->left_focus = focused;
+        app->left_focus = (&pane == &app->left);
 
     // The filter field is edited by ImGui, so re-apply the filter here, before
     // the rows are walked.
@@ -2506,12 +2594,12 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                 }
                 if (rclick) {
                     pane.selected = i;
-                    app->left_focus = focused;
+                    app->left_focus = (&pane == &app->left);
                     ImGui::OpenPopup("ctxmenu");
                 }
                 if (clicked) {
                     pane.selected = i;
-                    app->left_focus = focused;
+                    app->left_focus = (&pane == &app->left);
                     if (ImGui::GetIO().KeyShift) mark_range(pane, pane.anchor, i);
                     else pane.anchor = i;
                 }
@@ -2613,12 +2701,12 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
             }
             if (rclick) {
                 pane.selected = i;
-                app->left_focus = focused;
+                app->left_focus = (&pane == &app->left);
                 ImGui::OpenPopup("ctxmenu");
             }
             if (clicked) {
                 pane.selected = i;
-                app->left_focus = focused;
+                app->left_focus = (&pane == &app->left);
                 if (ImGui::GetIO().KeyShift) mark_range(pane, pane.anchor, i);
                 else pane.anchor = i;
             }
@@ -3093,12 +3181,6 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
 
 // Commands menu items. Shared by the menu bar and the F10 keyboard menu so the
 // two can never drift apart.
-// Defined further down with the keyboard handlers; the menu offers them too.
-static void do_copy_in_place(AppPanes* app);
-static void do_symlink_other(AppPanes* app);
-static void count_marked_sizes(AppPanes* app);
-static void fill_dir_sizes(AppPanes* app);
-
 static void render_commands_items(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other  = app->left_focus ? app->right : app->left;
@@ -3138,13 +3220,14 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Split view: tree + list", "Shift+Tab")) tree_mode_toggle(app, active, TREE_SPLIT);
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
     if (ImGui::MenuItem("Pack archive", "Alt+F5")) do_pack(app, false);
-    if (ImGui::MenuItem("Extract archive", "Alt+F6")) do_extract(app, true);
+    // Anything below that blocks runs between frames, not here.
+    if (ImGui::MenuItem("Extract archive", "Alt+F6")) app->pending_op = DEFER_EXTRACT;
     if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
     if (ImGui::MenuItem("New file", "Shift+F4")) { app->op = OP_NEWFILE; app->op_name[0] = '\0'; }
-    if (ImGui::MenuItem("Copy in place", "Shift+F5")) do_copy_in_place(app);
-    if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) do_symlink_other(app);
+    if (ImGui::MenuItem("Copy in place", "Shift+F5")) app->pending_op = DEFER_COPY_IN_PLACE;
+    if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) app->pending_op = DEFER_SYMLINK_OTHER;
     if (ImGui::MenuItem("Count marked", "Ctrl+L")) count_marked_sizes(app);
-    if (ImGui::MenuItem("Fill directory sizes", "Alt+Shift+Enter")) fill_dir_sizes(app);
+    if (ImGui::MenuItem("Fill directory sizes", "Alt+Shift+Enter")) app->pending_op = DEFER_FILL_SIZES;
     if (ImGui::MenuItem("Add to hotlist", "Alt+D")) {
         bool dup = false;
         for (const std::string& s : app->hotlist) if (s == active.current_dir) { dup = true; break; }
@@ -3154,7 +3237,7 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Copy", "Ctrl+C")) clipboard_set(app, active, false);
     if (ImGui::MenuItem("Cut", "Ctrl+X")) clipboard_set(app, active, true);
     // Paste pumps its own progress frames, so it has to run between frames.
-    if (ImGui::MenuItem("Paste", "Ctrl+V")) app->pending_op = 3;
+    if (ImGui::MenuItem("Paste", "Ctrl+V")) app->pending_op = DEFER_PASTE;
     ImGui::Separator();
     if (ImGui::MenuItem("Mark all", "Ctrl+Num+")) select_all_marks(active);
     if (ImGui::MenuItem("Clear marks", "Ctrl+Num-")) clear_marks(active);
@@ -3794,7 +3877,9 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // ---- pack dialog (Alt+F5): Enter packs, Esc cancels, and no other key
     //      reaches the panes while it is up ----
     if (app->pack_open) {
-        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) pack_commit(app);
+        // Enter asks for the pack; the tool runs between frames, because it
+        // blocks and pumps its own progress UI.
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) app->pending_op = DEFER_PACK;
         else if (key == SDLK_ESCAPE) { app->pack_open = false; app->pack_names.clear(); }
         return;
     }
