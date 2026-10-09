@@ -27,7 +27,7 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp)
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
 target_link_libraries(mc-clone PRIVATE imgui)
 target_include_directories(mc-clone PRIVATE src)
 
@@ -35,7 +35,14 @@ target_include_directories(mc-clone PRIVATE src)
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
 # checked without a display.
 enable_testing()
-add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp)
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
 target_link_libraries(test-panes PRIVATE imgui)
 target_include_directories(test-panes PRIVATE src)
 add_test(NAME panes COMMAND test-panes)
+
+# Archive backend. It shells out to zip/unzip, tar and 7z, so the test builds
+# real archives with those same tools and checks the listing parsers, the
+# member round-trip and the progress accounting. No display needed.
+add_executable(test-archive tests/test_archive.cpp src/archive.cpp)
+target_include_directories(test-archive PRIVATE src)
+add_test(NAME archive COMMAND test-archive)
