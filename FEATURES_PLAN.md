@@ -34,7 +34,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | H big items | done except multi-rename | quick search (`AltGr+letter`), `Shift+F1` custom columns, `Ctrl+Shift+F8` tree panel and `Shift+Tab` split view. Multi-rename dropped by decision |
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
-| K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes |
+| K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes; the size rides on `style.FontScaleMain` for every font, because the size passed to `AddFont()` is read once, on the first frame, and never again |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`
 and `font_hinting`. The hinting value is a name and not a number, so a hand-edited config says what the
@@ -53,11 +53,12 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 archive pane mode with its guards and operations including copy-out, the deferred-action table, the
 operation dialog with its destination rules, the font scan with its extension, depth, cap and
 no-duplicates rules, the font fallback when a named file is not a font, the hinting table with its
-name round-trip and its translation to the loader's flags, the framebuffer scale derived from a
+name round-trip and its translation to the loader's flags, the font size reaching the height a frame
+actually draws at for either font, the framebuffer scale derived from a
 window's logical and pixel sizes, the identity strings, the title
 bar's elision, the Options dialog's keys and layout, the menu bar actually being
 drawn, and the quick filter taking the caret with the keys typed straight after
-it) run headless — 1457 checks in `test-panes` plus 220 in `test-archive`:
+it) run headless — 1477 checks in `test-panes` plus 220 in `test-archive`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -100,6 +101,13 @@ from one that is stored and ignored. Whether a 2x monitor is honoured is not rep
 Xvfb on this machine), so the arithmetic is tested instead: `mc_framebuffer_scale()` returns the ratio
 the SDL3 backend writes into `io.DisplayFramebufferScale.x`, and falls back to 1x on a minimized or
 half-measured window.
+Size is checked the same way, and it had a real bug behind it. ImGui since 1.92 bakes glyphs at the
+size the *style* asks for; the size handed to `AddFont()` only becomes that font's default, which
+ImGui reads once, on the first frame, to seed its base size. A slider wired to it therefore set the
+size at startup and did nothing after: the atlas was rebuilt, and the text stayed the same height. The
+test measures `ImGui::GetFontSize()` inside a real frame — the height the UI draws at — for the
+built-in font and for a TrueType file resized after that first frame, and then checks the raster
+followed: a baked `H` at 30 px is most of 30 px tall, not of 13.
 
 ---
 
@@ -598,7 +606,8 @@ Manual checklist (extend per phase):
     `File`, `Commands`, `Options` and `Help` all open at a narrow window width and every entry does what
     its shortcut does — `Rename`, `Copy`, `Move / rename`, `Delete`, `Paste`, `Quit` from `File`; theme and
     sort from `Options`. `Options > Fonts and theme...` opens, with `Esc` closing it: the theme combo
-    repaints immediately, the size slider re-scales the built-in font, and picking a font from the list
+    repaints immediately, the size slider re-scales the text — for the built-in font and for a TrueType
+    font alike — and picking a font from the list
     re-lays-out the whole UI between frames. Typing in the filter box narrows the list and does not move
     the pane's cursor; a `.ttf` that is not a font leaves the built-in font on screen with the reason in
     the dialog, and the settings do not keep the bad path. `mc-clone --version` prints the name, the
@@ -618,4 +627,6 @@ Manual checklist (extend per phase):
     rather than being reinterpreted. On a build without `freetype2` the combo is gone and the dialog
     says the text is rasterized with stb_truetype, which does no hinting. Drag the window to a monitor
     with a different scaling factor, or change the desktop scaling: the text re-sharpens without a
-    restart, and `Help > About` shows the window scale it settled at.
+    restart, and `Help > About` shows the window scale it settled at. The size slider belongs to both
+    fonts: pick a TrueType file, move it, and the file list re-lays-out at the new height — 0 px puts the
+    built-in 13 px back, and the size in the dialog's status line is the height the text is drawn at.

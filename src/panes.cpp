@@ -1334,9 +1334,21 @@ float mc_framebuffer_scale(int logical_w, int pixel_w) {
 // cannot be read is neither fatal nor silent: the built-in font goes back in and
 // the caller is told, which is the difference between a picker that looks broken
 // and one that explains itself.
+//
+// The size does not go where it looks like it should. Since 1.92 ImGui bakes
+// glyphs at the size the *style* asks for - FontSizeBase * FontScaleMain - and the
+// size handed to AddFont() only becomes that font's default, which ImGui reads
+// once, on the first frame, to seed FontSizeBase. Passing the user's size to
+// AddFont() therefore sets the size at startup and never again: the slider moves,
+// the atlas is rebuilt, and the text stays exactly as big as it was. So every font
+// here is added at one reference size and the requested size is carried by
+// FontScaleMain, which is read on every frame. 13 px is not an arbitrary pick: it
+// is the size AddFontDefault() uses for both of its built-in fonts, so the
+// reference and the seeded base are the same number whichever font is loaded.
 bool app_font_apply(const char* path, float size, const char* hinting) {
+    const float kRefSize = 13.0f;
     ImFontAtlas* fonts = ImGui::GetIO().Fonts;
-    ImGui::GetStyle().FontScaleMain = 1.0f;
+    ImGui::GetStyle().FontScaleMain = size > 0.0f ? size / kRefSize : 1.0f;
     fonts->ClearFonts();
 #ifdef MC_HAVE_FREETYPE
     // The loader and its flags belong to the atlas, not to one font, and the
@@ -1353,14 +1365,17 @@ bool app_font_apply(const char* path, float size, const char* hinting) {
         struct stat st;
         bool readable = !stat(path, &st) && S_ISREG(st.st_mode) && st.st_size > 100 &&
                         font_file_looks_readable(path);
-        if (readable && fonts->AddFontFromFileTTF(path, size > 0.0f ? size : 16.0f)) return true;
+        // The reference size, not the requested one: the loader bakes at the size
+        // the style asks for, so a 48 px request is rasterized by FreeType at 48 px
+        // whatever this says.
+        if (readable && fonts->AddFontFromFileTTF(path, kRefSize)) return true;
         fonts->ClearFonts();
         fonts->AddFontDefault();
         return false;
     }
-    // The built-in font is 13px and is scaled rather than re-sized, because the
-    // config's size is absolute and the atlas has no other say in the matter.
-    if (size > 0.0f) ImGui::GetStyle().FontScaleMain = size / 13.0f;
+    // AddFontDefault() chooses between its bitmap face and its scalable one by the
+    // size it expects to reach the screen, which is why the scale is set before
+    // this call and not after: at 20 px the scalable face is the one worth having.
     fonts->AddFontDefault();
     return true;
 }
@@ -3912,8 +3927,9 @@ static void render_options(AppPanes* app) {
         app->font_size = size < 0.0f ? 0.0f : size;
         app->font_dirty = true;
     }
-    ImGui::TextWrapped("0 px is the built-in size: 13 px for the built-in font, "
-                       "16 px for a TrueType font");
+    ImGui::TextWrapped("0 px is the built-in size, 13 px, for any font. The size is a "
+                       "rasterization request and not a stretch: a TrueType font is drawn "
+                       "from its outlines at the size asked for.");
 
     // Hinting sits next to the size because the two are one decision: a size says
     // how tall a glyph is, hinting says how it meets the pixel grid at that size.

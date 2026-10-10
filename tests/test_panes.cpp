@@ -1615,6 +1615,72 @@ static void test_font_apply(AppPanes* app, const std::string& root) {
     ImGui::DestroyContext(ctx);
 }
 
+// The size has to reach the pixels. For a TrueType font it used to stop short of
+// them: the size handed to AddFont() only seeds style.FontSizeBase, which ImGui
+// reads once on the first frame, so moving the slider rebuilt the atlas and left
+// the text exactly as tall as it was. ImGui::GetFontSize() inside a frame is the
+// height the UI actually draws at, so that is what is measured - for both fonts,
+// and for a change made after that first frame.
+static float rendered_font_size() {
+    // This build has no texture backend, so the atlas has to be built by hand
+    // before a frame - which also forces the glyphs to be rasterized at the size
+    // the frame is about to draw at.
+    ImU8* px = nullptr; int w = 0, h = 0;
+    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&px, &w, &h);
+    ImGui::NewFrame();
+    ImGui::Begin("size probe");
+    float fs = ImGui::GetFontSize();
+    ImGui::End();
+    ImGui::Render();
+    return fs;
+}
+
+static void test_font_size() {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(800, 600);
+
+    // The built-in font: the number in the dialog is the height it draws at.
+    CHECK(app_font_apply(nullptr, 0.0f, "default"));
+    CHECK(rendered_font_size() == 13.0f);        // 0 px is the built-in size
+    CHECK(app_font_apply(nullptr, 20.0f, "default"));
+    CHECK(rendered_font_size() == 20.0f);
+    CHECK(app_font_apply(nullptr, 0.0f, "default"));
+    CHECK(rendered_font_size() == 13.0f);        // and 0 px puts it back
+
+    StringList fonts;
+    app_scan_fonts(fonts);
+    if (fonts.empty()) { ImGui::DestroyContext(ctx); return; }   // nothing to measure here
+
+    // A TrueType file resized after the first frame: the case that was broken.
+    CHECK(app_font_apply(fonts[0].c_str(), 13.0f, "default"));
+    CHECK(rendered_font_size() == 13.0f);        // the frame that seeds the base size
+    CHECK(app_font_apply(fonts[0].c_str(), 24.0f, "default"));
+    CHECK(rendered_font_size() == 24.0f);
+    CHECK(app_font_apply(fonts[0].c_str(), 13.0f, "default"));
+    CHECK(rendered_font_size() == 13.0f);
+
+    // One number, either font.
+    CHECK(app_font_apply(nullptr, 18.0f, "default"));
+    float builtin = rendered_font_size();
+    CHECK(app_font_apply(fonts[0].c_str(), 18.0f, "default"));
+    CHECK(rendered_font_size() == builtin);
+
+    // And the glyphs really are that tall. A scale that moved the metrics but not
+    // the raster would satisfy every check above and still show 13 px text.
+    CHECK(app_font_apply(fonts[0].c_str(), 30.0f, "default"));
+    ImFontBaked* big = io.Fonts->Fonts[0]->GetFontBaked(30.0f);
+    CHECK(big != nullptr);
+    if (big) {
+        CHECK(big->Size == 30.0f);
+        ImFontGlyph* h = big->FindGlyph('H');
+        CHECK(h != nullptr);
+        if (h) CHECK(h->Y1 - h->Y0 > 12.0f);     // an H most of 30 px, not of 13
+    }
+    ImGui::DestroyContext(ctx);
+}
+
 // Hinting is a named setting with a real effect on the pixels, so the parts that
 // can drift are each pinned down: the names round-trip through the config, the
 // translation to the loader is the one FreeType documents, every mode survives a
@@ -2315,6 +2381,7 @@ int main() {
     test_ui_id_uniqueness(&app);
     test_font_scan(root);
     test_font_apply(&app, root);
+    test_font_size();
     test_hinting(&app, root);
     test_display_scale();
     test_framebuffer_scale();
