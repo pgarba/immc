@@ -50,8 +50,17 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 archive pane mode with its guards and operations including copy-out, the deferred-action table, the
 operation dialog with its destination rules, the font scan with its extension, depth, cap and
 no-duplicates rules, the font fallback when a named file is not a font, the identity strings, the title
-bar's elision, and the Options dialog's keys and layout) run headless — 1332 checks in `test-panes`
-plus 220 in `test-archive`: `cmake --build build -j4 && (cd build && ctest)`.
+bar's elision, the Options dialog's keys and layout, the menu bar actually being
+drawn, and the quick filter taking the caret with the keys typed straight after
+it) run headless — 1348 checks in `test-panes` plus 220 in `test-archive`:
+`cmake --build build -j4 && (cd build && ctest)`.
+Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
+keyboard-focus request per frame and the last one submitted wins, and the command
+line at the bottom of the window asks on every frame - with offset `-1`, which
+resolved to no focusable item at all, so the command line was never the active
+item and every field that had asked first was ignored. `claim_focus()` marks the
+claim so the command line stands down, it asks for itself with offset 0, and it
+steps back while the filter, a path bar or the Options field holds the keyboard.
 The identity is checked from the terminal too: `ctest` runs `mc-clone --version` and matches the name
 and the version in its output, the one path that has to work with no display at all.
 It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
@@ -81,7 +90,7 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 | `FileEntry` | `filesystem.h:8-13` | `name[256]`, `mode`, `size`, `mtime` — **no path**, so branch view / compare need a path-carrying entry type. |
 | Tabs / history | `panes.h:12-13` `MAX_TABS 8`, `MAX_DIR_HISTORY 32`; `tab_*` @255-277, `push_history/navigate_to/history_back/forward` @204-253 | tab strip rendered by `render_tab_bar` @825. |
 | Windows | `render_quick_view` @1055 (floating child), `render_viewer` @1096, `render_output` @1119, `render_hotlist` @1131, `render_search` @1164, `render_confirm` @1216, `render_about` @1234, `render_properties` @1272, `render_options` (theme, size, font list with a filter), `render_progress_dialog` @530 | quick view is a *floating window*, not a pane replacement. |
-| Menu bar | `app_panes_render` | `File` (the file operations and the internal clipboard, TC's Files menu), `Commands` (the rest), `Options` (theme, font, hidden, columns, sort, trash), `Help` (About). `F10` opens the `Commands` items as a keyboard menu from the same `render_commands_items`, so the two cannot drift. |
+| Menu bar | `app_panes_render` | `File` (the file operations and the internal clipboard, TC's Files menu), `Commands` (the rest), `Options` (theme, font, hidden, columns, sort, trash), `Help` (About). `F10` opens the `Commands` items as a keyboard menu from the same `render_commands_items`, so the two cannot drift. The root window has to carry `ImGuiWindowFlags_MenuBar`: without it `BeginMenuBar()` returns false and the menus exist in the source and nowhere on screen. |
 | File list render | `render_file_list` @850-1053 | table for MID/FULL, `ImGui::Columns` for BRIEF; row backgrounds drawn manually via `GetWindowDrawList`. Right-click popup `ctxmenu` @1007-1048. |
 | Config | `config.h` | persists window geom, font, theme, tabs, `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`. The Options dialog writes the same three fields the startup reads, so what the session showed is what the next one starts with. |
 | Theme | `theme.h` `MCThemeColors` | has `dir/exec/marked_bg/cursor_bg/cursor_outline`; **no diff colors** (needed by compare). |
@@ -568,3 +577,8 @@ Manual checklist (extend per phase):
     the pane's cursor; a `.ttf` that is not a font leaves the built-in font on screen with the reason in
     the dialog, and the settings do not keep the bad path. `mc-clone --version` prints the name, the
     version and the config path in a terminal with no display.
+20. The four menu titles are on screen at the top of the window, not only in the source, and the panes
+    start below them. `Ctrl+S` opens the quick filter with the caret already in the field, so the next
+    keys typed narrow the list instead of landing in the command line; `Ctrl+S` in the other pane focuses
+    that pane's field. With the filter holding the keyboard, `Esc` leaves it and the command line takes
+    the typing back.

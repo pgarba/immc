@@ -112,6 +112,7 @@ AppPanes::AppPanes() {
     about_open = false;
     options_open = false;
     options_field_active = false;
+    focus_claimed = false;
     font_dirty = false;
     font_scanned = false;
     font_size = 0.0f;
@@ -1541,6 +1542,13 @@ static void elide_split(int keep, int* head, int* tail) {
     *tail = keep - *head;
 }
 
+// Ask for the caret to land on the item submitted next. Claiming it keeps the
+// command line's every-frame request from overwriting it later in the frame.
+static void claim_focus(AppPanes* app) {
+    ImGui::SetKeyboardFocusHere();
+    app->focus_claimed = true;
+}
+
 static std::string elide_middle(const char* s, float max_w) {
     if (ImGui::CalcTextSize(s).x <= max_w) return s;
     const char* gap = "...";
@@ -1763,10 +1771,7 @@ static void render_op_dialog(AppPanes* app) {
         ImGui::Spacing();
 
         pack_fill("To:");
-        if (app->op_focus_request) {
-            ImGui::SetKeyboardFocusHere();
-            app->op_focus_request = false;
-        }
+        if (app->op_focus_request) { claim_focus(app); app->op_focus_request = false; }
         ImGui::InputText("To:", app->op_name, sizeof(app->op_name));
         if (plan.archive.empty())
             text_wrap_disabled("End with / (or name a folder that exists) and every item keeps its "
@@ -1792,10 +1797,7 @@ static void render_op_dialog(AppPanes* app) {
         const char* field = app->op == OP_RENAME ? "New name:"
                           : app->op == OP_NEWFILE ? "File name:" : "Directory name:";
         pack_fill(field);
-        if (app->op_focus_request) {
-            ImGui::SetKeyboardFocusHere();
-            app->op_focus_request = false;
-        }
+        if (app->op_focus_request) { claim_focus(app); app->op_focus_request = false; }
         ImGui::InputText(field, app->op_name, sizeof(app->op_name));
     }
 
@@ -3680,8 +3682,10 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
     ImGui::PushStyleColor(ImGuiCol_FrameBg, mc_theme_colors()->title_unfocused);
     ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, mc_theme_colors()->title_unfocused);
     ImGui::SetNextItemWidth(-FLT_MIN);
+    // Focus the field itself. Offset -1 would mean the item submitted *before*
+    // this call - the path bar above - so Ctrl+S looked like it did nothing.
     if (pane.filter_focus_request) {
-        ImGui::SetKeyboardFocusHere(-1);
+        claim_focus(app);
         pane.filter_focus_request = false;
     }
     ImGui::PushID(id);
@@ -3964,15 +3968,22 @@ void app_panes_render(AppPanes* app) {
     Pane& left = app->left;
     Pane& right = app->right;
 
+    // ImGui answers one keyboard-focus request per frame, and the last one
+    // submitted wins. The command line at the bottom asks on every frame, so any
+    // field that wants the caret has to claim it here and be left alone after.
+    app->focus_claimed = false;
+
     // Fullscreen main window (MC-style, no decorations)
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(io.DisplaySize);
     ImGui::Begin("Midnight Commander", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoScrollbar);
+                 ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar);
 
-    // Top menu bar. The Commands items also back the F10 keyboard menu.
+    // Top menu bar. BeginMenuBar() draws nothing unless the window carries
+    // ImGuiWindowFlags_MenuBar, so the flag belongs to this Begin, not here.
+    // The Commands items also back the F10 keyboard menu.
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             render_file_items(app);
@@ -4040,10 +4051,7 @@ void app_panes_render(AppPanes* app) {
     ImGui::PushStyleColor(ImGuiCol_Text, l_text);
     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(1.0f, 1.0f, 1.0f, 0.3f));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (left.path_focus_request) {
-        ImGui::SetKeyboardFocusHere();
-        left.path_focus_request = false;
-    }
+    if (left.path_focus_request) { claim_focus(app); left.path_focus_request = false; }
     ImGui::InputText("##leftpath", left.path_edit, sizeof(left.path_edit));
     left.path_edit_active = ImGui::IsItemActive();
     if (left.path_edit_active) {
@@ -4077,10 +4085,7 @@ void app_panes_render(AppPanes* app) {
     ImGui::PushStyleColor(ImGuiCol_Text, r_text);
     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(1.0f, 1.0f, 1.0f, 0.3f));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (right.path_focus_request) {
-        ImGui::SetKeyboardFocusHere();
-        right.path_focus_request = false;
-    }
+    if (right.path_focus_request) { claim_focus(app); right.path_focus_request = false; }
     ImGui::InputText("##rightpath", right.path_edit, sizeof(right.path_edit));
     right.path_edit_active = ImGui::IsItemActive();
     if (right.path_edit_active) {
@@ -4130,9 +4135,14 @@ void app_panes_render(AppPanes* app) {
         ImGui::TextUnformatted("$");
         ImGui::SameLine();
         bool allow_cmd_focus = (app->confirm == CONF_NONE) && (app->active_path_pane < 0) &&
-                               !app->search_input_active && (app->op == OP_NONE);
-        if (allow_cmd_focus)
-            ImGui::SetKeyboardFocusHere(-1);
+                               !app->search_input_active && (app->op == OP_NONE) &&
+                               !left.filter_field_active && !right.filter_field_active &&
+                               !app->options_field_active;
+        // Offset 0 means this field. With -1 the request resolved to whatever
+        // item came before it, which was nothing focusable, so the command line
+        // was never the active item and any earlier request got thrown away.
+        if (allow_cmd_focus && !app->focus_claimed)
+            ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-status_w - 1.0f);
         ImGui::InputText("##cmdline", app->cmd, sizeof(app->cmd));
         if (shown[0]) {

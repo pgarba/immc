@@ -1813,6 +1813,116 @@ static void test_options_dialog_layout(AppPanes* app) {
     ImGui::DestroyContext(ctx);
 }
 
+// The menu bar only exists if the window it belongs to asks for it: BeginMenuBar()
+// returns false without ImGuiWindowFlags_MenuBar, which leaves four menus in the
+// source and a blank strip on screen. Measuring the titles is not enough - that
+// passes either way - so this asks ImGui what the window actually drew.
+static void test_menu_bar(AppPanes* app) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(900, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    for (int f = 0; f < 2; f++) {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    }
+    ImGuiWindow* root = ImGui::FindWindowByName("Midnight Commander");
+    CHECK(root != nullptr);
+    if (root) {
+        CHECK(root->MenuBarHeight > 0.0f);                                  // the flag is set
+        CHECK(root->DC.NavLayersActiveMask & (1 << ImGuiNavLayer_Menu));    // and the bar ran
+        // The panes start below the bar rather than underneath it.
+        // The bar sits at the top of the window and the panes are drawn under
+        // it, so the strip is not sitting on top of the file list.
+        ImRect bar = root->MenuBarRect();
+        CHECK(bar.Min.x == root->Pos.x && bar.Min.y == root->Pos.y);
+        CHECK(bar.Max.y > bar.Min.y && root->DC.CursorMaxPos.y > bar.Max.y);
+    }
+    ImGui::DestroyContext(ctx);
+}
+
+// Ctrl+S opens the quick filter and puts the caret in it, so the keys typed
+// straight after belong to the filter and not to the pane behind it.
+static void test_filter_focus(AppPanes* app, const std::string& root) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(900, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    // ImGui resolves a focus request at the start of the next frame, so a frame
+    // is not enough to see the result - one more is.
+    auto frame = [app](int n) {
+        for (int i = 0; i < n; i++) {
+            ImGui::NewFrame();
+            app_panes_render(app);
+            ImGui::Render();
+        }
+    };
+
+    Pane& pane = app->left;
+    refresh_pane(&pane, root.c_str());
+    app->left_focus = true;
+    pane.filter[0] = '\0';
+    pane.filter_active = false;
+    pane.filter_focus_request = false;
+    pane.filter_field_active = false;
+
+    app_panes_handle_key(app, SDLK_S, SDL_KMOD_CTRL);
+    CHECK(pane.filter_active);
+    CHECK(pane.filter_focus_request);
+
+    frame(2);
+    // The field itself, not the row above it: SetKeyboardFocusHere(-1) asked for
+    // the previous item and the caret landed nowhere the user could see.
+    CHECK(pane.filter_field_active);
+
+    // And typing works from that frame on, fed the way the SDL backend feeds it.
+    io.AddInputCharacter('g');
+    io.AddInputCharacter('a');
+    frame(1);
+    CHECK(!strcmp(pane.filter, "ga"));
+    CHECK(pane.filter_field_active);
+
+    // The filter is live: the view shrinks to what matches, and the row the
+    // cursor sits on is one of them.
+    rebuild_view(pane);
+    CHECK(pane.view.size() > 0);
+    for (int i = 0; i < (int)pane.view.size(); i++) {
+        const char* name = pane.entries[pane.view[i]]->name;
+        if (!strcmp(name, "..")) continue;   // the parent row always stays
+        CHECK(filter_matches(name, pane.filter));
+    }
+    CHECK(strcmp(pane.filter_applied, "ga") == 0);
+
+    // Ctrl+S in the other pane focuses that pane's field, not the first one.
+    app->left.filter_field_active = false;
+    app->left_focus = false;
+    refresh_pane(&app->right, root.c_str());
+    app->right.filter[0] = '\0';
+    app->right.filter_active = false;
+    app->right.filter_field_active = false;
+    app_panes_handle_key(app, SDLK_S, SDL_KMOD_CTRL);
+    CHECK(app->right.filter_focus_request);
+    frame(2);
+    CHECK(app->right.filter_field_active);
+    CHECK(!app->left.filter_field_active);
+
+    app->left.filter[0] = '\0';
+    app->left.filter_active = false;
+    app->right.filter[0] = '\0';
+    app->right.filter_active = false;
+    app->right.filter_field_active = false;
+    app->left_focus = true;
+    rebuild_view(app->left);
+    ImGui::DestroyContext(ctx);
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -1903,6 +2013,8 @@ int main() {
     test_options_config(&app);
     test_options_keys(&app);
     test_options_dialog_layout(&app);
+    test_menu_bar(&app);
+    test_filter_focus(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

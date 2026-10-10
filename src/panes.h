@@ -294,6 +294,10 @@ public:
     // frames, next to the other things that cannot run inside one.
     bool  options_open;
     bool  options_field_active; // the font filter holds the keyboard this frame
+    // ImGui keeps one keyboard-focus request per frame and the last one wins, so
+    // whoever asks first has to say so: the command line at the bottom of the
+    // window asks on every frame. Transient, never saved.
+    bool  focus_claimed;
     char  theme[64];        // a name from mc_theme_list()
     char  font[1024];       // path to a .ttf/.otf; empty = the built-in font
     float font_size;        // px; 0 = the built-in default size
