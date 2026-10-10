@@ -1584,11 +1584,11 @@ static void test_font_apply(AppPanes* app, const std::string& root) {
     // A file big enough to try but not a font: the loader refuses it and the
     // built-in font goes back in.
     snprintf(app->font, sizeof(app->font), "%s/badfonts/bigjunk.ttf", root.c_str());
-    CHECK(!app_font_apply(app->font, 18.0f));
+    CHECK(!app_font_apply(app->font, 18.0f, "default"));
     CHECK(ImGui::GetIO().Fonts->Fonts.Size > 0);
 
     // A path that does not exist at all.
-    CHECK(!app_font_apply("/nonexistent/no-such-font.ttf", 18.0f));
+    CHECK(!app_font_apply("/nonexistent/no-such-font.ttf", 18.0f, "default"));
 
     // A real font, when this machine has one.
     StringList fonts;
@@ -1606,13 +1606,191 @@ static void test_font_apply(AppPanes* app, const std::string& root) {
     // built-in size back.
     app->font[0] = '\0';
     app->font_size = 20.0f;
-    CHECK(app_font_apply(app->font, app->font_size));
+    CHECK(app_font_apply(app->font, app->font_size, app->hinting));
     CHECK(ImGui::GetStyle().FontScaleMain > 1.4f);
     app->font_size = 0.0f;
-    CHECK(app_font_apply(app->font, app->font_size));
+    CHECK(app_font_apply(app->font, app->font_size, app->hinting));
     CHECK(ImGui::GetStyle().FontScaleMain == 1.0f);
 
     ImGui::DestroyContext(ctx);
+}
+
+// Hinting is a named setting with a real effect on the pixels, so the parts that
+// can drift are each pinned down: the names round-trip through the config, the
+// translation to the loader is the one FreeType documents, every mode survives a
+// real font, and the loader is actually installed rather than merely available.
+// A build without FreeType has the vocabulary but nothing to honour it, and says
+// which rasterizer it has instead of pretending otherwise.
+static void test_hinting(AppPanes* app, const std::string& root) {
+    int n = 0;
+    const char* const* names = mc_hinting_list(&n);
+    CHECK(n > 0);
+    for (int i = 0; i < n; i++) {
+        CHECK(names[i][0] != '\0');
+        CHECK(mc_hinting_index(names[i]) == i);   // the picker's row is the config's name
+    }
+    CHECK(mc_hinting_index("ultra-crisp") == -1); // a hand-edited config is not guessed at
+    CHECK(mc_hinting_index("") == -1);
+    CHECK(mc_hinting_index(NULL) == -1);
+
+    // Each mode asks for something different, and "default" asks for nothing:
+    // it is the loader's own choice, not an invention of this app.
+    unsigned int f_def  = mc_freetype_loader_flags("default");
+    unsigned int f_none = mc_freetype_loader_flags("none");
+    unsigned int f_lite = mc_freetype_loader_flags("light");
+    unsigned int f_mono = mc_freetype_loader_flags("mono");
+    unsigned int f_hard = mc_freetype_loader_flags("mono (no smoothing)");
+    CHECK(f_def == 0);
+    CHECK(f_none != f_def && f_lite != f_def && f_mono != f_def);
+    CHECK(f_lite != f_mono && f_mono != f_hard && f_none != f_hard);
+    // An unknown name falls back to that same default rather than to a random bit.
+    CHECK(mc_freetype_loader_flags("ultra-crisp") == f_def);
+    CHECK(mc_freetype_loader_flags(NULL) == f_def);
+#ifdef MC_HAVE_FREETYPE
+    CHECK(f_none == (unsigned int)ImGuiFreeTypeLoaderFlags_NoHinting);
+    CHECK(f_lite == (unsigned int)ImGuiFreeTypeLoaderFlags_LightHinting);
+    CHECK(f_mono == (unsigned int)ImGuiFreeTypeLoaderFlags_MonoHinting);
+    CHECK(f_hard == (unsigned int)(ImGuiFreeTypeLoaderFlags_MonoHinting |
+                                   ImGuiFreeTypeLoaderFlags_Monochrome));
+#endif
+
+    char raster[64];
+    mc_font_rasterizer(raster, sizeof(raster));
+    CHECK(raster[0] != '\0');
+#ifdef MC_HAVE_FREETYPE
+    CHECK(mc_font_hinting_available());
+    CHECK(strstr(raster, "FreeType") == raster);   // named, with a version to look up
+#else
+    CHECK(!mc_font_hinting_available());
+    CHECK(!strcmp(raster, "stb_truetype"));
+#endif
+
+    // The setting survives a session, and a name this build does not know is
+    // dropped on the way back in instead of being reinterpreted.
+    MCConfig cfg;
+    mc_config_default(&cfg);
+    CHECK(!strcmp(cfg.hinting, "default"));
+    snprintf(app->hinting, sizeof(app->hinting), "mono");
+    app_panes_save_state(app, &cfg);
+    CHECK(!strcmp(cfg.hinting, "mono"));
+    AppPanes next;
+    app_panes_apply_state(&next, &cfg);
+    CHECK(!strcmp(next.hinting, "mono"));
+
+    snprintf(cfg.hinting, sizeof(cfg.hinting), "ultra-crisp");
+    snprintf(next.hinting, sizeof(next.hinting), "default");
+    app_panes_apply_state(&next, &cfg);
+    CHECK(!strcmp(next.hinting, "default"));
+    cfg.hinting[0] = '\0';
+    app_panes_apply_state(&next, &cfg);
+    CHECK(!strcmp(next.hinting, "default"));
+    snprintf(app->hinting, sizeof(app->hinting), "default");
+
+    // Now the pixels. Every mode has to survive a real atlas rebuild, and with
+    // FreeType the atlas has to answer to FreeType - an atlas still on
+    // stb_truetype would ignore every mode below, and this test would pass while
+    // the setting did nothing at all.
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    app_font_apply(nullptr, 0.0f, "default");
+#ifdef MC_HAVE_FREETYPE
+    CHECK(io.Fonts->FontLoader == ImGuiFreeType::GetFontLoader());
+#endif
+
+    StringList fonts;
+    app_scan_fonts(fonts);
+    const char* file = fonts.empty() ? nullptr : fonts[0].c_str();
+    for (int i = 0; i < n; i++) {
+        CHECK(app_font_apply(nullptr, 0.0f, names[i]));
+        CHECK(io.Fonts->Fonts.Size > 0);
+        // The mode reached the loader, not just the settings.
+#ifdef MC_HAVE_FREETYPE
+        CHECK(io.Fonts->FontLoaderFlags == mc_freetype_loader_flags(names[i]));
+#endif
+        // Force the rasterization: a mode the loader cannot combine with a real
+        // face is a failure waiting for a click, and it shows up here as glyphs
+        // that never get baked.
+        ImFontBaked* baked = io.Fonts->Fonts[0]->GetFontBaked(18.0f);
+        CHECK(baked != nullptr);
+        if (!file) continue;
+        CHECK(app_font_apply(file, 18.0f, names[i]));
+        CHECK(io.Fonts->Fonts.Size > 0);
+        ImFontBaked* fb = io.Fonts->Fonts[0]->GetFontBaked(18.0f);
+        CHECK(fb != nullptr);
+        if (fb) CHECK(fb->Size > 0.0f);
+    }
+
+#ifdef MC_HAVE_FREETYPE
+    // And the flag reaches FreeType instead of being stored and ignored: the same
+    // face at the same size lands on different pixels under "none" and under
+    // "mono". Geometry is what hinting moves - corners and advance, snapped to the
+    // grid or not - so geometry is what is compared. Without this check a loader
+    // that quietly dropped the flags would pass every assertion above.
+    if (file) {
+        const char* pair[] = { "none", "mono" };
+        const char* glyphs[] = { "A", "i", "m", "8", "o" };
+        float before[5][3], after[5][3];
+        memset(before, 0, sizeof(before));
+        memset(after, 0, sizeof(after));
+        for (int pass = 0; pass < 2; pass++) {
+            CHECK(app_font_apply(file, 18.0f, pair[pass]));
+            ImFontBaked* b = io.Fonts->Fonts[0]->GetFontBaked(18.0f);
+            CHECK(b != nullptr);
+            if (!b) break;
+            for (int g = 0; g < 5; g++) {
+                ImFontGlyph* gl = b->FindGlyph((ImWchar)glyphs[g][0]);
+                if (!gl) continue;
+                (pass ? after : before)[g][0] = gl->X0;
+                (pass ? after : before)[g][1] = gl->X1;
+                (pass ? after : before)[g][2] = gl->AdvanceX;
+            }
+        }
+        bool moved = false;
+        for (int g = 0; g < 5; g++)
+            for (int k = 0; k < 3; k++)
+                if (before[g][k] != after[g][k]) moved = true;
+        CHECK(moved);       // hinting put the glyphs somewhere else on the grid
+    }
+#endif
+    ImGui::DestroyContext(ctx);
+}
+
+// The density the glyphs are baked at is a measured property of the window, not a
+// preference: it changes when the window moves to another monitor, and every
+// glyph on screen is then wrong until the atlas is rebuilt.
+static void test_display_scale() {
+    AppPanes a;
+    CHECK(a.display_scale == 1.0f);
+
+    CHECK(app_panes_set_display_scale(&a, 2.0f));    // moved to a 2x display
+    CHECK(a.display_scale == 2.0f);
+    CHECK(a.font_dirty);                             // the rebuild is queued, not done here
+
+    a.font_dirty = false;                            // main.cpp applied it between frames
+    CHECK(!app_panes_set_display_scale(&a, 2.0f));   // the same scale is not an event
+    CHECK(!a.font_dirty);
+
+    CHECK(app_panes_set_display_scale(&a, 1.25f));   // desktop scaling changed
+    CHECK(a.display_scale == 1.25f);
+    CHECK(app_panes_set_display_scale(&a, 0.0f));    // nonsense clamps instead of dividing by it
+    CHECK(a.display_scale == 1.0f);
+}
+
+// The density is derived from two measurements SDL makes about the window, and
+// the derivation has to agree with what ImGui's SDL3 backend writes into
+// io.DisplayFramebufferScale.x, because that is what the glyphs are baked at.
+static void test_framebuffer_scale() {
+    CHECK(mc_framebuffer_scale(1200, 2400) == 2.0f);   // a 2x display
+    CHECK(mc_framebuffer_scale(1200, 1200) == 1.0f);   // a 1x display
+    CHECK(mc_framebuffer_scale(1280, 1600) == 1.25f);  // 125% desktop scaling
+    CHECK(mc_framebuffer_scale(1200, 3600) == 3.0f);   // a 3x display
+    // A minimized window reports no logical size, and a mode change can report a
+    // pixel size before the logical one. Neither is a scale of zero: text would be
+    // baked at zero size and the screen would go blank.
+    CHECK(mc_framebuffer_scale(0, 2400) == 1.0f);
+    CHECK(mc_framebuffer_scale(1200, 0) == 1.0f);
+    CHECK(mc_framebuffer_scale(-1200, -2400) == 1.0f);
 }
 
 // Who the build says it is, in one line for a terminal and in a block for the
@@ -1633,6 +1811,7 @@ static void test_identity(AppPanes* app) {
     CHECK(strstr(about, MC_APP_BINARY) != NULL);
     CHECK(strstr(about, "Dear ImGui") != NULL);
     CHECK(strstr(about, "settings ") != NULL);
+    CHECK(strstr(about, "rasterized with ") != NULL);   // which loader this build has
     CHECK(strstr(about, "archive tools found: ") != NULL);
     // The About window is a paragraph, not a wall: it stays inside its buffer.
     CHECK(strlen(about) < sizeof(about) - 1);
@@ -1803,6 +1982,26 @@ static void test_options_dialog_layout(AppPanes* app) {
         if (i) mw += st.ItemSpacing.x;
     }
     CHECK(mw <= io.DisplaySize.x);
+
+    // The hinting block is drawn and not merely compiled: its one-line
+    // explanation differs per mode, so the mode with the longer note makes the
+    // dialog taller - and the wider note still has to stay inside the frame.
+    if (mc_font_hinting_available()) {
+        auto bottom_with = [&](const char* mode) -> float {
+            snprintf(app->hinting, sizeof(app->hinting), "%s", mode);
+            for (int f = 0; f < 2; f++) {
+                ImGui::NewFrame();
+                app_panes_render(app);
+                ImGui::Render();
+            }
+            ImGuiWindow* d = ImGui::FindWindowByName("Options");
+            if (d) CHECK(d->DC.CursorMaxPos.x <= d->Pos.x + d->Size.x + 0.5f);
+            return d ? d->DC.CursorMaxPos.y : 0.0f;
+        };
+        CHECK(bottom_with("default") > 0.0f);
+        CHECK(bottom_with("none") > bottom_with("default"));
+        snprintf(app->hinting, sizeof(app->hinting), "default");
+    }
 
     app->options_open = false;
     app->options_field_active = false;
@@ -2116,6 +2315,9 @@ int main() {
     test_ui_id_uniqueness(&app);
     test_font_scan(root);
     test_font_apply(&app, root);
+    test_hinting(&app, root);
+    test_display_scale();
+    test_framebuffer_scale();
     test_identity(&app);
     test_title(&app);
     test_options_config(&app);

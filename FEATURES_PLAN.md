@@ -34,8 +34,11 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | H big items | done except multi-rename | quick search (`AltGr+letter`), `Shift+F1` custom columns, `Ctrl+Shift+F8` tree panel and `Shift+Tab` split view. Multi-rename dropped by decision |
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
+| K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes |
 
-Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash` and `columns`.
+Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`
+and `font_hinting`. The hinting value is a name and not a number, so a hand-edited config says what the
+dialog shows and a name this build does not recognise is dropped back to `default` rather than guessed at.
 
 **Archives (§6) closed the last missing binding**, and inside an archive `F5` copies the marked
 members out into the other pane, as TC's does. Four rows stay partial, each a deliberate shape
@@ -49,10 +52,12 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 `fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, the
 archive pane mode with its guards and operations including copy-out, the deferred-action table, the
 operation dialog with its destination rules, the font scan with its extension, depth, cap and
-no-duplicates rules, the font fallback when a named file is not a font, the identity strings, the title
+no-duplicates rules, the font fallback when a named file is not a font, the hinting table with its
+name round-trip and its translation to the loader's flags, the framebuffer scale derived from a
+window's logical and pixel sizes, the identity strings, the title
 bar's elision, the Options dialog's keys and layout, the menu bar actually being
 drawn, and the quick filter taking the caret with the keys typed straight after
-it) run headless — 1348 checks in `test-panes` plus 220 in `test-archive`:
+it) run headless — 1457 checks in `test-panes` plus 220 in `test-archive`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -86,6 +91,15 @@ hovering it raised ImGui's "visible items with conflicting ID" box. Sweeping a v
 rendered UI and reading ImGui's own conflict counter turns that into a check — ImGui only counts items
 answering to the ID hovered last frame, which is exactly what a hover does.
 Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
+Text rendering is the one area where a headless check can only go so far, so it is checked as far as
+it can: the test asserts the atlas really answers to the FreeType loader (`io.Fonts->FontLoader ==
+ImGuiFreeType::GetFontLoader()`) rather than merely that the library was linked, that the mode name
+reaches the loader as flags, and that the flags change the raster — the same face at the same size
+lands on different pixels under `none` than under `mono`, which is what separates a working setting
+from one that is stored and ignored. Whether a 2x monitor is honoured is not reproducible here (no
+Xvfb on this machine), so the arithmetic is tested instead: `mc_framebuffer_scale()` returns the ratio
+the SDL3 backend writes into `io.DisplayFramebufferScale.x`, and falls back to 1x on a minimized or
+half-measured window.
 
 ---
 
@@ -102,7 +116,8 @@ Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 | Windows | `render_quick_view` @1055 (floating child), `render_viewer` @1096, `render_output` @1119, `render_hotlist` @1131, `render_search` @1164, `render_confirm` @1216, `render_about` @1234, `render_properties` @1272, `render_options` (theme, size, font list with a filter), `render_progress_dialog` @530 | quick view is a *floating window*, not a pane replacement. |
 | Menu bar | `app_panes_render` | `File` (the file operations and the internal clipboard, TC's Files menu), `Commands` (the rest), `Options` (theme, font, hidden, columns, sort, trash), `Help` (About). `F10` opens the `Commands` items as a keyboard menu from the same `render_commands_items`, so the two cannot drift. The root window has to carry `ImGuiWindowFlags_MenuBar`: without it `BeginMenuBar()` returns false and the menus exist in the source and nowhere on screen. |
 | File list render | `render_file_list` @850-1053 | table for MID/FULL, `ImGui::Columns` for BRIEF; row backgrounds drawn manually via `GetWindowDrawList`. Right-click popup `ctxmenu` @1007-1048. |
-| Config | `config.h` | persists window geom, font, theme, tabs, `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`. The Options dialog writes the same three fields the startup reads, so what the session showed is what the next one starts with. |
+| Config | `config.h` | persists window geom, font, theme, tabs, `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`, `font_hinting`. The Options dialog writes the same three fields the startup reads, so what the session showed is what the next one starts with. |
+| Text rendering | `panes.cpp` `kHintingModes`/`mc_freetype_loader_flags`/`app_font_apply`, `mc_framebuffer_scale`; `main.cpp` window creation and `SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED` | The hinting table is one array of `{name, bits, note}`: the name is what the config stores and what the combo shows, the note is the line the dialog says about the cost of picking it. `mc_freetype_loader_flags()` is the only place the app's names meet FreeType's flags, and it compiles in a build without FreeType, where there is a vocabulary to remember but nothing to honour it. The window is created with `SDL_WINDOW_HIGH_PIXEL_DENSITY`; without it the compositor stretches a 1x framebuffer and every glyph is a bitmap blown up to twice its size. |
 | Theme | `theme.h` `MCThemeColors` | has `dir/exec/marked_bg/cursor_bg/cursor_outline`; **no diff colors** (needed by compare). |
 
 ---
@@ -533,6 +548,7 @@ handler to keep that honest.
 | 14 | archive `F5` copy-out, folder extraction | 1h | — |
 | 15 | operation dialog for `F5`/`F6`/`F7`/`F2`/`Shift+F4` | 2h | — |
 | 16 | app identity, title bar, menu bar, Options dialog | 2h | — |
+| 17 | FreeType loader, hinting mode, high-DPI window | 2h | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -594,3 +610,12 @@ Manual checklist (extend per phase):
     keys typed narrow the list instead of landing in the command line; `Ctrl+S` in the other pane focuses
     that pane's field. With the filter holding the keyboard, `Esc` leaves it and the command line takes
     the typing back.
+21. `mc-clone --version` says which rasterizer the build has. In `Options > Fonts and theme...` the
+    hinting combo offers the five modes and one line under it says what picking one costs; switching to
+    `mono` at 13-15 px makes the stems land on whole pixels, `none` makes them grey, and `light` keeps
+    the spacing between glyphs. The choice survives a restart, and so does a hand-edited
+    `font_hinting = mono` in the config; a name that is not one of the five comes back as `default`
+    rather than being reinterpreted. On a build without `freetype2` the combo is gone and the dialog
+    says the text is rasterized with stb_truetype, which does no hinting. Drag the window to a monitor
+    with a different scaling factor, or change the desktop scaling: the text re-sharpens without a
+    restart, and `Help > About` shows the window scale it settled at.

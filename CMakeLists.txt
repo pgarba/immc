@@ -33,6 +33,20 @@ target_include_directories(imgui PUBLIC
 )
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
+# Font rasterization. ImGui's built-in loader is stb_truetype, which does no
+# hinting at all: stems land between pixels and come out grey. The FreeType
+# loader ImGui ships in misc/ does, and hinting is what makes small monospace
+# text legible. It stays optional - without freetype2 the app builds and runs on
+# stb_truetype, and the Options dialog says so instead of offering a choice it
+# cannot honour.
+find_package(Freetype QUIET)
+if (TARGET Freetype::Freetype)
+    target_sources(imgui PRIVATE ${IMGUI_DIR}/misc/freetype/imgui_freetype.cpp)
+    target_include_directories(imgui PUBLIC ${IMGUI_DIR}/misc/freetype)
+    target_link_libraries(imgui PUBLIC Freetype::Freetype)
+    target_compile_definitions(imgui PUBLIC MC_HAVE_FREETYPE)
+endif()
+
 # Build the application
 add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
 target_link_libraries(mc-clone PRIVATE imgui)

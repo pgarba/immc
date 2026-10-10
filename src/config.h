@@ -12,6 +12,10 @@ struct MCConfig {
     int   win_w, win_h;   // window size
     char  font[1024];     // path to a .ttf/.otf font; empty = built-in font
     float font_size;      // font size in px; 0 = built-in default
+    char  hinting[32];    // how glyphs meet the pixel grid: default | none | light |
+                          // mono | "mono (no smoothing)". Names, not numbers, so a
+                          // hand-edited config says what the dialog shows, and a
+                          // number cannot mean something different next release.
     char  theme[64];      // dark | light | classic | gruvbox | gruvbox-light |
                           // solarized-dark | solarized-light
 

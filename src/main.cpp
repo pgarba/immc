@@ -33,9 +33,18 @@ static int print_version(void) {
     char settings[1200];
     snprintf(settings, sizeof(settings), "settings %s\n", cfgp);
 
+    // Which rasterizer this build has is the first thing a packager wants to know:
+    // it decides whether the hinting setting in the config means anything at all.
+    char raster[64];
+    mc_font_rasterizer(raster, sizeof(raster));
+    char font_line[160];
+    snprintf(font_line, sizeof(font_line), "text rasterized with %s%s\n", raster,
+             mc_font_hinting_available() ? " (hinting selectable)" : " (no hinting available)");
+
     fputs(line, stdout); fputc('\n', stdout);
     fputs(built, stdout);
     fputs(settings, stdout);
+    fputs(font_line, stdout);
     return 0;
 }
 
@@ -48,6 +57,18 @@ static int print_usage(const char* argv0) {
              name ? name + 1 : MC_APP_BINARY, MC_APP_NAME, MC_VERSION);
     fputs(line, stdout);
     return 0;
+}
+
+// The window's framebuffer scale: device pixels per logical pixel. SDL's
+// SDL_GetWindowDisplayScale() additionally folds in the desktop content scale,
+// which is about how large the window should look rather than how many pixels a
+// glyph gets, so it is not the number the font atlas wants.
+static float window_pixel_scale(SDL_Window* window)
+{
+    int w = 0, h = 0, pw = 0, ph = 0;
+    SDL_GetWindowSize(window, &w, &h);
+    SDL_GetWindowSizeInPixels(window, &pw, &ph);
+    return mc_framebuffer_scale(w, pw);
 }
 
 int main(int argc, char** argv)
@@ -79,7 +100,7 @@ int main(int argc, char** argv)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_WindowFlags window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+    SDL_WindowFlags window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     // Create with the saved position baked in: setting the position after
     // creation gets overridden by the window manager when it maps the window.
     SDL_Window* window;
@@ -90,6 +111,11 @@ int main(int argc, char** argv)
         SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, cfg.win_h);
         SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
         SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true);
+        // High-DPI: ask for a framebuffer in device pixels. Without this the window
+        // is given a 1x framebuffer and the compositor stretches it over the real
+        // one, so on a 2x display every glyph is a 1x bitmap blown up to twice its
+        // size - the usual reason a whole app looks soft on a laptop screen.
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true);
         SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER,
                               (cfg.win_x >= 0 && cfg.win_y >= 0) ? cfg.win_x : SDL_WINDOWPOS_CENTERED);
         SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER,
@@ -124,8 +150,18 @@ int main(int argc, char** argv)
     // Style and font come from the panes' state, which apply_state filled from
     // the config: the Options dialog and the startup path read the same three
     // values, so a theme or font the dialog changed is already in effect here.
+    //
+    // The density is settled before the font is baked, not after. ImGui rasterizes
+    // glyphs at io.DisplayFramebufferScale, and AddFontDefault() chooses between
+    // its two built-in fonts by the size that will reach the screen - both decide
+    // during the call below, and neither has seen a frame yet.
+    float scale = window_pixel_scale(window);
+    io.DisplayFramebufferScale = ImVec2(scale, scale);
+    app_panes_set_display_scale(panes, scale);
+
     mc_apply_theme(panes->theme);
-    app_font_apply(panes->font, panes->font_size);
+    app_font_apply(panes->font, panes->font_size, panes->hinting);
+    panes->font_dirty = false;   // the scale that change asked for is already baked in
 
     // Main loop
     bool done = false;
@@ -138,6 +174,18 @@ int main(int argc, char** argv)
         {
             if (event.type == SDL_EVENT_QUIT)
                 done = true;
+
+            // The window moved to a monitor with another density, or the desktop
+            // scaling changed under it: the glyphs on screen were rasterized for
+            // the old one, so the atlas goes back on the list to be rebuilt.
+            if (event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED ||
+                event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                if (event.window.windowID == SDL_GetWindowID(window)) {
+                    float s = window_pixel_scale(window);
+                    io.DisplayFramebufferScale = ImVec2(s, s);
+                    app_panes_set_display_scale(panes, s);
+                }
+            }
 
             if (event.type == SDL_EVENT_KEY_DOWN) {
                 SDL_Keycode k = event.key.key;

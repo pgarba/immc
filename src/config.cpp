@@ -33,6 +33,7 @@ void mc_config_default(MCConfig* c) {
     c->win_w = 1280; c->win_h = 800;
     c->font[0] = '\0';
     c->font_size = 0.0f;
+    snprintf(c->hinting, sizeof(c->hinting), "default");
     snprintf(c->theme, sizeof(c->theme), "dark");
     c->filter_preset[0] = '\0';
     c->view_mode = 0;      // VIEW_MID
@@ -77,6 +78,7 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "window_h"))  c->win_h = atoi(val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
+        else if (!strcmp(key, "font_hinting")) snprintf(c->hinting, sizeof(c->hinting), "%s", val);
         else if (!strcmp(key, "theme"))     snprintf(c->theme, sizeof(c->theme), "%s", val);
         else if (!strcmp(key, "filter_preset")) snprintf(c->filter_preset, sizeof(c->filter_preset), "%s", val);
         else if (!strcmp(key, "view_mode"))   c->view_mode = atoi(val);
@@ -143,6 +145,15 @@ void mc_config_save(const MCConfig* c) {
         "# Font size in px (0 = built-in default)\n"
         "font_size = %g\n"
         "\n"
+        "# How glyphs meet the pixel grid. One of:\n"
+        "#   default                 the font's own hinter, normal strength\n"
+        "#   none                    no hinting (what stb_truetype always does)\n"
+        "#   light                   snapped vertically only, keeps glyph spacing\n"
+        "#   mono                    snapped both ways, crispest small monospace\n"
+        "#   mono (no smoothing)     as mono with no anti-aliasing\n"
+        "# Needs the FreeType loader; a build without it ignores this line.\n"
+        "font_hinting = %s\n"
+        "\n"
         "# Color theme: dark | light | classic | gruvbox | gruvbox-light |\n"
         "#              solarized-dark | solarized-light\n"
         "theme = %s\n"
@@ -160,7 +171,7 @@ void mc_config_save(const MCConfig* c) {
         "\n# Columns of the long view (Shift+F1); name is always first\n"
         "columns = %s\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
-        c->font, (double)c->font_size, c->theme,
+        c->font, (double)c->font_size, c->hinting, c->theme,
         c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->trash,
         c->columns);
 

@@ -9,6 +9,11 @@
 #include <imgui_internal.h>   // ClearActiveID: drop the filter field's keyboard focus
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
+#ifdef MC_HAVE_FREETYPE
+#include <imgui_freetype.h>       // ImGuiFreeType::GetFontLoader() and the loader flags
+#include <ft2build.h>             // FreeType's include shim, then the header with its version
+#include FT_FREETYPE_H
+#endif
 #include <SDL3/SDL_opengl.h>
 #include <string.h>
 #include <strings.h>   // strncasecmp: quick search prefix match
@@ -117,6 +122,8 @@ AppPanes::AppPanes() {
     font_scanned = false;
     font_size = 0.0f;
     font[0] = '\0';
+    snprintf(hinting, sizeof(hinting), "default");
+    display_scale = 1.0f;
     font_filter[0] = '\0';
     font_msg[0] = '\0';
     snprintf(theme, sizeof(theme), "dark");
@@ -1012,6 +1019,21 @@ void app_panes_set_sdl_window(AppPanes* app, void* window) {
     app->sdl_window = window;
 }
 
+// The window's framebuffer scale: device pixels per ImGui logical pixel. ImGui
+// rasterizes glyphs at this density, so a 2x display gets a 26 px raster of a
+// 13 px font instead of a 13 px raster stretched over 26 - which is the whole
+// difference between a crisp and a blurry high-DPI window. It changes when the
+// window moves to a different monitor or the desktop scaling changes, and the
+// atlas has to be rebuilt for the new density, which is why a change sets
+// font_dirty rather than rebuilding here.
+bool app_panes_set_display_scale(AppPanes* app, float scale) {
+    if (!(scale > 0.0f)) scale = 1.0f;
+    if (scale == app->display_scale) return false;
+    app->display_scale = scale;
+    app->font_dirty = true;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Identity, title bar, fonts
 //
@@ -1055,13 +1077,17 @@ void app_about_identity(char* out, size_t n) {
     char sdlv[32];
     sdl_version_string(sdlv, sizeof(sdlv));
 
+    char raster[64];
+    mc_font_rasterizer(raster, sizeof(raster));
+
     snprintf(out, n,
              "%s %s - a Total Commander style file manager\n"
              "executable %s - Dear ImGui %s, SDL %s\n"
              "settings %s\n"
+             "text rasterized with %s\n"
              "archive tools found: %s%s\n",
-             MC_APP_NAME, MC_VERSION, MC_APP_BINARY, IMGUI_VERSION, sdlv, cfgp, tools,
-             arch_tool_available(ARCH_RAR) ? ", RAR read-only" : "");
+             MC_APP_NAME, MC_VERSION, MC_APP_BINARY, IMGUI_VERSION, sdlv, cfgp, raster,
+             tools, arch_tool_available(ARCH_RAR) ? ", RAR read-only" : "");
 }
 
 // Past this many characters a title bar stops being readable, and the path is
@@ -1181,14 +1207,146 @@ static bool font_file_looks_readable(const char* path) {
     return false;
 }
 
-// Rebuild the font atlas from a path and a size. A file that cannot be read is
-// neither fatal nor silent: the built-in font goes back in and the caller is
-// told, which is the difference between a picker that looks broken and one that
-// explains itself.
-bool app_font_apply(const char* path, float size) {
+// ---------------------------------------------------------------------------
+// Hinting
+//
+// A glyph outline is a curve; hinting is what decides which pixels it lights up.
+// It is the difference between a stem that lands on one pixel and one that lights
+// two pixels half bright, so at the small monospace sizes a file manager lives on
+// it is the difference between legible and grey. The modes are named, and the
+// names are what the config stores - the same arrangement the theme uses - so a
+// hand-edited config says what the Options dialog shows.
+//
+// The bits below are this app's own; mc_freetype_loader_flags() translates them
+// for the loader. That keeps one table that compiles in a build without
+// FreeType, where there is a vocabulary to remember but nothing to honour it.
+// ---------------------------------------------------------------------------
+
+enum MCHintingBit {
+    MC_HINT_NONE      = 1 << 0,   // leave the outline alone
+    MC_HINT_LIGHT     = 1 << 1,   // snap vertically only
+    MC_HINT_STRONG    = 1 << 2,   // snap both ways
+    MC_HINT_NO_SMOOTH = 1 << 3,   // no grey: monochrome coverage
+};
+
+struct MCHintingMode {
+    const char* name;   // the config's value and the combo's label
+    int         bits;
+    const char* note;   // one line in the dialog: what picking it costs
+};
+
+static const MCHintingMode kHintingModes[] = {
+    { "default",  0,
+      "the font's own hinter at normal strength: what the loader chooses for this font" },
+    { "none",     MC_HINT_NONE,
+      "no hinting at all: the outline is lit as drawn, so stems land between pixels and come out grey "
+      "- which is what the built-in loader does whatever this says" },
+    { "light",    MC_HINT_LIGHT,
+      "snapped to the grid vertically only: keeps the spacing between glyphs, softer across them" },
+    { "mono",     MC_HINT_STRONG,
+      "snapped both ways: the crispest at small monospace sizes, at the cost of even spacing" },
+    { "mono (no smoothing)", MC_HINT_STRONG | MC_HINT_NO_SMOOTH,
+      "snapped both ways with no grey at all: hard edges, and thin strokes can break up at small sizes" },
+};
+
+static const int kHintingCount = (int)(sizeof(kHintingModes) / sizeof(kHintingModes[0]));
+
+const char* const* mc_hinting_list(int* count) {
+    static const char* names[kHintingCount];
+    static bool built = false;
+    if (!built) {
+        for (int i = 0; i < kHintingCount; i++) names[i] = kHintingModes[i].name;
+        built = true;
+    }
+    *count = kHintingCount;
+    return names;
+}
+
+// -1 for a name this build does not know, so a config edited by hand is either
+// honoured or visibly ignored, never quietly reinterpreted.
+int mc_hinting_index(const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < kHintingCount; i++)
+        if (!strcmp(kHintingModes[i].name, name)) return i;
+    return -1;
+}
+
+// The dialog offers the choice only where something can carry it out.
+bool mc_font_hinting_available() {
+#ifdef MC_HAVE_FREETYPE
+    return true;
+#else
+    return false;
+#endif
+}
+
+// What rasterizes the text in this build. Worth showing rather than asserting:
+// "the font is blurry" has two entirely different causes, and this line tells
+// them apart.
+void mc_font_rasterizer(char* out, size_t n) {
+#ifdef MC_HAVE_FREETYPE
+#if defined(FREETYPE_MAJOR)
+    snprintf(out, n, "FreeType %d.%d.%d", FREETYPE_MAJOR, FREETYPE_MINOR, FREETYPE_PATCH);
+#elif defined(FT_MAJOR)
+    snprintf(out, n, "FreeType %d.%d.%d", FT_MAJOR, FT_MINOR, FT_PATCH);
+#else
+    snprintf(out, n, "FreeType");
+#endif
+#else
+    snprintf(out, n, "stb_truetype");
+#endif
+}
+
+// One line about a mode, for the dialog to say what picking it costs.
+static const char* mc_hinting_note(int index) {
+    if (index < 0 || index >= kHintingCount) index = 0;
+    return kHintingModes[index].note;
+}
+
+static unsigned int mc_freetype_loader_flags(const char* name) {
+    int i = mc_hinting_index(name);
+    if (i < 0) i = 0;                       // unknown or empty: the loader's own choice
+    unsigned int bits = (unsigned int)kHintingModes[i].bits;
+    unsigned int flags = 0;
+    if (bits & MC_HINT_NONE)      flags |= ImGuiFreeTypeLoaderFlags_NoHinting;
+    if (bits & MC_HINT_LIGHT)     flags |= ImGuiFreeTypeLoaderFlags_LightHinting;
+    if (bits & MC_HINT_STRONG)    flags |= ImGuiFreeTypeLoaderFlags_MonoHinting;
+    if (bits & MC_HINT_NO_SMOOTH) flags |= ImGuiFreeTypeLoaderFlags_Monochrome;
+    return flags;
+}
+
+// Device pixels per logical pixel, from the two sizes SDL reports for one window.
+// This is the density the glyph atlas gets baked at: ImGui takes its pixel density
+// from io.DisplayFramebufferScale.x, and the SDL3 backend fills that field with
+// exactly this ratio, so the number measured here is the number the font system
+// ends up using. A measurement you cannot divide by - a minimized window reports
+// no logical size, and a mode change reports the two sizes out of step for a
+// frame - falls back to 1x rather than to a scale that would shrink text to
+// nothing. The vertical ratio is usually the same number; where it is not, the
+// backend still sets both components every frame, and the glyphs follow x.
+float mc_framebuffer_scale(int logical_w, int pixel_w) {
+    if (logical_w <= 0 || pixel_w <= 0) return 1.0f;
+    float s = (float)pixel_w / (float)logical_w;
+    return s > 0.0f ? s : 1.0f;
+}
+
+// Rebuild the font atlas from a path, a size and a hinting mode. A file that
+// cannot be read is neither fatal nor silent: the built-in font goes back in and
+// the caller is told, which is the difference between a picker that looks broken
+// and one that explains itself.
+bool app_font_apply(const char* path, float size, const char* hinting) {
     ImFontAtlas* fonts = ImGui::GetIO().Fonts;
     ImGui::GetStyle().FontScaleMain = 1.0f;
     fonts->ClearFonts();
+#ifdef MC_HAVE_FREETYPE
+    // The loader and its flags belong to the atlas, not to one font, and the
+    // flags are read when a glyph is baked - so the atlas has to be cleared and
+    // rebuilt for a hinting change to show, which is what this function is for.
+    fonts->SetFontLoader(ImGuiFreeType::GetFontLoader());
+    fonts->FontLoaderFlags = mc_freetype_loader_flags(hinting);
+#else
+    (void)hinting;   // remembered in the settings, nothing here can act on it
+#endif
     if (path && path[0]) {
         // ImGui also asserts on a buffer under 100 bytes, so a truncated or
         // placeholder .ttf is turned down on size as well as on signature.
@@ -1216,9 +1374,18 @@ void app_panes_apply_font(AppPanes* app) {
     if (app->font_size > 0.0f) snprintf(size_note, sizeof(size_note), " at %.0f px", app->font_size);
     else                       size_note[0] = '\0';
 
-    if (app_font_apply(app->font, app->font_size)) {
-        snprintf(app->font_msg, sizeof(app->font_msg), "Font: %s%s",
-                 app->font[0] ? file_base(app->font) : "built-in", size_note);
+    // The mode is part of the sentence because it is part of the result: the same
+    // file at the same size looks different under each of them, and a build that
+    // cannot hint has to say so rather than name a mode it ignored.
+    char hint_note[64];
+    if (mc_font_hinting_available())
+        snprintf(hint_note, sizeof(hint_note), ", %s hinting", app->hinting);
+    else
+        snprintf(hint_note, sizeof(hint_note), "%s", "");
+
+    if (app_font_apply(app->font, app->font_size, app->hinting)) {
+        snprintf(app->font_msg, sizeof(app->font_msg), "Font: %s%s%s",
+                 app->font[0] ? file_base(app->font) : "built-in", size_note, hint_note);
     } else {
         snprintf(app->font_msg, sizeof(app->font_msg),
                  "\"%s\" could not be read as a font; the built-in font is in use",
@@ -3589,6 +3756,14 @@ static void render_about(AppPanes* app) {
     char ident[1024];
     app_about_identity(ident, sizeof(ident));
     ImGui::TextWrapped("%s", ident);
+    // What the text is drawn with, and at what density. "The font is blurry" has
+    // two unrelated causes - a build with no hinting, and glyphs baked for a
+    // different monitor's density - and this line tells them apart.
+    char raster[64];
+    mc_font_rasterizer(raster, sizeof(raster));
+    ImGui::TextWrapped("text: %s, %s, window scale %.2fx", raster,
+                       mc_font_hinting_available() ? app->hinting : "no hinting in this build",
+                       (double)app->display_scale);
     ImGui::Separator();
     ImGui::Spacing();
     ImGui::TextUnformatted(
@@ -3739,6 +3914,29 @@ static void render_options(AppPanes* app) {
     }
     ImGui::TextWrapped("0 px is the built-in size: 13 px for the built-in font, "
                        "16 px for a TrueType font");
+
+    // Hinting sits next to the size because the two are one decision: a size says
+    // how tall a glyph is, hinting says how it meets the pixel grid at that size.
+    // A build without FreeType has no hinting to offer, and says which rasterizer
+    // it has instead of showing a combo that cannot be honoured.
+    ImGui::Spacing();
+    int hc = 0;
+    const char* const* hnames = mc_hinting_list(&hc);
+    if (mc_font_hinting_available()) {
+        int hidx = mc_hinting_index(app->hinting);
+        if (hidx < 0) hidx = 0;
+        if (ImGui::Combo("Hinting", &hidx, hnames, hc)) {
+            snprintf(app->hinting, sizeof(app->hinting), "%s", hnames[hidx]);
+            app->font_dirty = true;
+            snprintf(app->status_msg, sizeof(app->status_msg), "Hinting: %s", app->hinting);
+        }
+        ImGui::TextWrapped("%s", mc_hinting_note(hidx));
+    } else {
+        char raster[64];
+        mc_font_rasterizer(raster, sizeof(raster));
+        ImGui::TextDisabled("Hinting is not offered: this build rasterizes text with %s, which does no "
+                            "hinting at all. Build against freetype2 and the choice appears here.", raster);
+    }
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Font");
@@ -4216,6 +4414,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     snprintf(cfg->theme, sizeof(cfg->theme), "%s", app->theme);
     snprintf(cfg->font, sizeof(cfg->font), "%s", app->font);
     cfg->font_size = app->font_size;
+    snprintf(cfg->hinting, sizeof(cfg->hinting), "%s", app->hinting);
     cfg->show_hidden = app->show_hidden ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
@@ -4243,6 +4442,10 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     if (cfg->theme[0]) snprintf(app->theme, sizeof(app->theme), "%s", cfg->theme);
     snprintf(app->font, sizeof(app->font), "%s", cfg->font);
     app->font_size = cfg->font_size > 0.0f ? cfg->font_size : 0.0f;   // 0 = the built-in size
+    // A hinting name the build does not know is dropped rather than guessed at:
+    // the default mode is the one the loader would have chosen anyway.
+    if (mc_hinting_index(cfg->hinting) >= 0)
+        snprintf(app->hinting, sizeof(app->hinting), "%s", cfg->hinting);
     app->show_hidden = cfg->show_hidden != 0;
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
