@@ -1845,6 +1845,67 @@ static void test_menu_bar(AppPanes* app) {
     ImGui::DestroyContext(ctx);
 }
 
+// A menu bar that is drawn but does not answer to the mouse is the same as no
+// menu bar. The trap is the command line at the bottom of the same window: it
+// asks for the keyboard on every frame, a request lands on the *next* frame, and
+// it takes ActiveId away from the item in the middle of being clicked, so the
+// press never survives the release and the item silently does nothing.
+static void test_menu_click(AppPanes* app) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(900, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    auto frame = [app]() {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    };
+
+    frame(); frame();
+    ImGuiWindow* root = ImGui::FindWindowByName("Midnight Commander");
+    CHECK(root != nullptr);
+    if (!root) { ImGui::DestroyContext(ctx); return; }
+
+    ImRect bar = root->MenuBarRect();
+    bool view_before = app->left.quick_view;
+
+    // Press and release on the first title.
+    io.AddMousePosEvent(bar.Min.x + 8.0f, bar.Min.y + bar.GetHeight() * 0.5f);
+    frame();
+    io.AddMouseButtonEvent(0, true);
+    frame();
+    io.AddMouseButtonEvent(0, false);
+    frame(); frame();
+    CHECK(ImGui::IsPopupOpen((ImGuiID)0, ImGuiPopupFlags_AnyPopup));   // it dropped down
+
+    // The dropdown is its own window; click its first row, "View".
+    ImGuiWindow* menu = nullptr;
+    for (ImGuiWindow* w : ctx->Windows)
+        if ((w->Flags & ImGuiWindowFlags_Popup) && w->Active) menu = w;
+    CHECK(menu != nullptr);
+    if (menu) {
+        float pad = ImGui::GetStyle().WindowPadding.y;
+        io.AddMousePosEvent(menu->Pos.x + 20.0f, menu->Pos.y + pad + ImGui::GetFrameHeight() * 0.5f);
+        frame();
+        io.AddMouseButtonEvent(0, true);
+        frame();
+        io.AddMouseButtonEvent(0, false);
+        frame();
+        CHECK(app->left.quick_view != view_before);   // the item fired
+        app->left.quick_view = view_before;           // leave the app as found
+    }
+
+    // With the menu gone the command line takes the keyboard back, so the two
+    // rules hold at once: typing works, clicking works.
+    frame(); frame();
+    CHECK(!ImGui::IsPopupOpen((ImGuiID)0, ImGuiPopupFlags_AnyPopup));
+    CHECK(ImGui::GetActiveID() != 0);
+    ImGui::DestroyContext(ctx);
+}
+
 // Ctrl+S opens the quick filter and puts the caret in it, so the keys typed
 // straight after belong to the filter and not to the pane behind it.
 static void test_filter_focus(AppPanes* app, const std::string& root) {
@@ -1920,6 +1981,53 @@ static void test_filter_focus(AppPanes* app, const std::string& root) {
     app->right.filter_field_active = false;
     app->left_focus = true;
     rebuild_view(app->left);
+    ImGui::DestroyContext(ctx);
+}
+
+// A focus request is answered at the start of the next frame, against whichever
+// window holds focus by then - so a window that appears in between, the F3
+// preview or any dialog, takes the answer and the field stays unfocused. The
+// request is repeated until the field has the keyboard; this is what proves it.
+static void test_filter_focus_preview(AppPanes* app, const std::string& root) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(900, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    auto frame = [app](int n) {
+        for (int i = 0; i < n; i++) {
+            ImGui::NewFrame();
+            app_panes_render(app);
+            ImGui::Render();
+        }
+    };
+
+    Pane& pane = app->left;
+    refresh_pane(&pane, root.c_str());
+    app->left_focus = true;
+    pane.filter[0] = '\0';
+    pane.filter_active = false;
+    pane.filter_field_active = false;
+    pane.filter_focus_request = false;
+    app->left.quick_view = true;                 // the F3 preview opens this frame
+
+    // Ctrl+S first, so the preview window appears in the very frame the request
+    // is submitted and competes with it for the keyboard.
+    app_panes_handle_key(app, SDLK_S, SDL_KMOD_CTRL);
+    frame(4);
+    CHECK(ImGui::FindWindowByName("Quick view") != nullptr);
+    CHECK(pane.filter_field_active);
+    io.AddInputCharacter('o');
+    frame(1);
+    CHECK(!strcmp(pane.filter, "o"));
+
+    app->left.quick_view = false;
+    pane.filter[0] = '\0';
+    pane.filter_active = false;
+    pane.filter_field_active = false;
+    rebuild_view(pane);
     ImGui::DestroyContext(ctx);
 }
 
@@ -2015,6 +2123,8 @@ int main() {
     test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);
+    test_filter_focus_preview(&app, root);
+    test_menu_click(&app);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

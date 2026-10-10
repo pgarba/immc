@@ -61,6 +61,16 @@ resolved to no focusable item at all, so the command line was never the active
 item and every field that had asked first was ignored. `claim_focus()` marks the
 claim so the command line stands down, it asks for itself with offset 0, and it
 steps back while the filter, a path bar or the Options field holds the keyboard.
+Asking for the keyboard is also how a click gets lost: the request is answered on
+the *next* frame, so it lands in the middle of a press and takes `ActiveId` off
+whatever is being clicked - the release then finds a different item and the click
+is dropped. That is what made the menu bar titles drop their menus and the items
+in them do nothing. The command line asks only while the keyboard is free: nothing
+active, no popup open, nothing claimed. The other half is that a request is answered
+against whichever window holds focus a frame later, so a window appearing in between
+- the F3 preview, a dialog - swallows it, and the filter's request is repeated until
+the field really has the keyboard. Both are tested with a virtual mouse: press and
+release on a menu title, then on its first item, and check the item fired.
 The identity is checked from the terminal too: `ctest` runs `mc-clone --version` and matches the name
 and the version in its output, the one path that has to work with no display at all.
 It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
@@ -578,7 +588,9 @@ Manual checklist (extend per phase):
     the dialog, and the settings do not keep the bad path. `mc-clone --version` prints the name, the
     version and the config path in a terminal with no display.
 20. The four menu titles are on screen at the top of the window, not only in the source, and the panes
-    start below them. `Ctrl+S` opens the quick filter with the caret already in the field, so the next
+    start below them. **Clicking a title drops its menu, and clicking an item in it does the thing the
+    item says** - the same is true of the right-click menus and the combo box in the Options dialog, so
+    try one of each. The panes start below the bar. `Ctrl+S` opens the quick filter with the caret already in the field, so the next
     keys typed narrow the list instead of landing in the command line; `Ctrl+S` in the other pane focuses
     that pane's field. With the filter holding the keyboard, `Esc` leaves it and the command line takes
     the typing back.

@@ -3684,14 +3684,15 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     // Focus the field itself. Offset -1 would mean the item submitted *before*
     // this call - the path bar above - so Ctrl+S looked like it did nothing.
-    if (pane.filter_focus_request) {
-        claim_focus(app);
-        pane.filter_focus_request = false;
-    }
+    // The request is answered at the start of the next frame, against whichever
+    // window holds focus by then, and a window that appears in between - the F3
+    // preview, a dialog - takes it. So ask again until the field has the keyboard.
+    if (pane.filter_focus_request) claim_focus(app);
     ImGui::PushID(id);
     ImGui::InputText("##filter", pane.filter, sizeof(pane.filter));
     if (ImGui::IsItemClicked()) app->left_focus = (&pane == &app->left);
     pane.filter_field_active = ImGui::IsItemActive();
+    if (pane.filter_field_active) pane.filter_focus_request = false;
     ImGui::PopID();
     ImGui::PopStyleColor(2);
 }
@@ -4051,9 +4052,10 @@ void app_panes_render(AppPanes* app) {
     ImGui::PushStyleColor(ImGuiCol_Text, l_text);
     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(1.0f, 1.0f, 1.0f, 0.3f));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (left.path_focus_request) { claim_focus(app); left.path_focus_request = false; }
+    if (left.path_focus_request) claim_focus(app);
     ImGui::InputText("##leftpath", left.path_edit, sizeof(left.path_edit));
     left.path_edit_active = ImGui::IsItemActive();
+    if (left.path_edit_active) left.path_focus_request = false;
     if (left.path_edit_active) {
         left_focus = true;
         app->active_path_pane = 0;
@@ -4085,9 +4087,10 @@ void app_panes_render(AppPanes* app) {
     ImGui::PushStyleColor(ImGuiCol_Text, r_text);
     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(1.0f, 1.0f, 1.0f, 0.3f));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (right.path_focus_request) { claim_focus(app); right.path_focus_request = false; }
+    if (right.path_focus_request) claim_focus(app);
     ImGui::InputText("##rightpath", right.path_edit, sizeof(right.path_edit));
     right.path_edit_active = ImGui::IsItemActive();
+    if (right.path_edit_active) right.path_focus_request = false;
     if (right.path_edit_active) {
         left_focus = false;
         app->active_path_pane = 1;
@@ -4141,7 +4144,14 @@ void app_panes_render(AppPanes* app) {
         // Offset 0 means this field. With -1 the request resolved to whatever
         // item came before it, which was nothing focusable, so the command line
         // was never the active item and any earlier request got thrown away.
-        if (allow_cmd_focus && !app->focus_claimed)
+        // It still has to ask politely: a request lands on the *next* frame, and
+        // if a press is in flight it takes ActiveId away from whatever is being
+        // clicked, so the release finds a different item and the click is
+        // dropped. That is what made the menu bar titles open but their items do
+        // nothing. So: only while the keyboard is genuinely free.
+        bool keyboard_free = !app->focus_claimed && (ImGui::GetActiveID() == 0) &&
+                             !ImGui::IsPopupOpen((ImGuiID)0, ImGuiPopupFlags_AnyPopup);
+        if (allow_cmd_focus && keyboard_free)
             ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-status_w - 1.0f);
         ImGui::InputText("##cmdline", app->cmd, sizeof(app->cmd));
