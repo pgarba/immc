@@ -35,6 +35,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
 | K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes; the size rides on `style.FontScaleMain` for every font, because the size passed to `AddFont()` is read once, on the first frame, and never again |
+| L remote sites | planned | FTP/FTPS/SFTP browsed in a pane, `Ctrl+F` for the saved-site manager, `Ctrl+N` for quick connect, `cd ftp://…` on the command line. Nothing built yet — §8 is the decision record, so the implementation session starts with the shape settled. |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`
 and `font_hinting`. The hinting value is a name and not a number, so a hand-edited config says what the
@@ -231,13 +232,15 @@ followed: a baked `H` at 30 px is most of 30 px tall, not of 13.
 | Ctrl+Z comments | — | OUT | no comment store |
 
 ### Out of scope (Windows/legacy or dependency-bound)
-FTP (`Ctrl+F`, `Ctrl+Shift+F`, `Ctrl+N`, `Ctrl+Shift+M`) · thumbnails (`Ctrl+Shift+F1`) · comments
+FTP (`Ctrl+F`, `Ctrl+Shift+F`, `Ctrl+N`, `Ctrl+Shift+M`) — no longer out of scope, planned as
+Phase L in §8 · thumbnails (`Ctrl+Shift+F1`) · comments
 (`Ctrl+Z`, `Ctrl+Shift+F2`) · printing (`Ctrl+F9`) · NOCLOSE.PIF · buttonbar (`Alt+Shift+F11`) ·
 drive letters (`Alt+F1/F2` → implemented as mount picker instead) · writing into RAR (no writer in
 `7z`, so RAR is read-only) · archive *mutations* (rename/delete/move inside an archive).
 
 **Count:** 74 bindings in the table — 58 bound (16 already matched at audit time, 42 implemented by
-the phases below), 4 partial, 8 conflicts resolved by the Phase 0 migration, 4 out of scope.
+the phases below), 4 partial, 8 conflicts resolved by the Phase 0 migration, and the 4 FTP bindings
+planned as Phase L (§8) instead of out of scope.
 
 ---
 
@@ -557,6 +560,9 @@ handler to keep that honest.
 | 15 | operation dialog for `F5`/`F6`/`F7`/`F2`/`Shift+F4` | 2h | — |
 | 16 | app identity, title bar, menu bar, Options dialog | 2h | — |
 | 17 | FreeType loader, hinting mode, high-DPI window | 2h | — |
+| 18 | L1 remote sites: libcurl transport, sites file, site manager, browse, download | 1d | — |
+| 19 | L2 remote writes: upload, mkdir, rename, delete, chmod, properties | 0.5d | — |
+| 20 | L3 remote work off the frame loop with `curl_multi` | 0.5d | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -630,3 +636,87 @@ Manual checklist (extend per phase):
     restart, and `Help > About` shows the window scale it settled at. The size slider belongs to both
     fonts: pick a TrueType file, move it, and the file list re-lays-out at the new height — 0 px puts the
     built-in 13 px back, and the size in the dialog's status line is the height the text is drawn at.
+
+---
+
+## 8. Phase L — remote sites: FTP, FTPS, SFTP
+
+`Ctrl+F` opens a saved-site manager, `Ctrl+N` a quick-connect line, and a pane can then browse a
+server the way it browses a directory. Nothing here is built. This section records the decisions and
+the shape, so the implementation session starts with the arguments settled rather than re-litigating
+them against 5,500 lines of `panes.cpp`.
+
+| Decision | Choice | Why |
+|---|---|---|
+| Transport | link `libcurl`, optional at build time | one login and one TLS session stay open across pane navigations, and the credentials reach the handle in memory instead of argv, where `/proc` would show them. `find_package(CURL QUIET)` → `MC_HAVE_CURL` is the FreeType pattern: without the dev package the app still builds, and the dialog says this binary has no FTP support instead of offering a connect that cannot work. |
+| Saved passwords | `~/.config/mc-clone/ftp_sites`, created `0600` | the main config is written with `fopen(..., "w")` and lands `0644`, world-readable, so it must stay password-free. Cleartext in a private file, per site, with a "remember password" tick — and the dialog says in one line that it is cleartext. |
+| Quick connect | a `Ctrl+N` field **and** `cd ftp://…` on the command line | `exec_command()` already parses `cd` with `~` expansion and probes with `opendir()`; a scheme check in front of that probe is the whole change. The field connects without saving anything. |
+| Write scope | full read/write | browse, download, upload, `MKD`, `RNFR`/`RNTO`, `DELE`/`RMD`, `SITE CHMOD`. Delete is direct: a server has no trash, the `trash` setting is not honoured here, and the confirm prompt says so rather than implying a recovery path. |
+
+**A remote pane is a pane mode, not a parallel UI.** The same trick archives use: `current_dir` may be
+a virtual path — `ftp://user@host:2121/pub/incoming` — and `remote_split_virtual()` splits it into the
+site part and the path on the server. Tabs, tab labels, directory history, the path bar, the hotlist,
+filters, marks and `Ctrl+Left/Right` then carry a remote location without knowing FTP exists. A
+`Pane::remote_site` + `remote_path` pair and an `in_remote(pane)` guard mirror
+`archive_path`/`archive_prefix`/`in_archive()`, which 18 call sites consult today — that count is the
+honest price of this design, and it is paid once. A site root lists a `..` row like an archive root,
+so Enter leaves the site. The password is never part of a displayed path, and `Ctrl+P` puts the URL on
+the command line without it.
+
+**Listings fill `FileEntry` and stop there.** `MLSD` first — machine-readable, and it carries `type`,
+`size`, `modify` and `unix.mode` — falling back to parsing `LIST` when the server does not implement
+it, in both the unix and the DOS dialect and with names containing spaces. Both produce
+`FileEntry{name, mode, size, mtime}`, so `compare_files()` and the column formatting are untouched.
+`MLST` answers `Alt+Enter` for a single row.
+
+**TLS is a per-site mode, and the mode stays visible.** `ftp://` with `CURLUSESSL_TRY` upgrades with
+`AUTH TLS` when the server offers it; `ftps://` with `CURLUSESSL_ALL` and `AUTH=TLS` requires explicit
+FTPS; implicit FTPS is `CURLFTPAUTH_SSL` on port 990. Verification is on by default (`VERIFYPEER`,
+`VERIFYHOST=2`). A self-signed server can be connected anyway, per site, and while that flag is set the
+site list and the pane's status line both read `certificate not verified` — a security mode that
+degrades silently is the one thing not to get wrong here. `sftp://`/`ssh://` rides along with libcurl's
+libssh2 backend almost for free; the host key is trust-on-first-use with the fingerprint shown and
+remembered in the sites file, which is the weakest part of the feature and worth saying out loud.
+
+**Operations reuse the copy pipeline.** Download and upload go through the existing progress dialog:
+`CURLOPT_XFERINFOFUNCTION` has the same shape as `fs_progress_fn` — returning true aborts there,
+non-zero aborts in curl — so the dialog's Abort stops a transfer the way killing a child stops `unzip`.
+`F5` between a remote pane and a local one is the direction test. `F6` between two remote panes is a
+separate question — a server-side rename when both sit on one host, otherwise download, upload, delete
+— and should refuse until that is answered. Refused inside a remote pane, as inside an archive: branch
+view, tree panel, directory sizes, search, quick view, the editor, "open with". An archive *on* a
+server is two steps — fetch it to a temporary file, then browse it, the `arch_extract_temp()` analogue
+— and is a stretch goal, not part of L1.
+
+**Blocking is the open risk, and it has a named answer.** `src/` starts no threads today; long
+operations run synchronously and pump a minimal progress frame, which is what L1 does, with
+`CONNECTTIMEOUT_MS` and `LOW_SPEED_LIMIT`/`LOW_SPEED_TIME` so a dead server ends instead of hanging,
+and Abort through the xferinfo callback. A LAN listing is one round trip and feels instant; a WAN
+listing leaves the window unresponsive for 200-500 ms. If that is not acceptable, the fix is
+`curl_multi_*` driven once per frame — no threads, the pane fills in when the transfer completes —
+which is phase L3 and a larger change than L1, so it is a phase and not a footnote.
+
+**Testing is a localhost server, not a real one.** `tests/ftp_server.py`, about 100 lines: an FTP
+server on `127.0.0.1` with an ephemeral port serving a fixture tree, speaking
+`USER/PASS/PWD/CWD/PASV/LIST/MLSD/RETR/STOR/MKD/DELE/RNFR/RNTO/TYPE/SIZE/QUIT`, plus an `AUTH TLS`
+variant whose certificate the test generates with `openssl req -x509` (Python 3.14 is present,
+`pyftpdlib` is not, so the server is written here). Over it: connect, list, download and compare
+bytes, upload, mkdir, rename, delete; and a transfer the server stalls past `LOW_SPEED_TIME`, which
+must report failure rather than success — the same honesty rule the archive code has. Unit-level: URL
+parsing (scheme, port, IPv6, `%xx`, and no password in the display form), the sites-file round-trip
+**including its `0600` mode**, MLSD and both LIST dialects and the pane rows they produce, and which
+scheme sets which curl options. The TLS test asserts that verification-on refuses a self-signed server
+with a readable message, that the per-site override connects, and that `certificate not verified`
+reaches the UI. A build without libcurl must compile and answer "this build has no FTP support", the
+same shape as the no-FreeType build. `mc-clone --version` prints `FTP: libcurl 8.22.0 (OpenSSL 3.6.5)`
+or `FTP: not in this build`, and `test_cli.cpp` grows the assertion.
+
+**Keys.** `Ctrl+F` (site manager) and `Ctrl+N` (quick connect) are unbound today, and both are already
+reserved in §2's out-of-scope line. `Ctrl+Shift+F` and `Ctrl+Shift+M` are the other two FTP bindings
+that line records; `tc_command.txt` is not in the repository, so those two stay unbound until the spec
+line can be read. A connect that fails leaves the site dialog open with curl's message in it, the way
+the pack dialog refuses with a reason instead of closing.
+
+**Effort.** L1 transport + sites file + site manager + browse + download ~1d. L2 writes (upload,
+mkdir, rename, delete, chmod, properties) ~0.5d. L3 `curl_multi` so listings and transfers do not
+freeze the frame loop ~0.5d. SFTP host-key UX ~2h, deferrable.
