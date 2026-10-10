@@ -1,0 +1,18 @@
+#ifndef MC_VERSION_H
+#define MC_VERSION_H
+
+// Generated from src/version.h.in by CMake. The number lives in the project()
+// line of CMakeLists.txt and nowhere else, so the binary, its --version output
+// and the About window cannot disagree.
+
+// What the user calls the app, and what the file on disk is called. They differ:
+// the repository is immc, the executable it builds is mc-clone.
+#define MC_APP_NAME   "@MC_APP_NAME@"
+#define MC_APP_BINARY "@MC_APP_BINARY@"
+
+#define MC_VERSION       "@PROJECT_VERSION@"
+#define MC_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define MC_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define MC_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#endif // MC_VERSION_H

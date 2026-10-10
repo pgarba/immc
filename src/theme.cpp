@@ -259,3 +259,15 @@ void mc_apply_theme(const char* name) {
 const MCThemeColors* mc_theme_colors() {
     return &g_colors;
 }
+
+// "solarized" is accepted by mc_apply_theme as an alias but is not offered here:
+// a picker that lists the same palette twice reads like a bug.
+static const char* const kThemeNames[] = {
+    "dark", "light", "classic", "gruvbox", "gruvbox-light",
+    "solarized-dark", "solarized-light",
+};
+
+const char* const* mc_theme_list(int* count) {
+    *count = (int)(sizeof(kThemeNames) / sizeof(kThemeNames[0]));
+    return kThemeNames;
+}

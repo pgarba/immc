@@ -287,6 +287,22 @@ public:
 
     bool about_open;     // Help > About
 
+    // Options dialog (Options > Fonts and theme...). These mirror the config, so
+    // whatever the dialog changed is what gets written back on exit. The dialog
+    // applies them live, and a font atlas cannot be rebuilt while a frame is
+    // open, so a font pick sets font_dirty and main.cpp applies it between
+    // frames, next to the other things that cannot run inside one.
+    bool  options_open;
+    bool  options_field_active; // the font filter holds the keyboard this frame
+    char  theme[64];        // a name from mc_theme_list()
+    char  font[1024];       // path to a .ttf/.otf; empty = the built-in font
+    float font_size;        // px; 0 = the built-in default size
+    bool  font_dirty;       // a font pick is waiting to be applied
+    char  font_msg[256];    // the dialog's line about the last pick
+    StringList font_files;  // scanned font files, in picker order
+    bool  font_scanned;     // font_files is filled in
+    char  font_filter[128]; // narrows the picker list
+
     // Keyboard-opened menus (TC F10 = app menu, F9 = menu above the pane).
     // *_open is a one-shot open request consumed by render(); *_alive is
     // maintained by render() so the key handler can close a live popup.
@@ -327,6 +343,19 @@ void app_panes_commit_op(AppPanes* app);   // carry out the op the dialog is sho
 void app_panes_cancel_op(AppPanes* app);   // cancel a pending op
 void app_panes_run_pending(AppPanes* app); // run deferred menu/dialog actions
 void app_panes_set_sdl_window(AppPanes* app, void* window);
+
+// Identity and title bar. Plain functions over buffers so the strings the user
+// judges are identity-critical can be checked without a display.
+void app_identity_line(char* out, size_t n);   // "immc 0.9.0 (mc-clone)"
+void app_about_identity(char* out, size_t n);  // the About window's header block
+void app_window_title(AppPanes* app, char* out, size_t n); // "immc - <active dir>"
+
+// Fonts. app_font_apply rebuilds the atlas from `path`/`size` and returns false
+// when the file was rejected, having already put the built-in font back so the
+// app is never left without text. app_scan_fonts collects what this machine has.
+bool app_font_apply(const char* path, float size);
+void app_panes_apply_font(AppPanes* app);      // carry out a pending dialog pick
+void app_scan_fonts(StringList& out);
 
 struct MCConfig;
 void app_panes_save_state(AppPanes* app, MCConfig* cfg);          // tabs/dirs -> config

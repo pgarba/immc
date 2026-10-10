@@ -3,6 +3,7 @@
 #include "archive.h"
 #include "theme.h"
 #include "config.h"
+#include "version.h"   // generated: MC_APP_NAME, MC_VERSION
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_internal.h>   // ClearActiveID: drop the filter field's keyboard focus
@@ -109,6 +110,15 @@ AppPanes::AppPanes() {
     props_files = 0;
     props_dirs = 0;
     about_open = false;
+    options_open = false;
+    options_field_active = false;
+    font_dirty = false;
+    font_scanned = false;
+    font_size = 0.0f;
+    font[0] = '\0';
+    font_filter[0] = '\0';
+    font_msg[0] = '\0';
+    snprintf(theme, sizeof(theme), "dark");
     menu_open = false; menu_alive = false;
     pane_menu_open = false; pane_menu_alive = false;
     entry_menu_open = false; ctx_menu_alive = false;
@@ -999,6 +1009,221 @@ static void request_delete(AppPanes* app, bool force_direct) {
 
 void app_panes_set_sdl_window(AppPanes* app, void* window) {
     app->sdl_window = window;
+}
+
+// ---------------------------------------------------------------------------
+// Identity, title bar, fonts
+//
+// All of it is plain functions over buffers rather than widgets, so the strings
+// a person judges by eye can be checked headless: what the app calls itself, and
+// what the window manager draws, are the two places a wrong name shows up.
+// ---------------------------------------------------------------------------
+
+// "immc 0.9.0 (mc-clone)". The About window, --version and the title bar start
+// from here, so they cannot drift apart.
+void app_identity_line(char* out, size_t n) {
+    snprintf(out, n, "%s %s (%s)", MC_APP_NAME, MC_VERSION, MC_APP_BINARY);
+}
+
+// SDL reports its version as one packed integer; the About window and --version
+// show the three numbers a person can look up.
+static void sdl_version_string(char* out, size_t n) {
+    int v = SDL_GetVersion();
+    snprintf(out, n, "%d.%d.%d", SDL_VERSIONNUM_MAJOR(v),
+             SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
+}
+
+// The About window's header: what the app is, what it was built against, where
+// its settings live, and which archive tools this machine actually has. The last
+// line is the only one that can be false on a given install, so it is measured
+// instead of asserted.
+void app_about_identity(char* out, size_t n) {
+    char cfgp[1024];
+    mc_config_path(cfgp, sizeof(cfgp));
+
+    static const ArchKind kShown[] = { ARCH_ZIP, ARCH_TAR, ARCH_7Z };
+    char tools[256];
+    tools[0] = '\0';
+    for (ArchKind k : kShown) {
+        if (!arch_tool_available(k)) continue;
+        if (tools[0]) strncat(tools, ", ", sizeof(tools) - strlen(tools) - 1);
+        strncat(tools, arch_kind_name(k), sizeof(tools) - strlen(tools) - 1);
+    }
+    if (!tools[0]) snprintf(tools, sizeof(tools), "none installed");
+
+    char sdlv[32];
+    sdl_version_string(sdlv, sizeof(sdlv));
+
+    snprintf(out, n,
+             "%s %s - a Total Commander style file manager\n"
+             "executable %s - Dear ImGui %s, SDL %s\n"
+             "settings %s\n"
+             "archive tools found: %s%s\n",
+             MC_APP_NAME, MC_VERSION, MC_APP_BINARY, IMGUI_VERSION, sdlv, cfgp, tools,
+             arch_tool_available(ARCH_RAR) ? ", RAR read-only" : "");
+}
+
+// Past this many characters a title bar stops being readable, and the path is
+// the part worth shortening - never the app name in front of it.
+static const size_t MC_TITLE_MAX = 100;
+
+// Keep the head of a path and its last segment, dropping what is between them.
+// A title that elides from the front hides which archive or volume the pane is
+// in, and one that elides from the back hides where it is.
+static void elide_path_chars(const char* path, size_t max, char* out, size_t n) {
+    if (strlen(path) <= max) { snprintf(out, n, "%s", path); return; }
+    if (max < 8) { snprintf(out, n, "%s", path + (strlen(path) > max ? strlen(path) - max : 0)); return; }
+    const char* slash = strrchr(path, '/');
+    const char* leaf  = (slash && slash[1]) ? slash + 1 : path;
+    size_t leaf_len = strlen(leaf);
+    // A leaf longer than the whole budget (a deeply nested archive member) still
+    // gets the tail, which is the only part that identifies it.
+    if (leaf_len + 3 >= max) {
+        snprintf(out, n, "...%s", path + (strlen(path) + 3 > max ? strlen(path) - (max - 3) : 0));
+        return;
+    }
+    snprintf(out, n, "%.*s...%s", (int)(max - leaf_len - 3), path, leaf);
+}
+
+// Title bar text: the app name and what the active pane is looking at. Inside an
+// archive current_dir is the pane's virtual path, so the title names the archive
+// as well as the level inside it.
+void app_window_title(AppPanes* app, char* out, size_t n) {
+    const Pane& active = app->left_focus ? app->left : app->right;
+    char path[MC_TITLE_MAX + 8];
+    elide_path_chars(active.current_dir, MC_TITLE_MAX, path, sizeof(path));
+    snprintf(out, n, "%s - %s", MC_APP_NAME, path);
+}
+
+// The places fonts live. Nothing is configured: a ttf dropped into the user's
+// own font directory shows up in the picker without an edit to the config file.
+static const char* const kFontDirs[] = {
+    "/usr/share/fonts", "/usr/local/share/fonts",
+};
+
+static bool font_file_ext(const char* name) {
+    const char* dot = strrchr(name, '.');
+    if (!dot || dot == name) return false;
+    return !strcasecmp(dot, ".ttf") || !strcasecmp(dot, ".otf") ||
+           !strcasecmp(dot, ".ttc") || !strcasecmp(dot, ".otc");
+}
+
+// Recursive, depth- and count-capped. A system font tree holds thousands of
+// files and the picker shows one scrollable list, so the cap is the design.
+static void scan_font_tree(const char* root, StringList& out, int depth, int max) {
+    if (depth < 0 || (int)out.size() >= max) return;
+    DIR* d = opendir(root);
+    if (!d) return;
+    struct dirent* de;
+    while ((de = readdir(d)) != nullptr) {
+        if (de->d_name[0] == '.') continue;   // also skips . and ..
+        std::string full = std::string(root) + "/" + de->d_name;
+        struct stat st;
+        if (lstat(full.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            scan_font_tree(full.c_str(), out, depth - 1, max);
+        } else if (S_ISREG(st.st_mode) && font_file_ext(de->d_name)) {
+            bool dup = false;
+            for (const std::string& s : out) if (s == full) { dup = true; break; }
+            if (!dup) out.push_back(full);
+        }
+        if ((int)out.size() >= max) break;
+    }
+    closedir(d);
+}
+
+// The standard places, then the list sorted by file name so the members of one
+// family sit together instead of wherever the walk reached them.
+void app_scan_fonts(StringList& out) {
+    out.clear();
+    std::vector<std::string> dirs;
+    for (const char* d : kFontDirs) dirs.push_back(d);
+    const char* home = getenv("HOME");
+    if (home && *home) {
+        dirs.push_back(std::string(home) + "/.local/share/fonts");
+        dirs.push_back(std::string(home) + "/.fonts");
+    }
+    const char* xdg = getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) dirs.push_back(std::string(xdg) + "/fonts");
+
+    for (const std::string& d : dirs) scan_font_tree(d.c_str(), out, 6, 400);
+
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        const char* ba = strrchr(a.c_str(), '/'); ba = ba ? ba + 1 : a.c_str();
+        const char* bb = strrchr(b.c_str(), '/'); bb = bb ? bb + 1 : b.c_str();
+        int c = strcasecmp(ba, bb);
+        return c ? c < 0 : a < b;
+    });
+}
+
+// "DejaVuSansMono.ttf" for a path: the picker lists names and tooltips the paths.
+static const char* file_base(const char* path) {
+    const char* slash = strrchr(path, '/');
+    return (slash && slash[1]) ? slash + 1 : path;
+}
+
+// ImGui's font loader asserts instead of failing when the bytes are not a font,
+// so the file is sniffed before it is handed over: the signatures stb_truetype
+// understands, and nothing else. A config or a filter box can name any file.
+static bool font_file_looks_readable(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char magic[4] = { 0, 0, 0, 0 };
+    size_t got = fread(magic, 1, 4, f);
+    fclose(f);
+    if (got < 4) return false;
+    if (!memcmp(magic, "\0\x01\0\0", 4)) return true;   // TrueType
+    if (!memcmp(magic, "true", 4))       return true;   // TrueType, Apple spelling
+    if (!memcmp(magic, "ttcf", 4))       return true;   // TrueType collection
+    if (!memcmp(magic, "OTTO", 4))       return true;   // OpenType / CFF
+    if (!memcmp(magic, "O\0\0\0", 4))    return true;   // OpenType, older spelling
+    return false;
+}
+
+// Rebuild the font atlas from a path and a size. A file that cannot be read is
+// neither fatal nor silent: the built-in font goes back in and the caller is
+// told, which is the difference between a picker that looks broken and one that
+// explains itself.
+bool app_font_apply(const char* path, float size) {
+    ImFontAtlas* fonts = ImGui::GetIO().Fonts;
+    ImGui::GetStyle().FontScaleMain = 1.0f;
+    fonts->ClearFonts();
+    if (path && path[0]) {
+        // ImGui also asserts on a buffer under 100 bytes, so a truncated or
+        // placeholder .ttf is turned down on size as well as on signature.
+        struct stat st;
+        bool readable = !stat(path, &st) && S_ISREG(st.st_mode) && st.st_size > 100 &&
+                        font_file_looks_readable(path);
+        if (readable && fonts->AddFontFromFileTTF(path, size > 0.0f ? size : 16.0f)) return true;
+        fonts->ClearFonts();
+        fonts->AddFontDefault();
+        return false;
+    }
+    // The built-in font is 13px and is scaled rather than re-sized, because the
+    // config's size is absolute and the atlas has no other say in the matter.
+    if (size > 0.0f) ImGui::GetStyle().FontScaleMain = size / 13.0f;
+    fonts->AddFontDefault();
+    return true;
+}
+
+// The dialog only marks a pick; the atlas is rebuilt here, between frames, where
+// ImGui allows it. A rejected file is dropped from the app's state so the config
+// cannot end up naming a font that has never worked.
+void app_panes_apply_font(AppPanes* app) {
+    app->font_dirty = false;
+    char size_note[64];
+    if (app->font_size > 0.0f) snprintf(size_note, sizeof(size_note), " at %.0f px", app->font_size);
+    else                       size_note[0] = '\0';
+
+    if (app_font_apply(app->font, app->font_size)) {
+        snprintf(app->font_msg, sizeof(app->font_msg), "Font: %s%s",
+                 app->font[0] ? file_base(app->font) : "built-in", size_note);
+    } else {
+        snprintf(app->font_msg, sizeof(app->font_msg),
+                 "\"%s\" could not be read as a font; the built-in font is in use",
+                 file_base(app->font));
+        app->font[0] = '\0';
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2286,6 +2511,44 @@ static void open_with_default(AppPanes* app, const char* fullpath) {
     snprintf(app->status_msg, sizeof(app->status_msg), "Open with default: %s", fullpath);
 }
 
+// The cursor-bound actions, shared by the key handler and the File menu. A menu
+// item that reimplements its shortcut is how a menu ends up doing something the
+// key does not, so both call these.
+static void rename_cursor(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (branch_blocked(app, active)) return;
+    if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0)
+        open_name_dialog(app, OP_RENAME, active.entries[active.selected]->name);
+}
+
+static void edit_cursor(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (active.selected >= active.entry_count) return;
+    FileEntry* e = active.entries[active.selected];
+    if (in_archive(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Editing an archive member needs a real file (Alt+F9 extracts it)");
+        return;
+    }
+    if (is_directory(e->name, e->mode)) return;
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
+    spawn_terminal_editor(app, full);
+}
+
+static void open_cursor_default(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (active.selected >= active.entry_count) return;
+    if (in_archive(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "An archive member has to be extracted first (Alt+F9)");
+        return;
+    }
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
+    open_with_default(app, full);
+}
+
 // ---------------------------------------------------------------------------
 // Alt+F10 / Ctrl+F8: directory tree window
 // ---------------------------------------------------------------------------
@@ -3316,9 +3579,17 @@ static void render_about(AppPanes* app) {
     ImGui::SetNextWindowSize(ImVec2(600, 540), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 300, io.DisplaySize.y * 0.5f - 270), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("About mc-clone", &open, ImGuiWindowFlags_NoCollapse);
+    char title[64];
+    snprintf(title, sizeof(title), "About %s", MC_APP_NAME);
+    ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse);
+    // Who this build is, measured rather than typed: the toolchain versions and
+    // the archive tools come from the running process.
+    char ident[1024];
+    app_about_identity(ident, sizeof(ident));
+    ImGui::TextWrapped("%s", ident);
+    ImGui::Separator();
+    ImGui::Spacing();
     ImGui::TextUnformatted(
-        "mc-clone - a Total Commander style file manager (Dear ImGui + SDL3)\n\n"
         "TOTAL COMMANDER KEYS\n"
         "F1 help            F9 pane menu     F10 app menu    Alt+F4 quit\n"
         "F3 view            F4 edit          F5 copy         F6 move/rename\n"
@@ -3360,7 +3631,11 @@ static void render_about(AppPanes* app) {
         "tar cannot be written with a password, and only 7z splits into volumes\n"
         "An archive's contents are read-only: extract, change, pack again\n\n"
         "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
-        "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n");
+        "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n\n"
+        "MENUS\n"
+        "F10 opens the Commands menu   Shift+F9 hotlist   Shift+F10 pane menu\n"
+        "File, Commands, Options and Help sit on the menu bar\n"
+        "Options > Fonts and theme... picks the font and the palette\n");
     if (!open) app->about_open = false;
     ImGui::End();
 }
@@ -3417,6 +3692,193 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
     ImGui::PopStyleColor(2);
 }
 
+// "needle anywhere in hay", case-insensitively. The font filter is a substring
+// box, not a glob: someone looking for DejaVu types "dejavu" and means that.
+static bool icontains(const char* hay, const char* needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return true;
+    for (const char* p = hay; *p; p++)
+        if (!strncasecmp(p, needle, nl)) return true;
+    return false;
+}
+
+// The Options dialog: the settings that need a widget rather than a menu item.
+// The font list is scanned once and filtered in place, because a system font
+// tree holds hundreds of files and this still has to fit in a dialog.
+static void render_options(AppPanes* app) {
+    if (!app->options_open) return;
+    if (!app->font_scanned) { app_scan_fonts(app->font_files); app->font_scanned = true; }
+
+    // Never wider than the screen it opened on: the dialog is a column of long
+    // absolute paths, and one that runs off the edge cannot be read or moved.
+    ImVec2 disp = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(ImVec2(ImMin(620.0f, disp.x - 24.0f),
+                                    ImMin(460.0f, disp.y - 24.0f)), ImGuiCond_FirstUseEver);
+    bool open = app->options_open;
+    ImGui::Begin("Options", &open);
+
+    int count = 0;
+    const char* const* names = mc_theme_list(&count);
+    int tidx = 0;
+    for (int i = 0; i < count; i++) if (!strcmp(app->theme, names[i])) { tidx = i; break; }
+    if (ImGui::Combo("Theme", &tidx, names, count)) {
+        snprintf(app->theme, sizeof(app->theme), "%s", names[tidx]);
+        mc_apply_theme(app->theme);
+        snprintf(app->status_msg, sizeof(app->status_msg), "Theme: %s", app->theme);
+    }
+
+    float size = app->font_size;
+    if (ImGui::SliderFloat("Size", &size, 0.0f, 48.0f, "%.0f px")) {
+        app->font_size = size < 0.0f ? 0.0f : size;
+        app->font_dirty = true;
+    }
+    ImGui::TextWrapped("0 px is the built-in size: 13 px for the built-in font, "
+                       "16 px for a TrueType font");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Font");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##fontfilter", "filter the list",
+                             app->font_filter, sizeof(app->font_filter));
+    // The filter is a text field: while it holds the keyboard the arrows and
+    // Delete edit the word, they do not walk the file list behind the dialog.
+    app->options_field_active = ImGui::IsItemActive();
+
+    const float frame = ImGui::GetFrameHeight();
+    if (ImGui::BeginListBox("##fontlist", ImVec2(-FLT_MIN, frame * 12.0f))) {
+        int cur = 0;   // 0 = the built-in font, i+1 = font_files[i]
+        for (int i = 0; i < (int)app->font_files.size(); i++)
+            if (app->font_files[i] == app->font) { cur = i + 1; break; }
+        if (ImGui::Selectable("Built-in font", cur == 0)) {
+            app->font[0] = '\0';
+            app->font_dirty = true;
+        }
+        int shown = 0;
+        for (int i = 0; i < (int)app->font_files.size(); i++) {
+            const std::string& p = app->font_files[i];
+            if (app->font_filter[0] && !icontains(p.c_str(), app->font_filter)) continue;
+            shown++;
+            if (ImGui::Selectable(file_base(p.c_str()), cur == i + 1)) {
+                snprintf(app->font, sizeof(app->font), "%s", p.c_str());
+                app->font_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+        }
+        if (!shown) ImGui::TextDisabled("(no font file matches \"%s\")", app->font_filter);
+        ImGui::EndListBox();
+    }
+
+    // What happened to the last pick, including the case where the file was
+    // rejected and the built-in font went back in.
+    if (app->font_msg[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.55f, 0.25f, 1.0f));
+        ImGui::TextWrapped("%s", app->font_msg);
+        ImGui::PopStyleColor();
+    }
+    // Wrapped, like everything else in the dialog: a sentence that is longer
+    // than the window would otherwise push its frame off the screen.
+    ImGui::TextWrapped("%d font files in the system and user font directories",
+                       (int)app->font_files.size());
+    ImGui::Spacing();
+    if (ImGui::Button("Rescan")) app_scan_fonts(app->font_files);
+    ImGui::SameLine();
+    if (ImGui::Button("Close")) app->options_open = false;
+
+    if (!open) app->options_open = false;
+    ImGui::End();
+}
+
+// File menu: what TC puts under Files. Everything here acts on the entry under
+// the cursor or on the marks, and anything that blocks goes through the deferred
+// table instead of running inside the frame.
+static void render_file_items(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+
+    if (ImGui::MenuItem("View", "F3")) active.quick_view = !active.quick_view;
+    if (ImGui::MenuItem("Open with the default application", "Alt+F3")) open_cursor_default(app);
+    if (ImGui::MenuItem("Edit", "F4")) edit_cursor(app);
+    ImGui::Separator();
+    if (ImGui::MenuItem("New folder", "F7")) open_name_dialog(app, OP_MKDIR, nullptr);
+    if (ImGui::MenuItem("New file", "Shift+F4")) open_name_dialog(app, OP_NEWFILE, nullptr);
+    if (ImGui::MenuItem("Rename", "F2")) rename_cursor(app);
+    // Copy and move stop at the destination dialog; the operation itself runs
+    // between frames.
+    if (ImGui::MenuItem("Copy", "F5")) app->pending_op = DEFER_COPY;
+    if (ImGui::MenuItem("Move / rename", "F6")) app->pending_op = DEFER_MOVE;
+    if (ImGui::MenuItem("Copy in place", "Shift+F5")) app->pending_op = DEFER_COPY_IN_PLACE;
+    if (ImGui::MenuItem("Rename in place", "Shift+F6")) rename_cursor(app);
+    if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) app->pending_op = DEFER_SYMLINK_OTHER;
+    ImGui::Separator();
+    // The internal clipboard, next to the copy and move above it: TC keeps both
+    // pairs under Files, and "Copy" with two meanings in one menu is what the
+    // shortcuts are for.
+    if (ImGui::MenuItem("Copy marked", "Ctrl+C")) clipboard_set(app, active, false);
+    if (ImGui::MenuItem("Cut marked", "Ctrl+X")) clipboard_set(app, active, true);
+    if (ImGui::MenuItem("Paste", "Ctrl+V")) app->pending_op = DEFER_PASTE;
+    ImGui::Separator();
+    if (ImGui::MenuItem("Delete", "F8 / Del")) request_delete(app, false);
+    if (ImGui::MenuItem("Delete without the trash", "Shift+F8")) request_delete(app, true);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Quit", "Alt+F4")) app->quit_request = true;
+}
+
+// Options menu: the settings that outlive the current directory. TC keeps these
+// under Config; ours are few enough for one menu, and the two that need a widget
+// (a theme picker, a font picker) open the Options dialog.
+static void render_options_items(AppPanes* app) {
+    if (ImGui::MenuItem("Fonts and theme...")) app->options_open = !app->options_open;
+
+    if (ImGui::BeginMenu("Theme")) {
+        int count = 0;
+        const char* const* names = mc_theme_list(&count);
+        for (int i = 0; i < count; i++) {
+            if (ImGui::MenuItem(names[i], nullptr, !strcmp(app->theme, names[i]))) {
+                snprintf(app->theme, sizeof(app->theme), "%s", names[i]);
+                mc_apply_theme(app->theme);
+                snprintf(app->status_msg, sizeof(app->status_msg), "Theme: %s", app->theme);
+            }
+        }
+        ImGui::EndMenu();
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem("Show hidden files", "Alt+.", app->show_hidden)) {
+        app->show_hidden = !app->show_hidden;
+        fs_set_show_hidden(app->show_hidden);
+        app_panes_refresh_left(app);
+        app_panes_refresh_right(app);
+    }
+    if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
+
+    if (ImGui::BeginMenu("Sort by")) {
+        static const int         keys[5] = { FS_SORT_NAME, FS_SORT_EXT, FS_SORT_DATE, FS_SORT_SIZE, FS_SORT_NONE };
+        static const char*       names[5] = { "Name", "Extension", "Date", "Size", "Unsorted" };
+        static const char*       hints[5] = { "Ctrl+F3", "Ctrl+F4", "Ctrl+F5", "Ctrl+F6", "Ctrl+F7" };
+        static const char*       short_[5] = { "name", "ext", "date", "size", "unsorted" };
+        for (int i = 0; i < 5; i++) {
+            if (ImGui::MenuItem(names[i], hints[i], fs_get_sort_mode() == keys[i])) {
+                fs_set_sort_mode(keys[i]);
+                snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s", short_[i]);
+                app_panes_refresh_left(app);
+                app_panes_refresh_right(app);
+            }
+        }
+        ImGui::EndMenu();
+    }
+
+    ImGui::Separator();
+    // The same switch the delete prompt reports, so the menu says what Del will do.
+    if (ImGui::MenuItem("Send deletions to the trash", nullptr, app->trash_mode != 0)) {
+        app->trash_mode = app->trash_mode ? 0 : 1;
+        snprintf(app->status_msg, sizeof(app->status_msg), "Deletes %s%s",
+                 app->trash_mode ? "go to the trash" : "are direct",
+                 (app->trash_mode && !fs_trash_available())
+                     ? " (none found on this system)" : "");
+    }
+}
+
 // Commands menu items. Shared by the menu bar and the F10 keyboard menu so the
 // two can never drift apart.
 static void render_commands_items(AppPanes* app) {
@@ -3456,14 +3918,9 @@ static void render_commands_items(AppPanes* app) {
     }
     if (ImGui::MenuItem("Tree in this panel", "Ctrl+Shift+F8")) tree_mode_toggle(app, active, TREE_EMBED);
     if (ImGui::MenuItem("Split view: tree + list", "Shift+Tab")) tree_mode_toggle(app, active, TREE_SPLIT);
-    if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
     if (ImGui::MenuItem("Pack archive", "Alt+F5")) do_pack(app, false);
     // Anything below that blocks runs between frames, not here.
     if (ImGui::MenuItem("Extract archive", "Alt+F6")) app->pending_op = DEFER_EXTRACT;
-    if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, active);
-    if (ImGui::MenuItem("New file", "Shift+F4")) open_name_dialog(app, OP_NEWFILE, nullptr);
-    if (ImGui::MenuItem("Copy in place", "Shift+F5")) app->pending_op = DEFER_COPY_IN_PLACE;
-    if (ImGui::MenuItem("Link in other pane", "Shift+Ctrl+F5")) app->pending_op = DEFER_SYMLINK_OTHER;
     if (ImGui::MenuItem("Count marked", "Ctrl+L")) count_marked_sizes(app);
     if (ImGui::MenuItem("Fill directory sizes", "Alt+Shift+Enter")) app->pending_op = DEFER_FILL_SIZES;
     if (ImGui::MenuItem("Add to hotlist", "Alt+D")) {
@@ -3471,11 +3928,6 @@ static void render_commands_items(AppPanes* app) {
         for (const std::string& s : app->hotlist) if (s == active.current_dir) { dup = true; break; }
         if (!dup) { app->hotlist.push_back(active.current_dir); hotlist_save(app); }
     }
-    ImGui::Separator();
-    if (ImGui::MenuItem("Copy", "Ctrl+C")) clipboard_set(app, active, false);
-    if (ImGui::MenuItem("Cut", "Ctrl+X")) clipboard_set(app, active, true);
-    // Paste pumps its own progress frames, so it has to run between frames.
-    if (ImGui::MenuItem("Paste", "Ctrl+V")) app->pending_op = DEFER_PASTE;
     ImGui::Separator();
     if (ImGui::MenuItem("Mark all", "Ctrl+Num+")) select_all_marks(active);
     if (ImGui::MenuItem("Clear marks", "Ctrl+Num-")) clear_marks(active);
@@ -3494,25 +3946,6 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("View long", "Ctrl+F2")) app->view_mode = VIEW_FULL;
     if (ImGui::MenuItem("Compare panes", "Shift+F2")) app->compare_on = !app->compare_on;
     if (ImGui::MenuItem("Quick view panel", "Ctrl+Q")) app->quick_view_pane = !app->quick_view_pane;
-    static const int sort_keys[5] = { FS_SORT_NAME, FS_SORT_EXT, FS_SORT_DATE, FS_SORT_SIZE, FS_SORT_NONE };
-    static const char* sort_names[5] = { "Sort by name", "Sort by extension", "Sort by date",
-                                         "Sort by size", "Unsorted" };
-    static const char* sort_short[5] = { "name", "ext", "date", "size", "unsorted" };
-    static const char* sort_hints[5] = { "Ctrl+F3", "Ctrl+F4", "Ctrl+F5", "Ctrl+F6", "Ctrl+F7" };
-    for (int i = 0; i < 5; i++) {
-        if (ImGui::MenuItem(sort_names[i], sort_hints[i])) {
-            fs_set_sort_mode(sort_keys[i]);
-            snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s", sort_short[i]);
-            app_panes_refresh_left(app);
-            app_panes_refresh_right(app);
-        }
-    }
-    if (ImGui::MenuItem("Show hidden files", "Alt+.")) {
-        app->show_hidden = !app->show_hidden;
-        fs_set_show_hidden(app->show_hidden);
-        app_panes_refresh_left(app);
-        app_panes_refresh_right(app);
-    }
     ImGui::Separator();
     if (ImGui::MenuItem("New tab", "Ctrl+T")) tab_new(&active, true);
     if (ImGui::MenuItem("New tab, stay here", "Ctrl+Shift+T")) tab_new(&active, false);
@@ -3523,7 +3956,6 @@ static void render_commands_items(AppPanes* app) {
     ImGui::Separator();
     if (ImGui::MenuItem("Refresh", "Ctrl+R"))
         app->left_focus ? app_panes_refresh_left(app) : app_panes_refresh_right(app);
-    if (ImGui::MenuItem("Quit", "Alt+F4")) app->quit_request = true;
 }
 
 void app_panes_render(AppPanes* app) {
@@ -3542,8 +3974,16 @@ void app_panes_render(AppPanes* app) {
 
     // Top menu bar. The Commands items also back the F10 keyboard menu.
     if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            render_file_items(app);
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Commands")) {
             render_commands_items(app);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Options")) {
+            render_options_items(app);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
@@ -3722,6 +4162,7 @@ void app_panes_render(AppPanes* app) {
     render_confirm(app);
     render_about(app);
     render_properties(app);
+    render_options(app);
 }
 
 AppPanes* app_panes_init() {
@@ -3750,6 +4191,11 @@ AppPanes* app_panes_init() {
 // next session can reopen them.
 void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->view_mode = app->view_mode;
+    // The Options dialog edits these live, so what the session showed is what the
+    // next one starts with.
+    snprintf(cfg->theme, sizeof(cfg->theme), "%s", app->theme);
+    snprintf(cfg->font, sizeof(cfg->font), "%s", app->font);
+    cfg->font_size = app->font_size;
     cfg->show_hidden = app->show_hidden ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
@@ -3774,6 +4220,9 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
 void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     struct stat st;
     if (cfg->view_mode >= 0 && cfg->view_mode <= 2) app->view_mode = cfg->view_mode;
+    if (cfg->theme[0]) snprintf(app->theme, sizeof(app->theme), "%s", cfg->theme);
+    snprintf(app->font, sizeof(app->font), "%s", cfg->font);
+    app->font_size = cfg->font_size > 0.0f ? cfg->font_size : 0.0f;   // 0 = the built-in size
     app->show_hidden = cfg->show_hidden != 0;
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
@@ -4177,6 +4626,16 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
         default: break;
         }
     }
+    // Same for the Options dialog's font filter: typing "dejavu" narrows a list
+    // of hundreds of files, it does not scroll the pane behind the dialog.
+    if (app && app->options_open && app->options_field_active) {
+        switch (key) {
+        case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
+            return false;
+        default: break;
+        }
+    }
     switch (key) {
     case SDLK_UP: case SDLK_DOWN:
     case SDLK_PAGEUP: case SDLK_PAGEDOWN:
@@ -4268,6 +4727,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (app->cmdhist_open && key == SDLK_ESCAPE) { app->cmdhist_open = false; return; }
     if (app->tree_open && key == SDLK_ESCAPE) { app->tree_open = false; return; }
     if (app->about_open && key == SDLK_ESCAPE)   { app->about_open = false; return; }
+    if (app->options_open && key == SDLK_ESCAPE) { app->options_open = false; return; }
     // ---- pack dialog (Alt+F5): Enter packs, Esc cancels, and no other key
     //      reaches the panes while it is up ----
     if (app->pack_open) {
@@ -4608,20 +5068,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
 
     // ---- file operations ----
     // Alt+F3: open the cursor entry with the desktop's default application.
-    if (key == SDLK_F3 && (mod & SDL_KMOD_ALT)) {
-        if (active.selected >= 0 && active.selected < active.entry_count) {
-            if (in_archive(active)) {
-                snprintf(app->status_msg, sizeof(app->status_msg),
-                         "An archive member has to be extracted first (Alt+F9)");
-                return;
-            }
-            char full[4100];
-            snprintf(full, sizeof(full), "%s/%s", active.current_dir,
-                     entry_rel(active, active.selected));
-            open_with_default(app, full);
-        }
-        return;
-    }
+    if (key == SDLK_F3 && (mod & SDL_KMOD_ALT)) { open_cursor_default(app); return; }
     // TC "file view short / long": the brief and the full column set.
     if (key == SDLK_F1 && (mod & SDL_KMOD_CTRL)) {
         app->view_mode = VIEW_BRIEF;
@@ -4652,10 +5099,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     if (key == SDLK_F2 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) {
-        if (branch_blocked(app, active)) return;
-        if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
-            open_name_dialog(app, OP_RENAME, active.entries[active.selected]->name);
-        }
+        rename_cursor(app);
         return;
     }
     // TC F7: a dialog, not a prompt in the bar, so the folder name is typed into
@@ -4672,17 +5116,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     if (key == SDLK_F4) {
-        if (active.selected < active.entry_count) {
-            FileEntry* e = active.entries[active.selected];
-            if (in_archive(active)) {
-                snprintf(app->status_msg, sizeof(app->status_msg),
-                         "Editing an archive member needs a real file (Alt+F9 extracts it)");
-            } else if (!is_directory(e->name, e->mode)) {
-                char full[4100];
-                snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
-                spawn_terminal_editor(app, full);
-            }
-        }
+        edit_cursor(app);
         return;
     }
     // TC "F8, Del": plain Del deletes; Shift+Del / Shift+F8 skip the trash
@@ -4705,10 +5139,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_F5 && shift) { do_copy_in_place(app); return; }
     // TC Shift+F6: move/rename inside the current directory = the rename prompt.
     if (key == SDLK_F6 && shift) {
-        if (branch_blocked(app, active)) return;
-        if (active.selected < active.entry_count && strcmp(active.entries[active.selected]->name, "..") != 0) {
-            open_name_dialog(app, OP_RENAME, active.entries[active.selected]->name);
-        }
+        rename_cursor(app);
         return;
     }
     if (key == SDLK_F5 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { do_copy(app); return; }

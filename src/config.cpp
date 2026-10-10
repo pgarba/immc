@@ -16,6 +16,10 @@ static std::string config_path() {
     return config_dir() + "/config";
 }
 
+void mc_config_path(char* out, size_t n) {
+    snprintf(out, n, "%s", config_path().c_str());
+}
+
 static void ensure_config_dir() {
     std::string dir = config_dir();
     // Create ~/.config and ~/.config/mc-clone (ignore "already exists").

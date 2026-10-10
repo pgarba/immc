@@ -5,14 +5,58 @@
 #include "imgui_impl_opengl3.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
+#include <cstdio>
+#include <cstring>
 
 // Our application code
 #include "panes.h"
 #include "config.h"
 #include "theme.h"
+#include "version.h"
 
-int main(int, char**)
+// Headless identity output: no SDL video, no ImGui, nothing to lay out. It is
+// the one path a packager checks from a terminal, so it is handled before SDL is
+// initialized rather than after a window has failed to open on a headless box.
+// The lines are formatted into buffers and written with fputs: this project keeps
+// printf out of the C++ sources.
+static int print_version(void) {
+    char line[256];
+    app_identity_line(line, sizeof(line));
+
+    int v = SDL_GetVersion();
+    char built[256];
+    snprintf(built, sizeof(built), "Dear ImGui %s, SDL %d.%d.%d\n", IMGUI_VERSION,
+             SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
+
+    char cfgp[1024];
+    mc_config_path(cfgp, sizeof(cfgp));
+    char settings[1200];
+    snprintf(settings, sizeof(settings), "settings %s\n", cfgp);
+
+    fputs(line, stdout); fputc('\n', stdout);
+    fputs(built, stdout);
+    fputs(settings, stdout);
+    return 0;
+}
+
+static int print_usage(const char* argv0) {
+    const char* name = strrchr(argv0, '/');
+    char line[1200];
+    snprintf(line, sizeof(line),
+             "usage: %s [-v|--version] [-h|--help]\n"
+             "%s %s - a Total Commander style file manager (Dear ImGui + SDL3)\n",
+             name ? name + 1 : MC_APP_BINARY, MC_APP_NAME, MC_VERSION);
+    fputs(line, stdout);
+    return 0;
+}
+
+int main(int argc, char** argv)
 {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) return print_version();
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))    return print_usage(argv[0]);
+    }
+
     // Load user configuration (~/.config/mc-clone/config)
     MCConfig cfg;
     mc_config_load(&cfg);
@@ -41,7 +85,7 @@ int main(int, char**)
     SDL_Window* window;
     {
         SDL_PropertiesID props = SDL_CreateProperties();
-        SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "mc-clone");
+        SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, MC_APP_NAME);
         SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, cfg.win_w);
         SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, cfg.win_h);
         SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
@@ -54,7 +98,7 @@ int main(int, char**)
         SDL_DestroyProperties(props);
     }
     if (!window)
-        window = SDL_CreateWindow("mc-clone", cfg.win_w, cfg.win_h, window_flags);
+        window = SDL_CreateWindow(MC_APP_NAME, cfg.win_w, cfg.win_h, window_flags);
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1); // Enable vsync
@@ -68,20 +112,6 @@ int main(int, char**)
     // disabled — arrow keys, Tab, Enter etc. are handled by app_panes_handle_key
     // so the panes behave like MC instead of ImGui widget focus.
 
-    // Style: theme from config (dark | light | classic | gruvbox |
-    // gruvbox-light | solarized-dark | solarized-light)
-    mc_apply_theme(cfg.theme);
-
-    // Fonts: custom TTF from config, or the built-in font scaled to font_size.
-    ImFontAtlas* fonts = ImGui::GetIO().Fonts;
-    if (cfg.font[0] != '\0') {
-        float fsize = cfg.font_size > 0.0f ? cfg.font_size : 16.0f;
-        if (!fonts->AddFontFromFileTTF(cfg.font, fsize))
-            fonts->AddFontDefault();
-    } else if (cfg.font_size > 0.0f) {
-        ImGui::GetStyle().FontScaleMain = cfg.font_size / 13.0f;
-    }
-
     // Setup Platform/Renderer backends
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
@@ -91,8 +121,15 @@ int main(int, char**)
     app_panes_set_sdl_window(panes, window);
     app_panes_apply_state(panes, &cfg);   // restore last session's tabs/dirs
 
+    // Style and font come from the panes' state, which apply_state filled from
+    // the config: the Options dialog and the startup path read the same three
+    // values, so a theme or font the dialog changed is already in effect here.
+    mc_apply_theme(panes->theme);
+    app_font_apply(panes->font, panes->font_size);
+
     // Main loop
     bool done = false;
+    char last_title[512] = "";
     while (!done)
     {
         // Poll and handle events
@@ -165,6 +202,21 @@ int main(int, char**)
         // frame so copy/move can pump their own progress UI.
         if (panes->pending_op || panes->pending_confirm_yes)
             app_panes_run_pending(panes);
+
+        // A font the Options dialog picked is rebuilt here too: ImGui does not
+        // let the atlas change while a frame is open.
+        if (panes->font_dirty)
+            app_panes_apply_font(panes);
+
+        // The title bar follows the active pane. Compared first, because setting
+        // it every frame is a round trip to the window manager for a string that
+        // almost never changes.
+        char title[512];
+        app_window_title(panes, title, sizeof(title));
+        if (strcmp(title, last_title)) {
+            SDL_SetWindowTitle(window, title);
+            snprintf(last_title, sizeof(last_title), "%s", title);
+        }
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();

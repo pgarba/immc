@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(mc-clone C CXX)
+project(mc-clone VERSION 0.9.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
+
+# Identity. The repository and the desktop entry call the app immc; the
+# executable it builds is still mc-clone. version.h is generated so the version
+# number exists once, in the project() line above.
+set(MC_APP_NAME   "immc")
+set(MC_APP_BINARY "${PROJECT_NAME}")
+configure_file(${CMAKE_SOURCE_DIR}/src/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h)
 
 # Find SDL3
 find_package(SDL3 REQUIRED)
@@ -29,7 +36,7 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 # Build the application
 add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
 target_link_libraries(mc-clone PRIVATE imgui)
-target_include_directories(mc-clone PRIVATE src)
+target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 
 # Logic tests. tests/test_panes.cpp includes src/panes.cpp so the file-static
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
@@ -37,8 +44,12 @@ target_include_directories(mc-clone PRIVATE src)
 enable_testing()
 add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
 target_link_libraries(test-panes PRIVATE imgui)
-target_include_directories(test-panes PRIVATE src)
+target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 add_test(NAME panes COMMAND test-panes)
+
+# --version is handled before SDL is initialized, so it runs headless.
+add_test(NAME version COMMAND mc-clone --version)
+set_tests_properties(version PROPERTIES PASS_REGULAR_EXPRESSION "immc [0-9]+\\.[0-9]+\\.[0-9]+")
 
 # Archive backend. It shells out to zip/unzip, tar and 7z, so the test builds
 # real archives with those same tools and checks the listing parsers, the

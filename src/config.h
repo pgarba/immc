@@ -1,6 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <stddef.h>   // size_t, for mc_config_path
+
 // User configuration, stored as key = value lines in
 // ~/.config/mc-clone/config (written back on exit).
 static const int MC_MAX_TABS = 8;   // keep in sync with MAX_TABS in panes.h
@@ -35,6 +37,10 @@ struct MCConfig {
     int  right_tab_count;
     int  right_tab_active;
 };
+
+// Absolute path of the config file, for the About window to name. Does not
+// create anything.
+void mc_config_path(char* out, size_t n);
 
 void mc_config_default(MCConfig* c);
 void mc_config_load(MCConfig* c);

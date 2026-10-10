@@ -23,6 +23,10 @@ struct MCThemeColors {
 //        solarized-dark | solarized-light
 void mc_apply_theme(const char* name);
 
+// The theme names the Options dialog offers, in picker order. An unknown name
+// falls back to dark, so every entry here is applicable.
+const char* const* mc_theme_list(int* count);
+
 // Accent colors of the currently active theme.
 const MCThemeColors* mc_theme_colors();
 
