@@ -1452,6 +1452,45 @@ static void test_op_dialog(AppPanes* app, const std::string& root) {
     sh("rm -rf '" + dst + "'");
 }
 
+// Both panes render into the same ImGui window, so a label used by both sides is
+// the same item twice. ImGui only notices while the mouse is over one of them: it
+// counts the items whose ID equals the ID hovered in the previous frame, and more
+// than one raises its "visible items with conflicting ID" error box. Sweeping the
+// mouse over the window and reading that counter is therefore a real test and not
+// a restatement of the fix - it caught the tab strip, where the add-tab "+" and
+// every tab label were pushed with the same ID on both sides. The 12px step is
+// coarse enough to stay under a second and fine enough to land on a small button.
+static void test_ui_id_uniqueness(AppPanes* app) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1280, 800);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    int conflicts = 0;
+    for (int y = 8; y < 800 && conflicts < 3; y += 12) {
+        for (int x = 4; x < 1280 && conflicts < 3; x += 12) {
+            io.MousePos = ImVec2((float)x, (float)y);
+            // Two frames: the first sets the hovered ID, the second is where
+            // ImGui counts the items that answer to it.
+            for (int f = 0; f < 2; f++) {
+                ImGui::NewFrame();
+                app_panes_render(app);
+                ImGui::Render();
+                if (ctx->DebugDrawIdConflictsId != 0) {
+                    printf("duplicate item ID %08X under the mouse at %d,%d\n",
+                           ctx->DebugDrawIdConflictsId, x, y);
+                    conflicts++;
+                }
+            }
+        }
+    }
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+    CHECK(conflicts == 0);
+    ImGui::DestroyContext(ctx);
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -1534,6 +1573,7 @@ int main() {
     test_pack_options(&app, root);
     test_deferred_ops(&app, root);
     test_op_dialog(&app, root);
+    test_ui_id_uniqueness(&app);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

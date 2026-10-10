@@ -2540,7 +2540,12 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
         app->trash_mode = app->trash_mode ? 0 : 1;
 }
 
-static void render_tab_bar(AppPanes* app, Pane& pane) {
+// Both panes draw their strip into the same window, so the strip has to carry
+// the pane in its ID: a tab labelled "work" and the add-tab "+" would otherwise
+// be the same item twice, and ImGui only notices while the mouse is over one of
+// them, which is how it stayed hidden until someone hovered the +.
+static void render_tab_bar(AppPanes* app, Pane& pane, const char* id) {
+    ImGui::PushID(id);
     for (int t = 0; t < pane.tab_count; t++) {
         if (t) ImGui::SameLine();
         char lbl[256];
@@ -2560,6 +2565,7 @@ static void render_tab_bar(AppPanes* app, Pane& pane) {
         if (ImGui::SmallButton("+")) tab_new(&pane, true);
         ImGui::PopID();
     }
+    ImGui::PopID();
     (void)app;
 }
 
@@ -3583,7 +3589,7 @@ void app_panes_render(AppPanes* app) {
     ImGui::TableNextColumn();
 
     // Left pane
-    render_tab_bar(app, left);
+    render_tab_bar(app, left, "ltabs");
     if (!left.path_edit_active)
         snprintf(left.path_edit, sizeof(left.path_edit), "%s", left.current_dir);
     ImVec4 l_bg   = left_focus ? mc_theme_colors()->title_focused : mc_theme_colors()->title_unfocused;
@@ -3620,7 +3626,7 @@ void app_panes_render(AppPanes* app) {
     ImGui::TableNextColumn();
 
     // Right pane
-    render_tab_bar(app, right);
+    render_tab_bar(app, right, "rtabs");
     if (!right.path_edit_active)
         snprintf(right.path_edit, sizeof(right.path_edit), "%s", right.current_dir);
     ImVec4 r_bg   = !left_focus ? mc_theme_colors()->title_focused : mc_theme_colors()->title_unfocused;

@@ -47,7 +47,7 @@ can scope to files but the dirs-only variant is not reachable from the keypad.
 (filter matcher, the `view` row map, marking, mark-undo, tabs, clipboard path helpers, branch view,
 `fs_list_tree`, `fs_touch`/`fs_symlink`/`fs_trash`, quick search, the column spec, the tree model, the
 archive pane mode with its guards and operations including copy-out, the deferred-action table, and the
-operation dialog with its destination rules) run headless — 439 checks in `test-panes` plus 220 in
+operation dialog with its destination rules) run headless — 440 checks in `test-panes` plus 220 in
 `test-archive`: `cmake --build build -j4 && (cd build && ctest)`.
 It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
 reference across an `insert()`, so the `expanded` flag was written to freed memory and the next press
@@ -56,7 +56,11 @@ ImGui frame, which opens a second frame from inside the first and corrupts ImGui
 also driven through `app_panes_handle_key` itself, not only through the classifiers — that is the path
 on which `Alt+F5` used to reach the plain copy handler. Layout is measurable headless too: one frame
 of the pack dialog against a long path settles whether the text reaches past the window, so a clipped
-dialog is a failing check rather than a screenshot someone has to notice.
+dialog is a failing check rather than a screenshot someone has to notice. So is an ID collision: both
+panes draw into one window, and the tab strip pushed the same ID for its add-tab `+` on both sides, so
+hovering it raised ImGui's "visible items with conflicting ID" box. Sweeping a virtual mouse over the
+rendered UI and reading ImGui's own conflict counter turns that into a check — ImGui only counts items
+answering to the ID hovered last frame, which is exactly what a hover does.
 Smoke run: `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone`.
 
 ---
