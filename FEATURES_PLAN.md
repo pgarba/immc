@@ -35,7 +35,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
 | K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes; the size rides on `style.FontScaleMain` for every font, because the size passed to `AddFont()` is read once, on the first frame, and never again |
-| L remote sites | planned | FTP/FTPS/SFTP browsed in a pane, `Ctrl+F` for the saved-site manager, `Ctrl+N` for quick connect, `cd ftp://…` on the command line. Nothing built yet — §8 is the decision record, so the implementation session starts with the shape settled. |
+| L remote sites | done except L3 | `src/remote.{h,cpp}` — libcurl transport, `0600` sites file, MLSD and LIST parsers — and the remote pane mode in `panes.cpp`, compiling **and linking** with and without libcurl. `Ctrl+F` manager, `Ctrl+N` quick connect, `cd ftp://…`, and upload/download/mkdir/rename/delete/chmod are wired. `test-remote` runs 224 checks with 0 failures (171 without libcurl), `ctest` is 4/4 in both configurations, and the offscreen smoke run stays up in both. What libcurl forced into the design, and what is still open, is in §8.1. |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`
 and `font_hinting`. The hinting value is a name and not a number, so a hand-edited config says what the
@@ -642,9 +642,10 @@ Manual checklist (extend per phase):
 ## 8. Phase L — remote sites: FTP, FTPS, SFTP
 
 `Ctrl+F` opens a saved-site manager, `Ctrl+N` a quick-connect line, and a pane can then browse a
-server the way it browses a directory. Nothing here is built. This section records the decisions and
-the shape, so the implementation session starts with the arguments settled rather than re-litigating
-them against 5,500 lines of `panes.cpp`.
+server the way it browses a directory. This section records the decisions and the shape, so the
+implementation session starts with the arguments settled rather than re-litigating them against 5,500
+lines of `panes.cpp`. It is now a record of a built feature: §8.1 says what exists, what libcurl forced
+into the design, and what is still open.
 
 | Decision | Choice | Why |
 |---|---|---|
@@ -667,16 +668,19 @@ the command line without it.
 `size`, `modify` and `unix.mode` — falling back to parsing `LIST` when the server does not implement
 it, in both the unix and the DOS dialect and with names containing spaces. Both produce
 `FileEntry{name, mode, size, mtime}`, so `compare_files()` and the column formatting are untouched.
-`MLST` answers `Alt+Enter` for a single row.
+A single row's metadata comes from listing its parent — `MLST` looked reachable through
+`CURLOPT_CUSTOMREQUEST` and is not, see §8.1.
 
 **TLS is a per-site mode, and the mode stays visible.** `ftp://` with `CURLUSESSL_TRY` upgrades with
-`AUTH TLS` when the server offers it; `ftps://` with `CURLUSESSL_ALL` and `AUTH=TLS` requires explicit
-FTPS; implicit FTPS is `CURLFTPAUTH_SSL` on port 990. Verification is on by default (`VERIFYPEER`,
-`VERIFYHOST=2`). A self-signed server can be connected anyway, per site, and while that flag is set the
-site list and the pane's status line both read `certificate not verified` — a security mode that
-degrades silently is the one thing not to get wrong here. `sftp://`/`ssh://` rides along with libcurl's
-libssh2 backend almost for free; the host key is trust-on-first-use with the fingerprint shown and
-remembered in the sites file, which is the weakest part of the feature and worth saying out loud.
+`AUTH TLS` when the server offers it; explicit FTPS is `CURLUSESSL_ALL` with `AUTH=TLS`, and — contrary
+to how this paragraph first read — it is still sent to curl over an `ftp://` URL, because libcurl reads
+an `ftps://` *scheme* as implicit TLS; see §8.1. Implicit FTPS is `CURLFTPAUTH_SSL` on port 990.
+Verification is on by default (`VERIFYPEER`, `VERIFYHOST=2`). A self-signed server can be connected
+anyway, per site, and while that flag is set the site list, the edit dialog and the pane's status line all
+read `certificate not verified` — a security mode that degrades silently is the one thing not to get
+wrong here. `sftp://`/`ssh://` rides along with libcurl's libssh2 backend almost for free; the host key
+is trust-on-first-use with the fingerprint shown and remembered in the sites file, which is the weakest
+part of the feature and worth saying out loud.
 
 **Operations reuse the copy pipeline.** Download and upload go through the existing progress dialog:
 `CURLOPT_XFERINFOFUNCTION` has the same shape as `fs_progress_fn` — returning true aborts there,
@@ -720,3 +724,93 @@ the pack dialog refuses with a reason instead of closing.
 **Effort.** L1 transport + sites file + site manager + browse + download ~1d. L2 writes (upload,
 mkdir, rename, delete, chmod, properties) ~0.5d. L3 `curl_multi` so listings and transfers do not
 freeze the frame loop ~0.5d. SFTP host-key UX ~2h, deferrable.
+
+### 8.1 Where the build stands
+
+Written, and compiling both with and without libcurl: `src/remote.{h,cpp}` — protocol vocabulary, URL
+parsing, the `0600` sites file, the MLSD and LIST parsers, the cached-handle transport, and the tree
+helpers `net_download_tree`/`net_upload_tree`/`net_remove_tree` — plus the remote pane mode in
+`panes.cpp`: `Pane::remote_root`/`remote_path`/`remote_came_from`, `LIST_REMOTE`, `in_remote()`, and a
+`refresh_pane()` that splits `ftp://…` before it tries an archive path. The `Ctrl+F` manager stages its
+fields in a `NetForm` so Cancel means nothing happened; `Ctrl+N` takes one line; both are in the
+Commands menu. `cd ftp://…` and a bare URL go through `remote_open_url()`, which reuses a saved site's
+credentials for the same root. Guards refuse branch view, tree mode, search, directory sizes, the
+editor, the clipboard, extract-into, and "open with" inside a site; delete says the server has no
+trash; viewing downloads to a temp directory the viewer already cleans up. `--version` and the About
+window print `net_what()`.
+
+`tests/ftp_server.py` is the fixture: passive mode only, one user, jailed to `--root`, one JSON line
+naming the port it bound, `AUTH TLS` when given a certificate, and `FTP_SERVER_LOG=1` to watch the
+protocol on stderr — without that, a client bug looks exactly like a server bug. `test-remote` splits
+the pure half (URLs, virtual paths, the sites file and its mode, both listing dialects, `unix.mode`)
+from the localhost half, and skips the second when the build has no libcurl or the fixture will not
+start.
+
+**Five things libcurl does that the design above assumed otherwise.** All of them were found against
+the fixture, and all are settled in the code now.
+
+- A listing URL has to end in `/`. Without the slash curl sends `SIZE <last component>` to decide
+  file-or-directory, a directory answers `550`, and curl reports *The file does not exist* without ever
+  sending `MLSD`. `dir_url()` appends it — and `quote_cmds()` needs it for the same reason, because its
+  URL is a directory too: with `FAILONERROR` every mutation in a directory deeper than the root failed.
+  That is the shape of the original failure list: uploads passed and mutations did not, because
+  `net_upload()` names a file and was never affected.
+- `CURLOPT_CUSTOMREQUEST "MLST"` on a file URL is ignored: curl still sends `SIZE` then `RETR` and the
+  fact line never arrives. `net_stat()` now lists the parent and matches the basename, for every
+  protocol, which replaced two code paths with one. It also makes *one MLST per entry* in
+  `plan_existing()` wrong twice over — the new `net_stat()` would pay a parent listing per name — so
+  that does one `net_list()` of the destination directory and looks the names up in it.
+- `ftps://` is **implicit** TLS to libcurl: it starts the handshake before it has sent a single FTP
+  command, which against a server waiting for cleartext is `wrong version number`. Explicit FTPS has to
+  travel as `ftp://` with `CURLOPT_USE_SSL` set to `ALL`. The site's root string keeps the `ftps://` the
+  user typed, because that is what the path bar shows and it is the key that tells two saved sites
+  apart; `curl_url()` swaps the scheme at the transport boundary, and only `NET_FTPS_IMPLICIT` keeps
+  `ftps://`.
+- `CURLOPT_FTP_CREATE_MISSING_DIRS` makes curl answer a failed `CWD` with `MKD`, so *listing a path that
+  does not exist creates it on the server*. That belongs on a store and nowhere else, so it is set in
+  `net_upload()` alone.
+- `CURLOPT_QUOTE` runs after curl's own `CWD`, and curl decides whether it needs one from the directory
+  it remembers on the *handle* — while the connection it reuses sits wherever the last transfer left it.
+  `RNFR put.txt` was answered `550` with the session sitting in `/partial`. `quote_cmds()` now puts an
+  absolute `CWD` at the head of the quote list, which runs after anything curl does.
+
+**The server root is spelled two ways and callers have to know both.** `net_path_parent()` returns `""`
+for the root while `net_split_virtual()` returns `"/"` for a typed `ftp://host/`, so `net_path_is_root()`
+is the question and `activate_entry()` asks it. The old condition tested `remote_path[0]`, which made a
+pane at the root navigate to the root forever instead of leaving the site. `net_join_remote()` is the
+matching join: the naive `dir + "/" + name` produced `//name` out of the root, which a server that
+honours the empty component reads as a directory with no name in it.
+
+**The fixture was wrong in two ways that hid client bugs.** It closed its TLS data connection without a
+`close_notify`, so curl reported `SSL_read: unexpected eof while reading` after the listing bytes had
+already arrived; `close_data()`/`close_ctl()` now `unwrap()` first, guarded on
+`isinstance(…, ssl.SSLSocket)` — a plain socket has no `unwrap()`, and the resulting `AttributeError`
+took the single-process listener down and turned one bug into 39 failures, which is what a fixture that
+dies mid-session looks like. And its MLSD rows left out the space RFC 3659 puts between the facts and
+the entry, so a parser that took the whole tail after the last `;` passed every test while giving every
+name on a real server a leading space — the thing a user notices as a space appearing in front of a
+directory or file name the moment a row is opened or fetched. The fixture emits the conformant row now,
+and the parser strips exactly one separator space, so a name that genuinely starts with a space (sent as
+two) keeps one.
+
+**A build without libcurl did not link.** `MC_REMOTE_SOURCES` was empty in that configuration, so
+`remote.cpp` was never compiled and `panes.cpp` ended up with 114 undefined references to `net_*`. The
+module is compiled either way now; only the library and `MC_HAVE_CURL` are conditional. The claim that
+this configuration built had never actually been checked — it is checked in both `ctest` runs now.
+
+**Verified.** `test-remote`: 224 checks, 0 failures — 171 in a build without libcurl, where the
+transport half is skipped and the parsers, the URL layer and the sites file still run. `ctest`: 4/4 in
+both configurations. `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone` stays up in both. `--version`
+prints `remote sites: libcurl 8.22.0 (OpenSSL/3.6.5)`, or `remote sites: no FTP support in this build
+(install libcurl and rebuild to browse FTP)`.
+
+**Still open, and named.** L3's `curl_multi_*`, so a WAN listing does not freeze the frame loop — the
+transport blocks today, with `CONNECTTIMEOUT_MS` and `LOW_SPEED_LIMIT`/`LOW_SPEED_TIME` there so a dead
+server ends rather than hangs. The SFTP host-key UX: trust-on-first-use with the fingerprint remembered
+in the sites file, still the weakest part of the feature. Two checks the testing paragraph above asks for
+and does not have: a transfer the server stalls past `LOW_SPEED_TIME`, which needs the stall window
+shortened for the test to run in seconds rather than twenty; and an assertion that `certificate not
+verified` reaches the UI — the site list, the edit dialog and the status line all say it now, but nothing
+checks that they do. The `version` test does not assert the FTP line either. One cost the parent-listing
+`net_stat()` introduced: a recursive remote operation lists each directory twice, once for `net_stat()`
+and once for the walk, which is worth collapsing when L3 lands.

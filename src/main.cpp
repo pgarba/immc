@@ -41,10 +41,20 @@ static int print_version(void) {
     snprintf(font_line, sizeof(font_line), "text rasterized with %s%s\n", raster,
              mc_font_hinting_available() ? " (hinting selectable)" : " (no hinting available)");
 
+    // The same question one layer up: does this build talk to servers at all, and
+    // can it do it over TLS. A build without libcurl still runs; only the remote
+    // panes are missing, and this is where that becomes visible.
+    char ftp[96];
+    net_what(ftp, sizeof(ftp));
+    char net_line[200];
+    snprintf(net_line, sizeof(net_line), "remote sites: %s%s\n", ftp,
+             net_available() ? "" : " (install libcurl and rebuild to browse FTP)");
+
     fputs(line, stdout); fputc('\n', stdout);
     fputs(built, stdout);
     fputs(settings, stdout);
     fputs(font_line, stdout);
+    fputs(net_line, stdout);
     return 0;
 }
 

@@ -65,6 +65,8 @@ AppPanes::AppPanes() {
     right.tab_count = 0; right.tab_active = 0;
     left.archive_path[0] = '\0'; left.archive_prefix[0] = '\0';
     right.archive_path[0] = '\0'; right.archive_prefix[0] = '\0';
+    left.remote_root[0] = '\0'; left.remote_path[0] = '\0'; left.remote_came_from[0] = '\0';
+    right.remote_root[0] = '\0'; right.remote_path[0] = '\0'; right.remote_came_from[0] = '\0';
     left.filter[0] = '\0'; left.last_filter[0] = '\0'; left.filter_applied[0] = '\0';
     left.filter_active = false; left.filter_field_active = false; left.filter_focus_request = false;
     left.filter_exec_only = false;
@@ -92,6 +94,12 @@ AppPanes::AppPanes() {
     cmdhist_open = false;
     volumes_open = false;
     volumes_target = 0;
+    remote_mgr_open = false;
+    remote_quick_open = false;
+    remote_quick[0] = '\0';
+    remote_note[0] = '\0';
+    remote_edit = -1;
+    remote_focus_request = false;
     search_open = false;
     search_pattern[0] = '\0';
     search_done = false;
@@ -150,6 +158,7 @@ AppPanes::AppPanes() {
     prog_files_total = 0;
     prog_t0 = 0;
     prog_last_pump = 0;
+    prog_abort = false;
     pending_op = DEFER_NONE;
     pending_confirm_yes = false;
     sdl_window = nullptr;
@@ -231,6 +240,131 @@ static bool branch_blocked(AppPanes* app, const Pane& pane) {
     if (pane.list_mode != LIST_BRANCH) return false;
     snprintf(app->status_msg, sizeof(app->status_msg), "Not available in branch view (Ctrl+B exits)");
     return true;
+}
+
+// The pane is showing a directory that lives on a site. Like an archive, every
+// path built from a row is virtual, so the operations below have to go through
+// the transport rather than hand the path to a filesystem call.
+static bool in_remote(const Pane& pane) { return pane.remote_root[0] != '\0'; }
+
+// A pane's virtual path carries no password, so the login has to be looked up
+// from the site list. refresh_pane() is called from far too many places to gain
+// an AppPanes parameter, so the list is bound here instead: two pointers into
+// the AppPanes that owns it, which stay valid because the vectors are edited in
+// place. app_panes_free() unbinds them so a stale pane can never read a dead
+// app's sites.
+static const std::vector<NetSite>* g_net_saved;
+static const std::vector<NetSite>* g_net_adhoc;
+// The last listing failure. refresh_pane() has no status line of its own, so it
+// leaves the reason here and the render loop moves it into the status bar.
+static std::string g_net_note;
+
+static void net_bind(const AppPanes* app) {
+    g_net_saved = app ? &app->remote_sites : nullptr;
+    g_net_adhoc = app ? &app->remote_adhoc : nullptr;
+}
+
+// The site a root URL belongs to. The root carries the user, so two entries for
+// one host with different logins stay distinct. A quick connect that still holds
+// a typed password wins over a saved entry that declined to remember one.
+static const NetSite* net_site_for(const std::string& root) {
+    const NetSite* loose = nullptr;
+    const std::vector<NetSite>* lists[] = { g_net_saved, g_net_adhoc };
+    for (const std::vector<NetSite>* list : lists) {
+        if (!list) continue;
+        for (const NetSite& s : *list) {
+            if (net_site_root(s) != root) continue;
+            if (!s.password.empty()) return &s;
+            loose = &s;
+        }
+    }
+    return loose;
+}
+
+// Build the rows for one directory on a site. The listing arrives with names,
+// sizes, times and permission bits, so the pane sorts, filters and formats a
+// remote row exactly like a local one. `rel` is left alone: a remote row's path
+// is its name against the pane's virtual directory, as in an ordinary directory.
+static void list_remote_dir(const NetSite& site, const std::string& rpath,
+                            FileEntry*** out_entries, int* out_count,
+                            std::string* err) {
+    *out_entries = nullptr;
+    *out_count = 0;
+
+    std::vector<FileEntry> rows;
+    if (!net_list(site, rpath, &rows, err)) return;
+
+    std::vector<FileEntry*> ptrs;
+    for (const FileEntry& e : rows) {
+        if (!fs_get_show_hidden() && e.name[0] == '.') continue;
+        FileEntry* fe = file_entry_new(e.name, e.mode, e.size, e.mtime);
+        if (fe) ptrs.push_back(fe);
+    }
+    // Same order a real directory uses, so the cursor and the sort keys behave
+    // identically on a site.
+    std::sort(ptrs.begin(), ptrs.end(), [](const FileEntry* a, const FileEntry* b) {
+        return compare_files(&a, &b) < 0;
+    });
+
+    // ".." is always a row. At the site root it has no parent on the server, so
+    // it leaves the site; activate_entry() is what knows that.
+    *out_entries = (FileEntry**)calloc(ptrs.size() + 1, sizeof(FileEntry*));
+    if (!*out_entries) {
+        for (FileEntry* fe : ptrs) file_entry_free(fe);
+        return;
+    }
+    (*out_entries)[0] = file_entry_new("..", S_IFDIR | 0755, 0, 0);
+    int i = 1;
+    for (FileEntry* fe : ptrs) (*out_entries)[i++] = fe;
+    *out_count = i;
+}
+
+// The sites file is read once, before any pane is refreshed: a session restored
+// from the config can hold remote paths in its tabs, and those need their
+// logins back before the first listing.
+static void remote_sites_load(AppPanes* app) {
+    std::string err;
+    if (!net_sites_load(&app->remote_sites, &err) && !err.empty())
+        snprintf(app->remote_note, sizeof(app->remote_note), "%s", err.c_str());
+}
+
+static void remote_sites_write(AppPanes* app) {
+    std::string err;
+    if (!net_sites_save(app->remote_sites, &err))
+        snprintf(app->remote_note, sizeof(app->remote_note), "%s", err.c_str());
+}
+
+// A remote pane is a second filesystem seen over the network. Anything that
+// needs a real local file says so here, rather than letting a local call fail on
+// a path that only the transport understands.
+static bool remote_blocked(AppPanes* app, const Pane& pane, const char* what) {
+    if (!in_remote(pane)) return false;
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             "%s needs a local file: F5 downloads from a site", what);
+    return true;
+}
+
+// The login a remote pane needs. A pane can arrive at a site from a restored
+// session, the site manager, or a typed command line, and in every case the site
+// list is the only place the password lives. When it is not there, the status
+// line says what to do rather than leaving the operation to fail silently.
+static const NetSite* remote_site_for_root(AppPanes* app, const std::string& root) {
+    const NetSite* site = net_site_for(root);
+    if (!site)
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "No login for %s: Ctrl+F edits the saved sites, Ctrl+N connects again",
+                 root.c_str());
+    return site;
+}
+
+static const NetSite* remote_site_of(AppPanes* app, const Pane& pane) {
+    return remote_site_for_root(app, pane.remote_root);
+}
+
+// The server-side path of a row in a remote pane: the pane's path plus the row's
+// name. Remote rows carry no `rel` of their own, unlike branch and archive rows.
+static std::string remote_row_path(const Pane& pane, const char* name) {
+    return net_join_remote(pane.remote_path, name);
 }
 
 static bool filter_matches(const char* name, const char* pat) {
@@ -472,6 +606,8 @@ static void list_archive_dir(const char* archive, const char* prefix,
 
 void refresh_pane(Pane* pane, const char* path) {
     bool dir_changed = strcmp(pane->current_dir, path) != 0;
+    char previous[4096];
+    snprintf(previous, sizeof(previous), "%s", pane->current_dir);
     free_entries(pane->entries, pane->entry_count);
     strncpy(pane->current_dir, path, sizeof(pane->current_dir) - 1);
     pane->current_dir[sizeof(pane->current_dir) - 1] = '\0';
@@ -479,15 +615,40 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->anchor = 0;
     pane->rel.clear();
     char arch[4096], prefix[1024];
-    if (arch_split_virtual(path, arch, sizeof arch, prefix, sizeof prefix)) {
+    std::string nroot, nrpath;
+    if (net_split_virtual(path, &nroot, &nrpath)) {
+        const NetSite* site = net_site_for(nroot);
+        std::string err;
+        if (site) {
+            list_remote_dir(*site, nrpath, &pane->entries, &pane->entry_count, &err);
+        } else {
+            err = "No login for " + nroot + ": Ctrl+N connects to a URL, Ctrl+F edits the saved sites";
+        }
+        if (!err.empty()) g_net_note = err;
+        snprintf(pane->remote_root, sizeof(pane->remote_root), "%s", nroot.c_str());
+        snprintf(pane->remote_path, sizeof(pane->remote_path), "%s", nrpath.c_str());
+        // Remember where the pane came from, because ".." at the site root has
+        // to land somewhere real. Only on the step in: walking deeper inside the
+        // site must not overwrite the way back.
+        if (dir_changed && previous[0] && !net_is_remote(previous))
+            snprintf(pane->remote_came_from, sizeof(pane->remote_came_from), "%s", previous);
+        pane->archive_path[0] = '\0';
+        pane->archive_prefix[0] = '\0';
+        pane->list_mode = LIST_REMOTE;
+    } else if (arch_split_virtual(path, arch, sizeof arch, prefix, sizeof prefix)) {
         list_archive_dir(arch, prefix, &pane->entries, &pane->entry_count, &pane->rel);
         snprintf(pane->archive_path, sizeof pane->archive_path, "%s", arch);
         snprintf(pane->archive_prefix, sizeof pane->archive_prefix, "%s", prefix);
+        pane->remote_root[0] = '\0';
+        pane->remote_path[0] = '\0';
         pane->list_mode = LIST_ARCHIVE;
     } else {
         list_directory(path, &pane->entries, &pane->entry_count);
         pane->archive_path[0] = '\0';
         pane->archive_prefix[0] = '\0';
+        pane->remote_root[0] = '\0';
+        pane->remote_path[0] = '\0';
+        pane->remote_came_from[0] = '\0';
         // A plain navigation also ends branch view.
         pane->list_mode = LIST_NORMAL;
     }
@@ -511,6 +672,7 @@ void refresh_pane(Pane* pane, const char* path) {
 static void compute_dir_size(Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count || idx >= (int)pane.dir_size.size()) return;
     if (in_archive(pane)) return;   // a member's packed size is not a tree total
+    if (in_remote(pane)) return;    // summing a remote tree means downloading it
     FileEntry* e = pane.entries[idx];
     if (!is_directory(e->name, e->mode) || strcmp(e->name, "..") == 0) return;
     char full[4100];
@@ -822,6 +984,13 @@ static void search_walk(const char* dir, const char* pattern, std::vector<std::s
 static void run_search(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     if (archive_readonly(app, active)) return;   // a virtual path has nothing to walk
+    if (in_remote(active)) {
+        // Searching a site would mean listing every directory on the server, one
+        // round trip each. F5 takes a tree down, and then the local search runs.
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Search needs a local directory: F5 downloads from a site first");
+        return;
+    }
     app->search_results.clear();
     search_walk(active.current_dir, app->search_pattern, app->search_results, 0, app->show_hidden);
     app->search_done = true;
@@ -866,6 +1035,11 @@ static void run_shell_and_show(AppPanes* app, const char* shell_cmd) {
     app->output_open = true;
 }
 
+// Defined with the remote dialogs. "cd ftp://..." on the command line and the
+// Ctrl+N field both end up there, so a typed address means one thing however it
+// was entered.
+static void remote_open_url(AppPanes* app, const char* url);
+
 static void exec_command(AppPanes* app) {
     char* c = app->cmd;
     while (*c == ' ') c++;
@@ -886,17 +1060,25 @@ static void exec_command(AppPanes* app) {
             snprintf(target, sizeof(target), "%s", home ? home : "/");
         } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\0')) {
             snprintf(target, sizeof(target), "%s%s", home ? home : "", arg + 1);
+        } else if (net_is_remote(arg)) {
+            // A URL is a directory too, just not one the relative-path rules can
+            // join onto the folder the pane is in.
+            snprintf(target, sizeof(target), "%s", arg);
         } else if (arg[0] == '/') {
             snprintf(target, sizeof(target), "%s", arg);
         } else {
             snprintf(target, sizeof(target), "%s/%s", active.current_dir, arg);
         }
-        DIR* probe = opendir(target);
-        if (probe) {
-            closedir(probe);
-            navigate_to(app, &active, target);
+        if (net_is_remote(target)) {
+            remote_open_url(app, target);
         } else {
-            snprintf(app->status_msg, sizeof(app->status_msg), "cd: no such directory: %s", target);
+            DIR* probe = opendir(target);
+            if (probe) {
+                closedir(probe);
+                navigate_to(app, &active, target);
+            } else {
+                snprintf(app->status_msg, sizeof(app->status_msg), "cd: no such directory: %s", target);
+            }
         }
     } else if (strcmp(c, "exit") == 0 || strcmp(c, "quit") == 0) {
         app->quit_request = true;
@@ -965,8 +1147,35 @@ static void do_symlink_other(AppPanes* app);
 static void count_marked_sizes(AppPanes* app);
 static void fill_dir_sizes(AppPanes* app);
 
+// A remote delete goes over the transport. A server has no trash, so the trash
+// setting is not honoured here and the prompt says so before any of it happens.
+static void do_delete_remote(AppPanes* app, Pane& pane) {
+    const NetSite* site = remote_site_of(app, pane);
+    if (!site) return;
+    prog_begin(app, pane.current_dir, pane.current_dir, false);
+    app->prog_is_delete = true;
+    int ok = 0;
+    int marks = marked_count(pane);
+    std::string err;
+    for (int i = 0; i < pane.entry_count; i++) {
+        if (marks == 0 && i != pane.selected) continue;
+        if (marks > 0 && !pane.marked[i]) continue;
+        FileEntry* e = pane.entries[i];
+        if (strcmp(e->name, "..") == 0) continue;
+        std::string rpath = remote_row_path(pane, e->name);
+        if (net_remove_tree(*site, rpath, copy_progress_cb, app, &err)) ok++;
+        if (app->quit_request || app->prog_abort) break;
+    }
+    app->prog_active = false;
+    if (app->prog_abort && !ok) snprintf(app->status_msg, sizeof(app->status_msg), "Stopped: nothing deleted");
+    else if (ok) snprintf(app->status_msg, sizeof(app->status_msg), "Deleted %d entries on the server%s", ok, app->prog_abort ? " (aborted)" : "");
+    else    snprintf(app->status_msg, sizeof(app->status_msg), "Delete failed: %s", err.c_str());
+    refresh_pane(&pane, pane.current_dir);
+}
+
 static void do_delete(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (in_remote(active)) { do_delete_remote(app, active); return; }
     bool to_trash = app->delete_trash != 0;
     prog_begin(app, active.current_dir, active.current_dir, false);
     app->prog_is_delete = true;
@@ -987,10 +1196,11 @@ static void do_delete(AppPanes* app) {
             removed = fs_delete_entry_progress(src, copy_progress_cb, app);
         }
         if (removed) ok++;
-        if (app->quit_request) break;
+        if (app->quit_request || app->prog_abort) break;
     }
     app->prog_active = false;
-    if (ok) snprintf(app->status_msg, sizeof(app->status_msg), to_trash ? "Trashed %d entries" : "Deleted %d entries", ok);
+    if (app->prog_abort && !ok) snprintf(app->status_msg, sizeof(app->status_msg), "Stopped: nothing deleted");
+    else if (ok) snprintf(app->status_msg, sizeof(app->status_msg), to_trash ? "Trashed %d entries" : "Deleted %d entries", ok);
     else    snprintf(app->status_msg, sizeof(app->status_msg), "Delete failed: %s", strerror(errno));
     refresh_pane(&active, active.current_dir);
 }
@@ -1005,6 +1215,17 @@ static void request_delete(AppPanes* app, bool force_direct) {
     }
     // TC splits "direkt" and "Papierkorb": Shift always deletes for good, and
     // the prompt has to say which one is about to happen.
+    if (in_remote(active)) {
+        // There is no trash on a server, so the only question is whether the user
+        // really means the permanent kind. The wording says so rather than
+        // reusing the local prompt and letting them assume otherwise.
+        app->delete_trash = 0;
+        app->confirm = CONF_DELETE;
+        snprintf(app->confirm_text, sizeof(app->confirm_text),
+                 "Delete %d entrie%s from %s ? the server has no trash",
+                 n, n == 1 ? "y" : "s", active.current_dir);
+        return;
+    }
     app->delete_trash = (app->trash_mode && !force_direct && fs_trash_available()) ? 1 : 0;
     app->confirm = CONF_DELETE;
     if (app->delete_trash)
@@ -1418,7 +1639,7 @@ void app_panes_apply_font(AppPanes* app) {
 static void render_progress_dialog(AppPanes* app) {
     if (!app->prog_active) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImVec2 sz(560, 230);
+    ImVec2 sz(560, 270);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + (vp->Size.x - sz.x) * 0.5f,
                                    vp->Pos.y + (vp->Size.y - sz.y) * 0.5f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(sz, ImGuiCond_Always);
@@ -1460,6 +1681,18 @@ static void render_progress_dialog(AppPanes* app) {
         double eta = (double)(app->prog_total - app->prog_done) / rate;
         ImGui::Text("ETA:        %.0fs", eta);
     }
+
+    // Abort is a request, not a stop: the copy and the transport both poll the
+    // progress callback, which returns false while this is set, so the operation
+    // unwinds after the file it is on rather than mid-write. The pumped frame
+    // loop keeps redrawing this dialog, so the button is live throughout.
+    ImGui::Spacing();
+    if (ImGui::Button("Abort")) app->prog_abort = true;
+    ImGui::SameLine();
+    if (app->prog_abort)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "stopping after the current file...");
+    else
+        ImGui::TextDisabled("Abort stops the operation. What is already transferred stays.");
     ImGui::End();
 }
 
@@ -1501,11 +1734,12 @@ static bool copy_progress_cb(long long done, long long total, int fd, int ft, vo
         app->prog_last_pump = now;
         pump_progress_ui(app);
     }
-    return !app->quit_request;                 // closing the window aborts
+    return !app->quit_request && !app->prog_abort;   // closing the window, or Abort
 }
 
 static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_move) {
     app->prog_active = true;
+    app->prog_abort = false;
     app->prog_is_move = is_move;
     app->prog_is_delete = false;
     snprintf(app->prog_src, sizeof(app->prog_src), "%s", src);
@@ -1525,6 +1759,14 @@ static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_
 // The archive an operation applies to: the one the pane is inside, or the
 // archive file under the cursor.
 static bool archive_target(AppPanes* app, const Pane& pane, char* out, size_t cap) {
+    if (in_remote(pane)) {
+        // The archive is bytes on a server, and the archive tools read files.
+        // Fetching it and browsing it in place is the honest next step; until
+        // then the status line says what to do instead.
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "An archive on a site has to be downloaded first (F5)");
+        return false;
+    }
     if (in_archive(pane)) { snprintf(out, cap, "%s", pane.archive_path); return true; }
     if (pane.selected < 0 || pane.selected >= pane.entry_count) return false;
     std::string full = std::string(pane.current_dir) + "/" + entry_rel(pane, pane.selected);
@@ -1570,6 +1812,7 @@ static StringList target_rel(const Pane& pane) {
 // so the existing dialog, its rate line and its Abort apply unchanged.
 static void arch_prog_begin(AppPanes* app, const char* src, const char* dst) {
     app->prog_active = true;
+    app->prog_abort = false;
     app->prog_is_move = false;
     app->prog_is_delete = false;
     snprintf(app->prog_src, sizeof(app->prog_src), "%s", src);
@@ -2013,6 +2256,13 @@ static void do_extract(AppPanes* app, bool to_other_pane) {
                      "The target pane is inside an archive");
             return;
         }
+        if (in_remote(other)) {
+            // Extraction writes many small files; one upload per file over a
+            // network is a transfer the plan dialog already knows how to run.
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Extract into a local directory, then F5 it up to the site");
+            return;
+        }
         snprintf(dest, sizeof(dest), "%s", other.current_dir);
     } else {
         pane_real_dir(active, dest, sizeof(dest));
@@ -2110,6 +2360,30 @@ static bool plan_from_pane(AppPanes* app, OpPlan& plan, bool is_move) {
         plan.names = target_rel(active);
         for (const std::string& rel : plan.names)
             plan.raw_names.push_back(member_raw(active, rel.c_str()));
+    } else if (in_remote(active)) {
+        // Out of a site, one direction at a time. Between two sites there is no
+        // path that does not come through this machine first, and that has not
+        // been decided, so it is refused rather than quietly doing something else.
+        if (in_remote(other)) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Both panes are on a site: F5 downloads into a local pane");
+            return false;
+        }
+        if (in_archive(other)) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "The target pane is inside an archive");
+            return false;
+        }
+        plan.remote = active.remote_root;
+        plan.remote_prefix = active.remote_path;
+        plan.src_dir = active.current_dir;
+        plan.dst_dir = other.current_dir;
+        plan.names = target_rel(active);
+    } else if (in_remote(other)) {
+        // Into a site: the local pane's entries go up. A move drops the local copy
+        // once the server has its own.
+        plan.src_dir = active.current_dir;
+        plan.dst_dir = other.current_dir;
+        plan.names = target_rel(active);
     } else {
         if (archive_readonly(app, other)) return false;
         plan.src_dir = active.current_dir;
@@ -2136,6 +2410,26 @@ static std::string plan_target(const OpPlan& plan, size_t i) {
 
 static int plan_existing(const OpPlan& plan) {
     int n = 0;
+    std::string droot, drpath;
+    if (net_split_virtual(plan.dst_dir.c_str(), &droot, &drpath)) {
+        // An upload overwrites just the same, so the same confirm has to happen
+        // before it does. Only the server knows what is already there, and the
+        // answer is one listing of the destination directory. It cannot be asked
+        // per name: there is no single-entry lookup on a server, so net_stat()
+        // lists the parent itself, and a per-name loop would pay for the same
+        // listing once per name.
+        const NetSite* site = net_site_for(droot);
+        if (!site) return 0;
+        std::vector<FileEntry> rows;
+        std::string err;
+        if (!net_list(*site, drpath, &rows, &err)) return 0;
+        for (size_t i = 0; i < plan.names.size(); i++) {
+            std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
+            for (const FileEntry& fe : rows)
+                if (!strcmp(fe.name, base.c_str())) { n++; break; }
+        }
+        return n;
+    }
     for (size_t i = 0; i < plan.names.size(); i++)
         if (fs_exists(plan_target(plan, i).c_str())) n++;
     return n;
@@ -2152,7 +2446,7 @@ static int run_names_prog(AppPanes* app, const OpPlan& plan, fs_progress_fn cb, 
         bool r = plan.is_move ? fs_move_entry_progress(src.c_str(), dst.c_str(), cb, user)
                               : fs_copy_entry_progress(src.c_str(), dst.c_str(), cb, user);
         if (r) ok++;
-        if (app->quit_request) break;
+        if (app->quit_request || app->prog_abort) break;
     }
     return ok;
 }
@@ -2168,6 +2462,56 @@ static void refresh_for_destination(AppPanes* app, const std::string& dst) {
             (dst.size() > cur.size() && dst.compare(0, cur.size(), cur) == 0 && dst[cur.size()] == '/'))
             refresh_pane(p, p->current_dir);
     }
+}
+
+// One copy or move that crosses the network: a download into a local pane, or an
+// upload into a remote one. A move is a transfer and then a delete of the source,
+// which is the only way a move across a network exists, and it happens only once
+// the copy is known good. plan_from_pane() already refuses site to site.
+static void run_remote_plan(AppPanes* app, const OpPlan& plan) {
+    std::string droot, drpath;
+    bool dst_remote = net_split_virtual(plan.dst_dir.c_str(), &droot, &drpath);
+    const NetSite* dsite = dst_remote ? net_site_for(droot) : nullptr;
+    const NetSite* ssite = plan.remote.empty() ? nullptr : net_site_for(plan.remote);
+    if ((dst_remote && !dsite) || (!plan.remote.empty() && !ssite)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "No login for %s: Ctrl+F edits the saved sites, Ctrl+N connects again",
+                 dst_remote ? droot.c_str() : plan.remote.c_str());
+        return;
+    }
+
+    std::string err;
+    prog_begin(app, plan.src_dir.c_str(), plan.dst_dir.c_str(), plan.is_move);
+    int ok = 0;
+    for (size_t i = 0; i < plan.names.size(); i++) {
+        std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
+        bool r;
+        if (ssite) {
+            std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
+            std::string local = plan.dst_dir + "/" + base;
+            r = net_download_tree(*ssite, src, local.c_str(), copy_progress_cb, app, &err);
+            if (r && plan.is_move) net_remove_tree(*ssite, src, copy_progress_cb, app, &err);
+        } else {
+            std::string local = plan.src_dir + "/" + plan.names[i];
+            std::string dst = drpath.empty() ? base : drpath + "/" + base;
+            r = net_upload_tree(*dsite, local.c_str(), dst, copy_progress_cb, app, &err);
+            if (r && plan.is_move) fs_delete_entry_progress(local.c_str(), copy_progress_cb, app);
+        }
+        if (r) ok++;
+        if (app->quit_request || app->prog_abort) break;
+    }
+    app->prog_active = false;
+    if (app->prog_abort && !ok)
+        snprintf(app->status_msg, sizeof(app->status_msg), "Stopped: nothing transferred");
+    else if (ok)
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%s %d item%s to %s%s",
+                 plan.is_move ? "Moved" : "Copied", ok, ok == 1 ? "" : "s", plan.dst_dir.c_str(),
+                 app->prog_abort ? " (aborted)" : "");
+    else
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 plan.is_move ? "Move failed: %s" : "Copy failed: %s", err.c_str());
+    refresh_for_destination(app, plan.dst_dir);
 }
 
 // The one runner for copy, move and copying out of an archive. The dialog, the
@@ -2192,22 +2536,39 @@ static void run_op_plan(AppPanes* app) {
                                        copy_progress_cb, app, &err);
         app->prog_active = false;
         if (ok)
-            snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d member%s into %s%s",
+            snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d member%s into %s%s%s",
                      (int)plan.names.size(), plan.names.size() == 1 ? "" : "s", plan.dst_dir.c_str(),
-                     plan.archive_prefix.empty() ? "" : " (archive paths preserved)");
+                     plan.archive_prefix.empty() ? "" : " (archive paths preserved)",
+                     app->prog_abort ? " (aborted)" : "");
+        else if (app->prog_abort)
+            snprintf(app->status_msg, sizeof(app->status_msg), "Extract stopped before anything copied");
         else
             snprintf(app->status_msg, sizeof(app->status_msg), "Copy failed: %s", err.c_str());
         refresh_for_destination(app, plan.dst_dir);
         return;
     }
 
+    if (!plan.remote.empty() || net_is_remote(plan.dst_dir.c_str())) {
+        run_remote_plan(app, plan);
+        return;
+    }
+
     prog_begin(app, plan.src_dir.c_str(), plan.dst_dir.c_str(), plan.is_move);
     int ok = run_names_prog(app, plan, copy_progress_cb, app);
     app->prog_active = false;
-    snprintf(app->status_msg, sizeof(app->status_msg),
-             ok ? (plan.is_move ? "Moved %d item%s to %s" : "Copied %d item%s to %s")
-                : (plan.is_move ? "Move failed: %s" : "Copy failed: %s"),
-             ok ? ok : 0, ok == 1 ? "" : "s", ok ? plan.dst_dir.c_str() : strerror(errno));
+    // An abort is not a failure, and saying so matters: the entries that made it
+    // across are really there, and the rest were never attempted.
+    if (ok)
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%s %d item%s to %s%s", plan.is_move ? "Moved" : "Copied",
+                 ok, ok == 1 ? "" : "s", plan.dst_dir.c_str(),
+                 app->prog_abort ? " (aborted)" : "");
+    else if (app->prog_abort)
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%s stopped before anything transferred", plan.is_move ? "Move" : "Copy");
+    else
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 plan.is_move ? "Move failed: %s" : "Copy failed: %s", strerror(errno));
 
     // Afterwards, not before: a pane that is looking at the destination has to
     // show what landed there, and the pane the entries left has to lose them.
@@ -2301,6 +2662,7 @@ static void path_parent_dir(const std::string& p, char* out, size_t cap) {
 }
 
 static void clipboard_set(AppPanes* app, Pane& pane, bool cut) {
+    if (remote_blocked(app, pane, "The file clipboard")) return;
     if (in_archive(pane)) {
         // Ctrl+C inside an archive puts members on the clipboard; pasting into a
         // real directory extracts them. Cutting is refused because a member
@@ -2391,7 +2753,7 @@ static void do_paste_now(AppPanes* app) {
                      : fs_copy_entry_progress(src.c_str(), dst, copy_progress_cb, app);
         if (r) ok++;
         else failed.push_back(src);
-        if (app->quit_request) {
+        if (app->quit_request || app->prog_abort) {
             for (size_t j = i + 1; j < app->clipboard.paths.size(); j++) failed.push_back(app->clipboard.paths[j]);
             break;
         }
@@ -2568,6 +2930,13 @@ static void branch_fill(AppPanes* app, Pane& pane, bool marked_only) {
 }
 
 static void branch_toggle(AppPanes* app, Pane& pane, bool marked_only) {
+    if (in_remote(pane)) {
+        // Branch view is one recursive walk. Over FTP that is a listing per
+        // directory, and the pane already shows the same rows one level at a time.
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Branch view needs a local directory (Backspace leaves the site)");
+        return;
+    }
     if (in_archive(pane)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "Branch view needs a directory (Backspace leaves the archive)");
@@ -2599,9 +2968,38 @@ static std::string member_raw(const Pane& pane, const char* rel) {
     return full;
 }
 
+// Fetch one remote file into a temporary directory the viewer can read. The
+// directory is remembered on the app so closing the viewer removes it, exactly
+// as an extracted archive member is.
+static bool remote_fetch_temp(AppPanes* app, const NetSite& site, const std::string& rpath,
+                              char* out_path, size_t npath, char* out_dir, size_t ndir) {
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char tmpl[4096];
+    snprintf(tmpl, sizeof(tmpl), "%s/mc-clone-ftp-XXXXXX", tmp);
+    if (!mkdtemp(tmpl)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot make a temporary directory: %s",
+                 strerror(errno));
+        return false;
+    }
+    snprintf(out_dir, ndir, "%s", tmpl);
+    const char* base = strrchr(rpath.c_str(), '/');
+    snprintf(out_path, npath, "%s/%s", tmpl, base ? base + 1 : rpath.c_str());
+    std::string err;
+    if (net_download(site, rpath, out_path, copy_progress_cb, app, &err)) return true;
+    // A failed transfer leaves no file behind, so only the directory is left to
+    // clean up - and the viewer must not be handed a directory it cannot read.
+    rmdir(tmpl);
+    out_dir[0] = '\0';
+    snprintf(app->status_msg, sizeof(app->status_msg), "Cannot fetch %s: %s",
+             rpath.c_str(), err.c_str());
+    return false;
+}
+
 // Open a row in the viewer. Inside an archive the member is unpacked to a
-// temporary file first, and the viewer takes the temporary directory away when
-// it closes; everywhere else the row's path is already a real file.
+// temporary file first, and on a remote site the file is fetched to one; the
+// viewer takes that temporary directory away when it closes. Everywhere else the
+// row's path is already a real file.
 static void view_entry(AppPanes* app, Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count) return;
     const char* rel = entry_rel(pane, idx);
@@ -2618,6 +3016,17 @@ static void view_entry(AppPanes* app, Pane& pane, int idx) {
         }
         return;
     }
+    if (in_remote(pane)) {
+        const NetSite* site = remote_site_of(app, pane);
+        if (!site) return;
+        char tmp[4300], tmpdir[4096];
+        if (remote_fetch_temp(app, *site, remote_row_path(pane, rel),
+                              tmp, sizeof(tmp), tmpdir, sizeof(tmpdir))) {
+            snprintf(app->viewer_tmp_dir, sizeof(app->viewer_tmp_dir), "%s", tmpdir);
+            open_viewer(app, tmp);
+        }
+        return;
+    }
     char full[4100];
     snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
     open_viewer(app, full);
@@ -2630,6 +3039,20 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
     char full[4100];
     snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
     if (strcmp(e->name, "..") == 0) {
+        if (in_remote(pane)) {
+            // Up inside a site is one path component; up out of the site itself
+            // leaves it, back to wherever the pane was before the connect. The
+            // question is "is this the site root", not "is the path non-empty":
+            // net_path_parent() answers "" for the root, so a non-empty path one
+            // level down would otherwise step to the root and then sit there.
+            if (!net_path_is_root(pane.remote_path)) {
+                std::string up = net_path_parent(pane.remote_path);
+                navigate_to(app, &pane, net_virtual_path(pane.remote_root, up).c_str());
+            } else {
+                navigate_to(app, &pane, pane.remote_came_from[0] ? pane.remote_came_from : "/");
+            }
+            return;
+        }
         char parentbuf[4096];
         snprintf(parentbuf, sizeof(parentbuf), "%s", pane.current_dir);
         char* parent = dirname(parentbuf);
@@ -2638,15 +3061,18 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
         char path[4100];
         snprintf(path, sizeof(path), "%s/%s", pane.current_dir, rel);
         navigate_to(app, &pane, path);
-    } else if (arch_is_archive(full)) {
+    } else if (!in_remote(pane) && arch_is_archive(full)) {
         // TC opens an archive as if it were a directory. The path stays virtual
-        // from here on: everything below it is a member, not a file.
+        // from here on: everything below it is a member, not a file. A remote row
+        // only looks like a local path, so the extension is not enough to open it.
         navigate_to(app, &pane, full);
     } else if (pane.archive_path[0]) {
         // A member of the archive being browsed: unpack just this one rather
         // than the whole archive.
         view_entry(app, pane, idx);
-    } else if (is_executable(e->name, e->mode)) {
+    } else if (is_executable(e->name, e->mode) && !in_remote(pane)) {
+        // A server's mode bits can say "executable" about a file this machine
+        // cannot run, and would not be allowed to.
         char full[4300];
         snprintf(full, sizeof(full), "\"%s/%s\" 2>&1", pane.current_dir, rel);
         run_shell_and_show(app, full);
@@ -2709,6 +3135,7 @@ static void edit_cursor(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     if (active.selected >= active.entry_count) return;
     FileEntry* e = active.entries[active.selected];
+    if (remote_blocked(app, active, "The editor")) return;
     if (in_archive(active)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "Editing an archive member needs a real file (Alt+F9 extracts it)");
@@ -2723,6 +3150,7 @@ static void edit_cursor(AppPanes* app) {
 static void open_cursor_default(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     if (active.selected >= active.entry_count) return;
+    if (remote_blocked(app, active, "Opening with the default program")) return;
     if (in_archive(active)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "An archive member has to be extracted first (Alt+F9)");
@@ -2809,6 +3237,11 @@ static void tree_open(AppPanes* app, Pane& pane) {
 // The model is refilled on the way in so the tree is always rooted at what the
 // pane is showing.
 static void tree_mode_toggle(AppPanes* app, Pane& pane, int mode) {
+    if (in_remote(pane)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "The tree needs a local directory (Backspace leaves the site)");
+        return;
+    }
     if (in_archive(pane)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "The tree needs a real directory (Backspace leaves the archive)");
@@ -3779,6 +4212,12 @@ static void render_about(AppPanes* app) {
     ImGui::TextWrapped("text: %s, %s, window scale %.2fx", raster,
                        mc_font_hinting_available() ? app->hinting : "no hinting in this build",
                        (double)app->display_scale);
+    // Whether this build can reach a server at all, and over what. The site
+    // manager says the same thing, but the About window is where a build without
+    // libcurl gets noticed before anyone goes looking for the menu entry.
+    char ftp[96];
+    net_what(ftp, sizeof(ftp));
+    ImGui::TextWrapped("remote: %s", ftp);
     ImGui::Separator();
     ImGui::Spacing();
     ImGui::TextUnformatted(
@@ -3834,6 +4273,24 @@ static void render_about(AppPanes* app) {
 
 // Properties dialog (Alt+Enter): recursive count + size of the selected entry.
 static void open_properties(AppPanes* app, Pane& pane) {
+    if (in_remote(pane)) {
+        // Counting a remote tree would mean downloading it. What the listing
+        // already brought back - this row's mode, size and time - is what shows.
+        if (pane.selected < 0 || pane.selected >= pane.entry_count) return;
+        FileEntry* e = pane.entries[pane.selected];
+        std::string vroot, vrpath;
+        if (net_split_virtual(pane.current_dir, &vroot, &vrpath)) {
+            std::string rpath = remote_row_path(pane, e->name);
+            snprintf(app->props_path, sizeof(app->props_path), "%s", net_virtual_path(vroot, rpath).c_str());
+        } else {
+            snprintf(app->props_path, sizeof(app->props_path), "%s", pane.current_dir);
+        }
+        app->props_size = e->size;
+        app->props_files = S_ISDIR(e->mode) ? 0 : 1;
+        app->props_dirs = S_ISDIR(e->mode) ? 1 : 0;
+        app->props_open = true;
+        return;
+    }
     if (in_archive(pane)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "Properties need a directory (Backspace leaves the archive)");
@@ -4010,6 +4467,368 @@ static void render_options(AppPanes* app) {
 // File menu: what TC puts under Files. Everything here acts on the entry under
 // the cursor or on the marks, and anything that blocks goes through the deferred
 // table instead of running inside the frame.
+// ---------------------------------------------------------------------------
+// Remote sites: the saved-site manager (Ctrl+F) and quick connect (Ctrl+N)
+// ---------------------------------------------------------------------------
+
+// The editor's fields are staged here rather than written straight into the site
+// list: a half-typed host must not become the login a pane resolves, and Cancel
+// has to mean nothing happened.
+struct NetForm {
+    char name[256];
+    char host[256];
+    char user[256];
+    char pass[256];
+    char path[1024];
+    int  proto;
+    int  port;
+    bool remember;
+    bool verify_tls;
+    bool passive;
+    bool open;                 // the editor is showing below the list
+};
+static NetForm g_net_form;
+
+static void remote_form_blank(void) {
+    g_net_form.name[0] = '\0';
+    g_net_form.host[0] = '\0';
+    g_net_form.user[0] = '\0';
+    g_net_form.pass[0] = '\0';
+    g_net_form.path[0] = '\0';
+    g_net_form.proto = NET_FTP;
+    g_net_form.port = 0;
+    g_net_form.remember = false;
+    g_net_form.verify_tls = true;
+    g_net_form.passive = true;
+    g_net_form.open = true;
+}
+
+static void remote_form_fill(const NetSite& s) {
+    snprintf(g_net_form.name, sizeof(g_net_form.name), "%s", s.name.c_str());
+    snprintf(g_net_form.host, sizeof(g_net_form.host), "%s", s.host.c_str());
+    snprintf(g_net_form.user, sizeof(g_net_form.user), "%s", s.user.c_str());
+    snprintf(g_net_form.pass, sizeof(g_net_form.pass), "%s", s.password.c_str());
+    snprintf(g_net_form.path, sizeof(g_net_form.path), "%s", s.path.c_str());
+    g_net_form.proto = (int)s.proto;
+    g_net_form.port = s.port;
+    g_net_form.remember = s.remember;
+    g_net_form.verify_tls = s.verify_tls;
+    g_net_form.passive = s.passive;
+    g_net_form.open = true;
+}
+
+// Read the form back into a site. `base` carries over what the form has no field
+// for (a remembered password the user did not retype). The host field also takes
+// a whole URL, because pasting one there is the common mistake and the parser
+// already knows how to unpack it.
+static bool remote_form_site(AppPanes* app, NetSite* out, const NetSite* base) {
+    *out = base ? *base : NetSite();
+    out->name = g_net_form.name;
+    out->proto = (NetProto)g_net_form.proto;
+    out->host = g_net_form.host;
+    out->port = g_net_form.port;
+    out->user = g_net_form.user;
+    if (g_net_form.pass[0]) out->password = g_net_form.pass;
+    out->path = g_net_form.path;
+    out->remember = g_net_form.remember;
+    out->verify_tls = g_net_form.verify_tls;
+    out->passive = g_net_form.passive;
+    if (strchr(out->host.c_str(), ':') || strstr(out->host.c_str(), "/")) {
+        NetSite parsed;
+        std::string err;
+        if (!net_parse_url(out->host.c_str(), &parsed, &err)) {
+            snprintf(app->remote_note, sizeof(app->remote_note), "%s", err.c_str());
+            return false;
+        }
+        out->host = parsed.host;
+        if (parsed.port) out->port = parsed.port;
+        if (!parsed.user.empty()) out->user = parsed.user;
+        if (!parsed.path.empty()) out->path = parsed.path;
+        out->proto = parsed.proto;
+    }
+    if (out->host.empty()) {
+        snprintf(app->remote_note, sizeof(app->remote_note), "A site needs a host.");
+        return false;
+    }
+    return true;
+}
+
+// Make a site findable by root URL, which is how a pane's virtual path gets its
+// login back. Saved sites are already in the list; a quick connect goes into the
+// session-only list, which is never written to the sites file.
+static void remote_remember(AppPanes* app, const NetSite& site) {
+    std::string root = net_site_root(site);
+    for (NetSite& s : app->remote_adhoc)
+        if (net_site_root(s) == root) { net_forget(&s); s = site; return; }
+    for (NetSite& s : app->remote_sites)
+        if (net_site_root(s) == root) { net_forget(&s); s = site; return; }
+    app->remote_adhoc.push_back(site);
+}
+
+// Open a site in the focused pane. The listing itself happens in refresh_pane();
+// this only decides where to go and puts the pane back if nothing came back,
+// because an empty remote directory explains less than the directory the user
+// was already looking at.
+static void remote_open(AppPanes* app, const NetSite& site) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (!net_available()) {
+        char what[128];
+        net_what(what, sizeof(what));
+        snprintf(app->status_msg, sizeof(app->status_msg), "%s", what);
+        return;
+    }
+    std::string target = net_virtual_path(net_site_root(site), site.path);
+    char back[4096];
+    snprintf(back, sizeof(back), "%s", active.current_dir);
+    remote_remember(app, site);
+    navigate_to(app, &active, target.c_str());
+    // A successful listing always has at least the ".." row, so nothing came
+    // back only when the listing failed. refresh_pane() left the reason behind;
+    // it reaches the status line from there.
+    if (active.entry_count == 0) {
+        navigate_to(app, &active, back);
+        return;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%s", target.c_str());
+    // A connect that worked closes the windows that offered it: a manager left
+    // open over a pane that is already showing the site is a second window with
+    // nothing left to decide. The failure paths above return early and leave
+    // everything open, because there the reason is on screen and the fields are
+    // what needs fixing.
+    app->remote_mgr_open = false;
+    app->remote_quick_open = false;
+    app->remote_quick[0] = '\0';
+    g_net_form.open = false;
+    app->remote_edit = -1;
+    app->remote_note[0] = '\0';
+}
+
+// Open a typed URL in the focused pane. Anything the URL leaves out comes from
+// the site already known for that host, so "cd ftp.example.com/pub" after a
+// logged-in visit does not ask the server for an anonymous session.
+static void remote_open_url(AppPanes* app, const char* url) {
+    NetSite site;
+    std::string err;
+    if (!net_parse_url(url, &site, &err)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "%s", err.c_str());
+        return;
+    }
+    const NetSite* known = net_site_for(net_site_root(site));
+    if (known) {
+        if (site.user.empty()) site.user = known->user;
+        if (site.password.empty()) site.password = known->password;
+        site.remember = known->remember;
+        site.verify_tls = known->verify_tls;
+        site.passive = known->passive;
+    }
+    remote_open(app, site);
+}
+
+static void remote_quick_commit(AppPanes* app) {
+    NetSite site;
+    std::string err;
+    if (!net_parse_url(app->remote_quick, &site, &err)) {
+        snprintf(app->remote_note, sizeof(app->remote_note), "%s", err.c_str());
+        return;
+    }
+    // Typing "host/pub" is a shortcut to a saved site, not a request to log in
+    // anonymously: whatever the saved entry knows fills the gaps the URL left.
+    const NetSite* saved = net_sites_find(app->remote_sites, net_site_root(site));
+    if (saved) {
+        if (site.user.empty()) site.user = saved->user;
+        if (site.password.empty()) site.password = saved->password;
+        site.remember = saved->remember;
+        site.verify_tls = saved->verify_tls;
+        site.passive = saved->passive;
+    }
+    app->remote_quick_open = false;
+    app->remote_quick[0] = '\0';
+    remote_open(app, site);
+}
+static void remote_save_form(AppPanes* app) {
+    const NetSite* base = (app->remote_edit >= 0 &&
+                           app->remote_edit < (int)app->remote_sites.size())
+                              ? &app->remote_sites[app->remote_edit] : nullptr;
+    NetSite site;
+    if (!remote_form_site(app, &site, base)) return;   // the reason is in remote_note
+    if (base) {
+        net_forget(base);            // an old login must not be reused after an edit
+        app->remote_sites[app->remote_edit] = site;
+    } else {
+        app->remote_sites.push_back(site);
+        app->remote_edit = (int)app->remote_sites.size() - 1;
+    }
+    remote_sites_write(app);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Saved site %s",
+             site.name.empty() ? net_site_root(site).c_str() : site.name.c_str());
+}
+
+static void render_remote_manager(AppPanes* app) {
+    if (!app->remote_mgr_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(760, 520), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 380, io.DisplaySize.y * 0.5f - 260),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Remote sites (Ctrl+F)", &open, ImGuiWindowFlags_NoCollapse);
+
+    char what[160];
+    net_what(what, sizeof(what));
+    if (!net_available()) {
+        // The dialog still opens: a build without the transport says so instead
+        // of offering a connect that cannot work.
+        ImGui::TextUnformatted(what);
+        ImGui::Spacing();
+        ImGui::TextDisabled("Install the libcurl development package and rebuild to browse "
+                            "FTP, FTPS and SFTP sites. Everything else in the program is "
+                            "unchanged.");
+        if (app->remote_note[0])
+            ImGui::TextDisabled("%s", app->remote_note);
+        if (!open) app->remote_mgr_open = false;
+        ImGui::End();
+        return;
+    }
+    ImGui::TextDisabled("%s", what);
+    ImGui::Separator();
+
+    if (app->remote_sites.empty())
+        ImGui::TextUnformatted("(no saved sites - add one below, or press Ctrl+N to connect once)");
+
+    int remove_idx = -1;
+    for (int i = 0; i < (int)app->remote_sites.size(); i++) {
+        const NetSite& s = app->remote_sites[i];
+        ImGui::PushID(i);
+        std::string root = net_site_root(s);
+        char label[768];
+        snprintf(label, sizeof(label), "%s  %s%s", s.name.empty() ? root.c_str() : s.name.c_str(),
+                 s.name.empty() ? "" : root.c_str(),
+                 s.verify_tls || s.proto == NET_SFTP ? "" : "  [certificate not verified]");
+        // The row has to stop where the buttons begin. A Selectable with no size
+        // spans the whole content width, so it sat on top of all three buttons and
+        // took their click: pressing "connect" only ever selected the row, which
+        // is the same as pressing "edit". Sizing the row is the fix — the order the
+        // widgets are submitted in does not settle who owns the pixel.
+        float buttons_x = ImGui::GetWindowWidth() - 190.0f;
+        float row_w = buttons_x - ImGui::GetCursorPosX();
+        if (row_w < 40.0f) row_w = 40.0f;
+        if (ImGui::Selectable(label, app->remote_edit == i, 0, ImVec2(row_w, 0))) {
+            app->remote_edit = i;
+            remote_form_fill(s);
+        }
+        ImGui::SameLine(buttons_x);
+        if (ImGui::SmallButton("connect")) remote_open(app, s);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("edit")) { app->remote_edit = i; remote_form_fill(s); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("remove")) remove_idx = i;
+        ImGui::PopID();
+    }
+    if (remove_idx >= 0) {
+        net_forget(&app->remote_sites[remove_idx]);
+        app->remote_sites.erase(app->remote_sites.begin() + remove_idx);
+        if (app->remote_edit == remove_idx) { app->remote_edit = -1; g_net_form.open = false; }
+        else if (app->remote_edit > remove_idx) app->remote_edit--;
+        remote_sites_write(app);
+    }
+
+    ImGui::Separator();
+    if (!g_net_form.open) {
+        if (ImGui::Button("Add site")) { app->remote_edit = -1; remote_form_blank(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Quick connect")) {
+            app->remote_quick_open = true;
+            app->remote_focus_request = true;
+        }
+    } else {
+        ImGui::TextUnformatted(app->remote_edit >= 0 ? "Edit site" : "New site");
+        ImGui::SetNextItemWidth(300);
+        ImGui::InputText("name", g_net_form.name, sizeof(g_net_form.name));
+        ImGui::SetNextItemWidth(300);
+        ImGui::InputText("host", g_net_form.host, sizeof(g_net_form.host));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("A bare host, or a whole URL: ftp://host, ftps://host:990, sftp://host");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputInt("port", &g_net_form.port, 0, 0);
+        ImGui::SetNextItemWidth(300);
+        ImGui::InputText("user", g_net_form.user, sizeof(g_net_form.user));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputText("password", g_net_form.pass, sizeof(g_net_form.pass),
+                         ImGuiInputTextFlags_Password);
+        ImGui::SetNextItemWidth(420);
+        ImGui::InputText("start in", g_net_form.path, sizeof(g_net_form.path));
+        const char* proto_names[] = { "FTP (upgrade if offered)", "FTPS (explicit TLS)",
+                                      "FTPS (implicit, port 990)", "SFTP (SSH)" };
+        ImGui::SetNextItemWidth(300);
+        ImGui::Combo("protocol", &g_net_form.proto, proto_names, IM_ARRAYSIZE(proto_names));
+        ImGui::Checkbox("passive mode", &g_net_form.passive);
+        if (g_net_form.proto != NET_SFTP) {
+            ImGui::SameLine();
+            ImGui::Checkbox("verify the certificate", &g_net_form.verify_tls);
+            if (!g_net_form.verify_tls)
+                ImGui::TextDisabled("certificate not verified: anyone on the path can pose as "
+                                    "this server");
+        } else {
+            ImGui::TextDisabled("SFTP trusts the server's host key the first time it is seen");
+        }
+        ImGui::Checkbox("remember this password", &g_net_form.remember);
+        if (g_net_form.remember)
+            ImGui::TextDisabled("written as plain text in %s, readable only by you",
+                                net_sites_path().c_str());
+        if (ImGui::Button("Connect")) {
+            NetSite site;
+            const NetSite* base = (app->remote_edit >= 0 &&
+                                   app->remote_edit < (int)app->remote_sites.size())
+                                      ? &app->remote_sites[app->remote_edit] : nullptr;
+            if (remote_form_site(app, &site, base)) remote_open(app, site);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save")) remote_save_form(app);
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { g_net_form.open = false; app->remote_edit = -1; app->remote_note[0] = '\0'; }
+    }
+
+    if (app->remote_note[0]) {
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", app->remote_note);
+    }
+    if (!open) app->remote_mgr_open = false;
+    ImGui::End();
+}
+
+// Ctrl+N: one line, one connection, nothing saved. The same text the command
+// line takes after "cd ", so there is one grammar for a typed address.
+static void render_remote_quick(AppPanes* app) {
+    if (!app->remote_quick_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(620, 200), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 310, io.DisplaySize.y * 0.5f - 100),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Quick connect (Ctrl+N)", &open, ImGuiWindowFlags_NoCollapse);
+    char what[160];
+    net_what(what, sizeof(what));
+    if (!net_available()) {
+        ImGui::TextUnformatted(what);
+        ImGui::TextDisabled("Install the libcurl development package and rebuild.");
+        if (!open) app->remote_quick_open = false;
+        ImGui::End();
+        return;
+    }
+    ImGui::TextDisabled("host, user@host, user@host:port/path, ftp://... ftps://... sftp://...");
+    if (app->remote_focus_request) claim_focus(app);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("##quick", app->remote_quick, sizeof(app->remote_quick));
+    if (ImGui::Button("Connect")) remote_quick_commit(app);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) { app->remote_quick_open = false; app->remote_quick[0] = '\0'; }
+    if (app->remote_note[0])
+        ImGui::TextDisabled("%s", app->remote_note);
+    if (!open) app->remote_quick_open = false;
+    ImGui::End();
+}
+
 static void render_file_items(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
 
@@ -4128,6 +4947,15 @@ static void render_commands_items(AppPanes* app) {
     }
     if (ImGui::MenuItem("Search files", "Alt+F7")) app->search_open = !app->search_open;
     if (ImGui::MenuItem("Hotlist", "Shift+F9")) app->hotlist_open = !app->hotlist_open;
+    if (ImGui::MenuItem("Remote sites", "Ctrl+F")) {
+        app->remote_mgr_open = !app->remote_mgr_open;
+        app->remote_note[0] = '\0';
+    }
+    if (ImGui::MenuItem("Quick connect", "Ctrl+N")) {
+        app->remote_quick_open = !app->remote_quick_open;
+        app->remote_focus_request = true;
+        app->remote_note[0] = '\0';
+    }
     if (ImGui::MenuItem("Visited directories", "Alt+Down")) app->dirhist_open = !app->dirhist_open;
     if (ImGui::MenuItem("Command history", "Alt+F8")) app->cmdhist_open = !app->cmdhist_open;
     if (ImGui::MenuItem("Left drive", "Alt+F1")) { app->volumes_open = true; app->volumes_target = 0; }
@@ -4187,6 +5015,14 @@ void app_panes_render(AppPanes* app) {
     // submitted wins. The command line at the bottom asks on every frame, so any
     // field that wants the caret has to claim it here and be left alone after.
     app->focus_claimed = false;
+
+    // A listing that failed did so inside refresh_pane(), which has no status
+    // line of its own. The reason waits there and lands here, where the user
+    // sees it instead of an empty pane.
+    if (!g_net_note.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "%s", g_net_note.c_str());
+        g_net_note.clear();
+    }
 
     // Fullscreen main window (MC-style, no decorations)
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -4339,7 +5175,15 @@ void app_panes_render(AppPanes* app) {
         if (app->cmd[0] == '\0' && app->status_msg[0] == '\0') {
             Pane& act = left_focus ? left : right;
             int marks = marked_count(act);
-            if (!app->clipboard.paths.empty())
+            // A site reached without checking its certificate has to be said out
+            // loud where the user is actually sitting. The site list says it, but a
+            // pane can be browsing that site with nothing on screen reminding anyone
+            // that anyone on the path could be posing as the server. It outranks the
+            // mark count for exactly that reason.
+            const NetSite* unsite = in_remote(act) ? net_site_for(act.remote_root) : nullptr;
+            if (unsite && !unsite->verify_tls)
+                snprintf(info, sizeof(info), "certificate not verified for %s", act.remote_root);
+            else if (!app->clipboard.paths.empty())
                 snprintf(info, sizeof(info), "Marked: %d   Clipboard: %d (%s)",
                          marks, (int)app->clipboard.paths.size(),
                          app->clipboard.cut ? "cut" : "copy");
@@ -4397,12 +5241,19 @@ void app_panes_render(AppPanes* app) {
     render_about(app);
     render_properties(app);
     render_options(app);
+    render_remote_manager(app);
+    render_remote_quick(app);
 }
 
 AppPanes* app_panes_init() {
     AppPanes* app = new AppPanes();
     const char* home = getenv("HOME");
     if (!home || !*home) home = "/";
+
+    // Before the first refresh: a pane that navigates to a site needs the login,
+    // and refresh_pane() reaches the site list through these bindings.
+    net_bind(app);
+    remote_sites_load(app);
 
     refresh_pane(&app->left, home);
     refresh_pane(&app->right, home);
@@ -4515,6 +5366,10 @@ void app_panes_free(AppPanes* app) {
     if (!app) return;
     free_entries(app->left.entries, app->left.entry_count);
     free_entries(app->right.entries, app->right.entry_count);
+    // The cached handles belong to this app's site list, and so do the pointers
+    // into it: both have to go before the AppPanes does.
+    net_bind(nullptr);
+    net_shutdown();
     delete app;
 }
 
@@ -4567,7 +5422,39 @@ static bool resolve_destination(AppPanes* app) {
     // whole subtree, which has no single new name to be given.
     struct stat st;
     bool slash = value[len - 1] == '/';
-    if (!plan.archive.empty() || slash || (stat(value, &st) == 0 && S_ISDIR(st.st_mode))) {
+    std::string vroot, vrpath;
+    bool dst_remote = net_split_virtual(value, &vroot, &vrpath);
+    if (dst_remote) {
+        // A remote destination names either a directory on the server or the name
+        // one entry lands under, and only the server can tell them apart. One
+        // MLST decides it; a site root is always a directory.
+        const NetSite* site = remote_site_for_root(app, vroot);
+        if (!site) return false;
+        std::string rpath = vrpath;
+        while (rpath.size() > 1 && rpath.back() == '/') rpath.pop_back();
+        FileEntry me;
+        std::string err;
+        bool is_dir = rpath.empty() || (net_stat(*site, rpath, &me, &err) && S_ISDIR(me.mode));
+        if (slash || is_dir) {
+            plan.dst_dir = net_virtual_path(vroot, rpath);
+            plan.name_override.clear();
+        } else if (plan.names.size() == 1) {
+            size_t at = rpath.find_last_of('/');
+            std::string dir = at == std::string::npos ? "" : rpath.substr(0, at);
+            std::string base = at == std::string::npos ? rpath : rpath.substr(at + 1);
+            if (base.empty()) {
+                snprintf(app->op_error, sizeof(app->op_error), "That destination has no name in it.");
+                return false;
+            }
+            plan.dst_dir = net_virtual_path(vroot, dir);
+            plan.name_override = base;
+        } else {
+            snprintf(app->op_error, sizeof(app->op_error),
+                     "%d entries are selected, so the destination has to be a directory.",
+                     (int)plan.names.size());
+            return false;
+        }
+    } else if (!plan.archive.empty() || slash || (stat(value, &st) == 0 && S_ISDIR(st.st_mode))) {
         plan.dst_dir = (slash && len > 1) ? std::string(value).substr(0, len - 1) : value;
         plan.name_override.clear();
         if (slash && stat(plan.dst_dir.c_str(), &st) != 0) {
@@ -4594,19 +5481,21 @@ static bool resolve_destination(AppPanes* app) {
         return false;
     }
 
-    if (stat(plan.dst_dir.c_str(), &st) != 0) {
-        snprintf(app->op_error, sizeof(app->op_error), "There is no directory %s.", plan.dst_dir.c_str());
-        return false;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        snprintf(app->op_error, sizeof(app->op_error), "%s is a file, not a directory.",
-                 plan.dst_dir.c_str());
-        return false;
-    }
-    char arch[4096], prefix[1024];
-    if (arch_split_virtual(plan.dst_dir.c_str(), arch, sizeof(arch), prefix, sizeof(prefix))) {
-        snprintf(app->op_error, sizeof(app->op_error), "An archive cannot be written into.");
-        return false;
+    if (!dst_remote) {
+        if (stat(plan.dst_dir.c_str(), &st) != 0) {
+            snprintf(app->op_error, sizeof(app->op_error), "There is no directory %s.", plan.dst_dir.c_str());
+            return false;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            snprintf(app->op_error, sizeof(app->op_error), "%s is a file, not a directory.",
+                     plan.dst_dir.c_str());
+            return false;
+        }
+        char arch[4096], prefix[1024];
+        if (arch_split_virtual(plan.dst_dir.c_str(), arch, sizeof(arch), prefix, sizeof(prefix))) {
+            snprintf(app->op_error, sizeof(app->op_error), "An archive cannot be written into.");
+            return false;
+        }
     }
     // Copying a file onto itself loses it: the copy opens the target for writing
     // before it reads the source. A move that names its own source does nothing.
@@ -4654,6 +5543,48 @@ void app_panes_commit_op(AppPanes* app) {
                            virt_prefix, sizeof(virt_prefix))) {
         app_panes_cancel_op(app);
         return;
+    }
+    std::string vroot, vrpath;
+    if (net_split_virtual(dir.c_str(), &vroot, &vrpath)) {
+        // A folder or a rename on a server goes over the transport. An empty new
+        // file is not offered: it would be an upload of nothing, and the editor
+        // that follows a local new file would have nothing local to edit.
+        const NetSite* site = remote_site_for_root(app, vroot);
+        if (!site) { app_panes_cancel_op(app); return; }
+        std::string err;
+        if (app->op == OP_NEWFILE) {
+            snprintf(app->op_error, sizeof(app->op_error),
+                     "Empty new files are not created on a server. Use F5 to put a local file there.");
+            return;
+        }
+        if (app->op == OP_MKDIR) {
+            std::string rpath = vrpath.empty() ? app->op_name : vrpath + "/" + app->op_name;
+            if (net_mkdir(*site, rpath, &err)) {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Created %s",
+                         net_virtual_path(vroot, rpath).c_str());
+                refresh_pane(&active, active.current_dir);
+                app_panes_cancel_op(app);
+            } else {
+                // The name is still wrong or taken; let the user fix it in place.
+                snprintf(app->op_error, sizeof(app->op_error), "Cannot create that folder: %s",
+                         err.c_str());
+            }
+            return;
+        }
+        if (app->op == OP_RENAME) {
+            if (app->op_plan.names.empty()) { app_panes_cancel_op(app); return; }
+            std::string old_path = vrpath.empty() ? app->op_plan.names[0]
+                                                  : vrpath + "/" + app->op_plan.names[0];
+            if (net_rename(*site, old_path, app->op_name, &err)) {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Renamed to %s", app->op_name);
+                refresh_pane(&active, active.current_dir);
+                app_panes_cancel_op(app);
+            } else {
+                snprintf(app->op_error, sizeof(app->op_error), "Cannot rename to %s: %s",
+                         app->op_name, err.c_str());
+            }
+            return;
+        }
     }
     if (app->op == OP_MKDIR) {
         char path[4100];
@@ -4723,6 +5654,7 @@ static void unique_copy_name(const char* dir, const char* base, char* out, size_
 static void do_copy_in_place(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     if (archive_readonly(app, active)) return;
+    if (remote_blocked(app, active, "Copying a file alongside itself")) return;
     StringList srcs = target_paths(active);
     if (srcs.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to copy");
@@ -4745,6 +5677,7 @@ static void do_symlink_other(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other = app->left_focus ? app->right : app->left;
     if (archive_readonly(app, active) || archive_readonly(app, other)) return;
+    if (remote_blocked(app, active, "Symlinks") || remote_blocked(app, other, "Symlinks")) return;
     StringList srcs = target_paths(active);
     if (srcs.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Nothing to link");
@@ -4784,6 +5717,13 @@ static const int DIRSIZE_PER_PRESS = 200;
 
 static void fill_dir_sizes(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
+    if (in_remote(active)) {
+        // A remote directory's size is the sum of a tree this machine does not
+        // have. The listing's own sizes are shown; the total would be a download.
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Directory sizes need a local directory");
+        return;
+    }
     if (in_archive(active)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "Directory sizes need a real directory");
@@ -4875,6 +5815,18 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
         default: break;
         }
     }
+    // And for the remote dialogs. The site form and the quick-connect line are
+    // text fields, so arrows, Home, End and Delete belong to the caret inside
+    // them; without this the caret never moves and the pane behind the dialog
+    // walks instead, which reads as the dialog ignoring what was typed.
+    if (app && (app->remote_quick_open || (app->remote_mgr_open && g_net_form.open))) {
+        switch (key) {
+        case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
+            return false;
+        default: break;
+        }
+    }
     switch (key) {
     case SDLK_UP: case SDLK_DOWN:
     case SDLK_PAGEUP: case SDLK_PAGEDOWN:
@@ -4933,6 +5885,43 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) app_panes_commit_op(app);
         else if (key == SDLK_ESCAPE) app_panes_cancel_op(app);
         return;
+    }
+
+    // ---- the remote dialogs (Ctrl+N quick connect, Ctrl+F site manager) ----
+    // Enter and Esc are the only keys these take; every other key is text for a
+    // field. In the manager, Enter commits the editor when one is showing, which
+    // is what a keyboard user expects from a form, and Esc steps out of the form
+    // before it closes the window.
+    if (app->remote_quick_open) {
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { remote_quick_commit(app); return; }
+        if (key == SDLK_ESCAPE) {
+            app->remote_quick_open = false;
+            app->remote_quick[0] = '\0';
+            return;
+        }
+        // Nothing else may reach the panes while a connect is being typed. Ctrl+N
+        // is the one exception, because pressing it again is also the way out.
+        if (!(key == SDLK_N && (mod & SDL_KMOD_CTRL))) return;
+    }
+    if (app->remote_mgr_open) {
+        if (key == SDLK_ESCAPE) {
+            if (g_net_form.open) { g_net_form.open = false; app->remote_edit = -1; }
+            else app->remote_mgr_open = false;
+            return;
+        }
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+            if (g_net_form.open) remote_save_form(app);
+            else if (app->remote_edit >= 0 &&
+                     app->remote_edit < (int)app->remote_sites.size())
+                remote_open(app, app->remote_sites[app->remote_edit]);
+            return;
+        }
+        // The manager is a window over the panes, not a widget beside them. Until
+        // this returned, Enter on a bare list activated whatever the pane cursor
+        // happened to be on and the arrows walked a list that was out of sight.
+        // Everything the dialog does not take itself is dropped; Ctrl+F is left
+        // through because it is also the binding that closes the window.
+        if (!(key == SDLK_F && (mod & SDL_KMOD_CTRL))) return;
     }
 
     // ---- full viewer keys ----
@@ -5256,6 +6245,19 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_B && (mod & SDL_KMOD_CTRL)) { branch_toggle(app, active, shift); return; }
     // TC Ctrl+L: sum up the marked entries.
     if (key == SDLK_L && (mod & SDL_KMOD_CTRL)) { count_marked_sizes(app); return; }
+    // The spec's FTP bindings. Ctrl+F opens the saved-site manager, Ctrl+N one
+    // line of quick connect; both are dialogs, so nothing blocks here.
+    if (key == SDLK_F && (mod & SDL_KMOD_CTRL)) {
+        app->remote_mgr_open = !app->remote_mgr_open;
+        app->remote_note[0] = '\0';
+        return;
+    }
+    if (key == SDLK_N && (mod & SDL_KMOD_CTRL)) {
+        app->remote_quick_open = !app->remote_quick_open;
+        app->remote_focus_request = true;
+        app->remote_note[0] = '\0';
+        return;
+    }
 
     // ---- marking ----
     if (key == SDLK_SPACE && (mod & SDL_KMOD_CTRL)) { toggle_mark(active, active.selected); return; }

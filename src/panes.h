@@ -6,6 +6,7 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "filesystem.h"
+#include "remote.h"   // NetSite, for the site list AppPanes owns
 
 static const int MAX_TABS = 8;
 static const int MAX_DIR_HISTORY = 32;
@@ -27,11 +28,14 @@ using MarkSet = std::vector<bool>;
 using StringList = std::vector<std::string>;
 
 // Pane listing mode: the plain directory, TC's branch view (Ctrl+B), which
-// flattens the whole subtree below the pane's directory into one list, or an
-// archive's contents. Archive browsing is a virtual listing: current_dir holds
-// a path whose prefix is the archive file (see arch_split_virtual), so tabs,
-// history and the path bar carry it without knowing archives exist.
-enum PaneListMode { LIST_NORMAL = 0, LIST_BRANCH = 1, LIST_ARCHIVE = 2 };
+// flattens the whole subtree below the pane's directory into one list, an
+// archive's contents, or a directory on a remote site. The last three are
+// virtual listings: current_dir holds a path that only this program understands
+// (see arch_split_virtual and net_split_virtual), so tabs, history and the path
+// bar carry it without knowing archives or FTP exist, and the operations that
+// talk to the filesystem have to step back.
+enum PaneListMode { LIST_NORMAL = 0, LIST_BRANCH = 1, LIST_ARCHIVE = 2,
+                    LIST_REMOTE = 3 };
 
 // TC puts a directory tree inside a panel: Ctrl+Shift+F8 replaces the file
 // list with it, Shift+Tab splits the panel into tree + list.
@@ -93,6 +97,17 @@ struct Pane {
     // archive file plus the member directory currently shown ("" = top level).
     char archive_path[4096];
     char archive_prefix[1024];
+    // Set while browsing a site: the site root URL (scheme, user, host, port -
+    // never a password) and the path on the server. current_dir holds the
+    // virtual path built from the two, which is what lets tabs, history, the
+    // path bar and the hotlist carry a remote directory without knowing that
+    // FTP exists. The login itself is looked up by root URL, so a pane never
+    // holds a secret a screenshot or a saved session could leak.
+    char remote_root[512];
+    char remote_path[1024];
+    // The local directory the pane walked into the site from. ".." at the site
+    // root uses it to leave, because a remote pane has no parent of its own.
+    char remote_came_from[4096];
 
     // Directory history (Alt+Left / Alt+Right)
     char history[MAX_DIR_HISTORY][4096];
@@ -124,6 +139,8 @@ struct OpPlan {
     std::string name_override;   // non-empty: the one source lands under this name
     std::string archive;         // non-empty: the sources are members of this archive
     std::string archive_prefix;  // level inside that archive, when the pane was deeper
+    std::string remote;          // non-empty: the sources are entries on this site
+    std::string remote_prefix;   // level inside that site, when the pane was deeper
     bool is_move = false;
 };
 
@@ -217,6 +234,18 @@ public:
     // Hotlist (bookmarks)
     std::vector<std::string> hotlist;
     bool hotlist_open;
+    // Remote sites. `remote_sites` mirrors the sites file; `remote_adhoc` holds
+    // the quick connects made this session, which are never written back. Both
+    // are consulted whenever a pane navigates to a remote path, because a
+    // virtual path carries no password to log in with.
+    std::vector<NetSite> remote_sites;
+    std::vector<NetSite> remote_adhoc;
+    bool remote_mgr_open;      // Ctrl+F: the saved-site manager
+    bool remote_quick_open;    // Ctrl+N: one-line quick connect
+    char remote_quick[512];    // the quick-connect field
+    char remote_note[512];     // the last connect or listing failure
+    int  remote_edit;          // index into remote_sites being edited; -1 = add one
+    bool remote_focus_request; // the quick-connect field wants the caret
     bool dirhist_open;    // Alt+Down: visited directories
     bool cmdhist_open;    // Alt+F8: command line history
     bool volumes_open;    // Alt+F1/F2: mounted drives
@@ -258,6 +287,10 @@ public:
     int       prog_files_total;
     double    prog_t0;
     double    prog_last_pump;
+    // Set by the progress dialog's Abort button. The copy and the transport both
+    // poll the progress callback, which returns false while this is set, so the
+    // stop lands between files rather than in the middle of one.
+    bool      prog_abort;
 
     // Deferred actions: menu/context-menu/dialog-button triggers fire inside
     // the ImGui frame, but a long operation pumps its own progress UI, and that

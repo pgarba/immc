@@ -47,17 +47,40 @@ if (TARGET Freetype::Freetype)
     target_compile_definitions(imgui PUBLIC MC_HAVE_FREETYPE)
 endif()
 
+# Remote sites (FTP/FTPS/SFTP) go through libcurl rather than a command-line
+# client, for two reasons a password rules out and archives do not: a password in
+# argv is readable through /proc by anyone on the machine, and a login plus a TLS
+# handshake per directory listing makes browsing unusable. libcurl keeps one
+# control connection per site, and never puts a secret in the process table.
+#
+# Optional, and a build without it is a supported configuration rather than a
+# broken one: src/remote.cpp keeps its URL parsing, sites file and listing
+# parsers, and only the transport says this build has no FTP support.
+find_package(CURL QUIET)
+# remote.cpp is compiled either way. What is optional is the library and the
+# MC_HAVE_CURL define, not the module: panes.cpp links against net_* in both
+# configurations, and without the library the transport half of the module is what
+# answers "this build has no FTP support".
+set(MC_REMOTE_SOURCES src/remote.cpp)
+if(CURL_FOUND)
+    set(MC_REMOTE_LIBS CURL::libcurl)
+    add_compile_definitions(MC_HAVE_CURL)
+    message(STATUS "remote sites via libcurl: ${CURL_VERSION_STRING}")
+else()
+    message(STATUS "no libcurl found: FTP/FTPS/SFTP disabled, the rest of the app is unchanged")
+endif()
+
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
-target_link_libraries(mc-clone PRIVATE imgui)
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
+target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS})
 target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 
 # Logic tests. tests/test_panes.cpp includes src/panes.cpp so the file-static
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
 # checked without a display.
 enable_testing()
-add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp)
-target_link_libraries(test-panes PRIVATE imgui)
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
+target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS})
 target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 add_test(NAME panes COMMAND test-panes)
 
@@ -71,3 +94,17 @@ set_tests_properties(version PROPERTIES PASS_REGULAR_EXPRESSION "immc [0-9]+\\.[
 add_executable(test-archive tests/test_archive.cpp src/archive.cpp)
 target_include_directories(test-archive PRIVATE src)
 add_test(NAME archive COMMAND test-archive)
+
+# Remote backend. The parsers are checked against recorded server output, and the
+# transport against a real FTP server started by the test on 127.0.0.1, so the
+# MLSD and LIST dialects, the login, the transfers and the mutations are all
+# exercised rather than assumed. The test skips the network half when this build
+# has no libcurl, and still checks the parsers and the sites file.
+add_executable(test-remote tests/test_remote.cpp src/remote.cpp src/filesystem.cpp)
+target_include_directories(test-remote PRIVATE src)
+target_link_libraries(test-remote PRIVATE ${MC_REMOTE_LIBS})
+# The test starts the fixture server by absolute path, so it runs from any build
+# directory and from ctest's own working directory.
+target_compile_definitions(test-remote PRIVATE
+    MC_FTP_SERVER="${CMAKE_CURRENT_SOURCE_DIR}/tests/ftp_server.py")
+add_test(NAME remote COMMAND test-remote)

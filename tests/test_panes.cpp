@@ -1998,6 +1998,56 @@ static void test_options_keys(AppPanes* app) {
     app->options_open = false;
 }
 
+// The remote dialogs are windows over the panes, not widgets beside them, so a
+// key the dialog does not take must still not reach the file list. What this
+// pins is the reported bug: Enter with the site manager open activated whatever
+// the pane cursor happened to be sitting on.
+static void test_remote_keys(AppPanes* app) {
+    Pane& p = app->left;
+    refresh_pane(&p, "/tmp");
+    CHECK(p.entry_count > 1);
+    p.selected = 1;
+    int sel = p.selected;
+
+    app->remote_mgr_open = true;
+    app->remote_edit = -1;
+    // No field is up, so these stay app keys - but the pane must not act on them.
+    CHECK(app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.selected == sel);                                  // Enter did not open a row
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(p.selected == sel);                                  // nor did the arrow walk it
+    app_panes_handle_key(app, SDLK_SPACE, SDL_KMOD_NONE);
+    CHECK(!p.marked[sel]);                                     // nor did Space mark it
+    // Ctrl+F is the documented way out of the manager, so it is the one key the
+    // catch-all deliberately leaves through.
+    app_panes_handle_key(app, SDLK_F, SDL_KMOD_CTRL);
+    CHECK(!app->remote_mgr_open);
+
+    // Quick connect always has a field up, so the caret keys belong to it. These
+    // are all app keys normally, which is exactly what breaks typing a URL.
+    CHECK(app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));    // the baseline, dialog still shut
+    app->remote_quick_open = true;
+    CHECK(!app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_HOME, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_BACKSPACE, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_DELETE, SDL_KMOD_NONE, app));
+    // A URL that will not parse is refused without moving the pane, and the
+    // dialog stays up with the reason on screen so there is something to fix.
+    app->remote_quick[0] = '\0';
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.selected == sel);
+    CHECK(app->remote_quick_open);
+    CHECK(app->remote_note[0]);
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(!app->remote_quick_open);
+    CHECK(app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));    // and back to normal
+
+    app->remote_mgr_open = false;
+    app->remote_edit = -1;
+    app->remote_note[0] = '\0';
+}
+
 // The dialog has to fit the window it is opened in, and a font path has to stay
 // inside it: the list is a column of long absolute paths, which is exactly what
 // pushes a frame wider than the screen.
@@ -2389,7 +2439,7 @@ int main() {
     test_title(&app);
     test_options_config(&app);
     test_options_keys(&app);
-    test_options_dialog_layout(&app);
+    test_remote_keys(&app);    test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);
     test_filter_focus_preview(&app, root);
