@@ -378,6 +378,13 @@ public:
     // are the previews that are not on this disk and are still on their way.
     std::vector<std::pair<std::string, std::string>> qv_cache;
     std::vector<std::unique_ptr<QvFetch>> qv_fetches;
+    // The size the F3 window was last at, in pixels. main.cpp switches off ImGui's
+    // own .ini, so a floating window keeps its shape across sessions only if the
+    // config carries it. The position is deliberately not saved: a window left at
+    // coordinates from a monitor that has gone is one that cannot be grabbed.
+    // Keep the default in sync with quickview_w/quickview_h in config.cpp.
+    float qv_w = 720.0f;
+    float qv_h = 460.0f;
     // The op dialog's "Run in background" request. It lives here rather than in
     // the plan because it has to survive the overwrite confirm, and only
     // run_op_plan() knows whether the plan crosses a network at all - which is

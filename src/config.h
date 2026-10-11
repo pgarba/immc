@@ -10,6 +10,11 @@ static const int MC_MAX_TABS = 8;   // keep in sync with MAX_TABS in panes.h
 struct MCConfig {
     int   win_x, win_y;   // window position; -1 = let the window manager place it
     int   win_w, win_h;   // window size
+    // Size of the F3 quick view window, in pixels: restored at startup and
+    // written back on exit. ImGui's own window .ini is switched off, so this is
+    // the only reason the preview is the size you left it. The position is not
+    // saved - see the comment on qv_w in panes.h.
+    int   qv_w, qv_h;
     char  font[1024];     // path to a .ttf/.otf font; empty = built-in font
     float font_size;      // font size in px; 0 = built-in default
     char  hinting[32];    // how glyphs meet the pixel grid: default | none | light |

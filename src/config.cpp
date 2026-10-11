@@ -31,6 +31,9 @@ static void ensure_config_dir() {
 void mc_config_default(MCConfig* c) {
     c->win_x = -1; c->win_y = -1;
     c->win_w = 1280; c->win_h = 800;
+    // Keep in sync with qv_w/qv_h in AppPanes (panes.h): a config that says
+    // nothing and an app that was never told have to agree on the same window.
+    c->qv_w = 720; c->qv_h = 460;
     c->font[0] = '\0';
     c->font_size = 0.0f;
     snprintf(c->hinting, sizeof(c->hinting), "default");
@@ -76,6 +79,8 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "window_y"))  c->win_y = atoi(val);
         else if (!strcmp(key, "window_w"))  c->win_w = atoi(val);
         else if (!strcmp(key, "window_h"))  c->win_h = atoi(val);
+        else if (!strcmp(key, "quickview_w")) c->qv_w = atoi(val);
+        else if (!strcmp(key, "quickview_h")) c->qv_h = atoi(val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
         else if (!strcmp(key, "font_hinting")) snprintf(c->hinting, sizeof(c->hinting), "%s", val);
@@ -110,6 +115,10 @@ void mc_config_load(MCConfig* c) {
 
     if (c->win_w < 200) c->win_w = 1280;
     if (c->win_h < 200) c->win_h = 800;
+    // A quick view smaller than this has no room for the two header lines and a
+    // row of text, and a window that small is hard to drag back by its title bar.
+    if (c->qv_w < 200) c->qv_w = 720;
+    if (c->qv_h < 120) c->qv_h = 460;
     if (c->left_tab_count  < 0) c->left_tab_count  = 0;
     if (c->left_tab_count  > MC_MAX_TABS) c->left_tab_count = MC_MAX_TABS;
     if (c->right_tab_count < 0) c->right_tab_count = 0;
@@ -169,11 +178,15 @@ void mc_config_save(const MCConfig* c) {
         "show_hidden = %d\n"
         "trash = %d\n"
         "\n# Columns of the long view (Shift+F1); name is always first\n"
-        "columns = %s\n",
+        "columns = %s\n"
+        "\n# Size in pixels of the F3 quick view window (written on exit).\n"
+        "# The window opens here next time; its position is left to the screen.\n"
+        "quickview_w = %d\n"
+        "quickview_h = %d\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
         c->font, (double)c->font_size, c->hinting, c->theme,
         c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->trash,
-        c->columns);
+        c->columns, c->qv_w, c->qv_h);
 
     fprintf(f,
         "\n# Pane tabs restored at startup (written on exit)\n"

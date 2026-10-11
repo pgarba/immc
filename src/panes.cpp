@@ -4531,9 +4531,17 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
 }
 
 static void render_quick_view(AppPanes* app, Pane& pane) {
-    ImGui::SetNextWindowSize(ImVec2(720, 460), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(app->qv_w, app->qv_h), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 640, 60), ImGuiCond_FirstUseEver);
     ImGui::Begin("Quick view");
+    // Remember the shape to open at next session. FirstUseEver means ImGui holds
+    // the live size for the rest of this one, so what gets recorded here is what
+    // the user dragged the window to, not what it was asked to be. With F3 on both
+    // panes there are two such windows and the last one drawn is the one whose
+    // size is kept; both open at that size.
+    const ImVec2 qv_size = ImGui::GetWindowSize();
+    app->qv_w = qv_size.x;
+    app->qv_h = qv_size.y;
 
     if (pane.selected < 0 || pane.selected >= pane.entry_count) {
         ImGui::TextUnformatted("(empty)");
@@ -6027,6 +6035,11 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->sort_mode = fs_get_sort_mode();
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
     snprintf(cfg->columns, sizeof(cfg->columns), "%s", app->columns);
+    // The F3 window's size, so the preview is as big as the user left it. Its
+    // position is not saved: coordinates from a monitor that has gone leave a
+    // window that cannot be grabbed.
+    cfg->qv_w = (int)app->qv_w;
+    cfg->qv_h = (int)app->qv_h;
     Pane* src[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         Pane& pane = *src[p];
@@ -6079,6 +6092,13 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
     if (cfg->columns[0]) snprintf(app->columns, sizeof(app->columns), "%s", cfg->columns);
+    // A config that never carried these, or carries a 0 from a hand-edited file,
+    // leaves the size the app was built with. mc_config_load has already clamped a
+    // window too small to be usable back to that default.
+    if (cfg->qv_w > 0 && cfg->qv_h > 0) {
+        app->qv_w = (float)cfg->qv_w;
+        app->qv_h = (float)cfg->qv_h;
+    }
     Pane* dst[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         const char (*tabs)[4096] = (p == 0) ? cfg->left_tabs : cfg->right_tabs;

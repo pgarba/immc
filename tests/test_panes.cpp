@@ -1986,6 +1986,25 @@ static void test_options_config(AppPanes* app) {
     CHECK(!strcmp(next.font, "/usr/share/fonts/TTF/DejaVuSansMono.ttf"));
     CHECK(next.font_size == 17.0f);
 
+    // The F3 window's size travels the same way. ImGui's own window .ini is off,
+    // so the config is the only thing that remembers how big the user made it.
+    // The default the config writes and the default an app starts with have to be
+    // the same window, or a config from before these keys existed opens something
+    // else than the one the user first saw.
+    AppPanes fresh;
+    CHECK(cfg.qv_w == (int)fresh.qv_w && cfg.qv_h == (int)fresh.qv_h);
+    app->qv_w = 900.0f;
+    app->qv_h = 640.0f;
+    app_panes_save_state(app, &cfg);
+    CHECK(cfg.qv_w == 900 && cfg.qv_h == 640);
+    app_panes_apply_state(&next, &cfg);
+    CHECK(next.qv_w == 900.0f && next.qv_h == 640.0f);
+    // A zero from a hand-edited config leaves the size that is already there
+    // rather than opening a window with no room for a line of text.
+    cfg.qv_w = 0; cfg.qv_h = 0;
+    app_panes_apply_state(&next, &cfg);
+    CHECK(next.qv_w == 900.0f && next.qv_h == 640.0f);
+
     // A config with no font means the built-in font at its own size.
     mc_config_default(&cfg);
     app_panes_apply_state(&next, &cfg);
@@ -1998,6 +2017,39 @@ static void test_options_config(AppPanes* app) {
     const char* const* names = mc_theme_list(&n);
     CHECK(n > 0);
     for (int i = 0; i < n; i++) CHECK(fs_exists(names[i]) == false || names[i][0] != '\0');
+}
+
+// The keys have to survive the file, not just the struct: the next run reads what
+// this one wrote, and a key that does not match what the parser looks for is a
+// setting that quietly stops being remembered. HOME points at a scratch tree for
+// the duration and goes back before anything else can ask for it.
+static void test_config_file(const std::string& root) {
+    const char* real_home = getenv("HOME");
+    std::string home = root + "/cfg-home";
+    mkdir(home.c_str(), 0755);
+    setenv("HOME", home.c_str(), 1);
+
+    MCConfig cfg;
+    mc_config_default(&cfg);
+    cfg.qv_w = 900; cfg.qv_h = 640;
+    mc_config_save(&cfg);
+
+    MCConfig back;
+    mc_config_default(&back);
+    mc_config_load(&back);
+    CHECK(back.qv_w == 900 && back.qv_h == 640);
+    CHECK(back.win_w == 1280 && back.win_h == 800);   // the neighbours still parse
+
+    // A size hand-edited too small to use is not loaded. The file is written by
+    // this app, so anything in that field arrived by hand, and a window with no
+    // room for a line of text is hard to drag back by its title bar.
+    FILE* f = fopen((home + "/.config/mc-clone/config").c_str(), "a");
+    if (f) { fprintf(f, "quickview_w = 5\nquickview_h = 7\n"); fclose(f); }
+    mc_config_default(&back);
+    mc_config_load(&back);
+    CHECK(back.qv_w == 720 && back.qv_h == 460);
+
+    if (real_home) setenv("HOME", real_home, 1); else unsetenv("HOME");
 }
 
 // A session that ended on a site or inside an archive has to come back to the
@@ -3179,6 +3231,7 @@ int main() {
     test_identity(&app);
     test_title(&app);
     test_options_config(&app);
+    test_config_file(root);
     test_tab_restore(&app, root);
     test_options_keys(&app);
     test_remote_keys(&app);
