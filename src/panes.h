@@ -176,6 +176,10 @@ struct BgTransfer {
     // The worker's answer. Read once state is no longer BG_RUNNING.
     std::string error;
     int ok_names = 0;
+    // SDL_GetTicks() at the moment the worker stopped, written before the state
+    // that publishes it. A finished row stays on screen long after the thread is
+    // gone, so its "in Ns" is this minus t0 and not the clock minus t0.
+    std::atomic<long long> t_end_ms{0};
 
     std::thread worker;
 };

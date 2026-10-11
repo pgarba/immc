@@ -2213,10 +2213,27 @@ static void test_bg_transfers(AppPanes* app) {
     CHECK(strstr(out, "eta") == nullptr);
 
     // An ended transfer has no rate to quote, only what it moved and how long
-    // that took.
+    // that took - and how long that took is the transfer's span, not how long ago
+    // it started. The row is still drawn a minute later, so a duration measured
+    // against the clock counts up under a bar that says "done". The timestamps are
+    // fixed rather than read from the clock, because the claim is that this line
+    // does not read the clock.
     t.state = BgTransfer::BG_DONE;
+    t.t0 = 1000.0;
+    t.t_end_ms = 1000000;                       // ended the instant it began
     bg_line(&t, out, sizeof(out));
-    CHECK(strstr(out, "5.0M in 10s") != nullptr);
+    CHECK(strstr(out, "5.0M in 0s") != nullptr);
+    t.t_end_ms = 1009000;                       // ran nine of its ten seconds
+    bg_line(&t, out, sizeof(out));
+    CHECK(strstr(out, "5.0M in 9s") != nullptr);
+    char frozen[128];
+    snprintf(frozen, sizeof(frozen), "%s", out);
+    SDL_Delay(150);                                     // the row is still on screen
+    bg_line(&t, out, sizeof(out));
+    CHECK(!strcmp(out, frozen));                        // and the number has not moved
+    t.t_end_ms = 0;                                     // a finish never recorded
+    bg_line(&t, out, sizeof(out));
+    CHECK(strstr(out, "in 0s") != nullptr);
 
     // The worker's callback publishes instead of drawing, and its false answer is
     // what unwinds the transport after the file it is on.

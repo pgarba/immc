@@ -2644,9 +2644,14 @@ static void bg_line(const BgTransfer* t, char* out, size_t n) {
 
     // A finished row has no rate to speak of - the average over a transfer that
     // is over is not what anyone wants to read - so it reports what it moved and
-    // how long that took.
+    // how long that took. How long that took is the transfer's own span, frozen
+    // when the worker stopped: the row is still drawn minutes later, and a
+    // duration measured against the clock counts up under a bar that says "done".
     if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) {
-        snprintf(out, n, "%s in %.0fs", done_s, elapsed);
+        long long end_ms = t->t_end_ms.load(std::memory_order_acquire);
+        double span = end_ms > 0 ? (double)end_ms / 1000.0 - t->t0 : 0.0;
+        if (span < 0.0) span = 0.0;
+        snprintf(out, n, "%s in %.0fs", done_s, span);
         return;
     }
     if (total <= 0) {
@@ -2697,6 +2702,10 @@ static void bg_run_remote(BgTransfer* t, const NetSite& site, const OpPlan& plan
     if (!ok)
         t->error = t->abort.load() ? "stopped before anything transferred"
                                    : (err.empty() ? std::string("transfer failed") : err);
+    // The clock stops here. The row outlives the thread and stays on screen, so a
+    // duration measured against the clock would keep counting up under a bar that
+    // says "done". Written before the store below, which is what publishes it.
+    t->t_end_ms = (long long)SDL_GetTicks();
     // The store is what publishes ok_names and error: a frame that reads the
     // state with acquire sees everything written before it.
     int st = t->abort.load() ? BgTransfer::BG_ABORTED
