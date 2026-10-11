@@ -141,6 +141,16 @@ bool net_download(const NetSite& site, const std::string& rpath, const char* loc
 bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
                 fs_progress_fn cb, void* user, std::string* err);
 
+// Fetch the beginning of a remote file, into memory rather than onto disk: the
+// amount a preview needs, and no more. A quick view of a 4 GB file still has to
+// answer, and FTP cannot be asked for a range that ends early - REST sets a
+// starting point and the server then sends everything after it - so the transfer
+// is abandoned once `max_bytes` have arrived. curl calls that a write error and
+// this treats it as the transfer having done its job. `cb` is asked between
+// chunks and the fetch stops when it says no, exactly as in net_download().
+bool net_download_prefix(const NetSite& site, const std::string& rpath, std::string* out,
+                         size_t max_bytes, fs_progress_fn cb, void* user, std::string* err);
+
 // Mutations. These are sent as FTP commands against the entry's parent
 // directory, which is what makes them work with a path relative to the server's
 // working directory instead of assuming an absolute path the server accepts.

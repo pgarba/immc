@@ -836,8 +836,52 @@ static void test_ftp_transfer(FtpFixture& fx) {
     sh("rm -rf " + q(out));
 }
 
-// The default is that a certificate has to check out. This is the one place the
-// rule is proved: the same server, the same site, one flag apart.
+// A quick view wants the beginning of a file, not the file. The cap has to hold
+// against a file far larger than it, and a file smaller than the cap has to come
+// back whole - that second case is what decides whether browsing a directory of
+// small text files costs a fresh login per file or not.
+static void test_ftp_prefix(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    std::string err, body;
+
+    CHECK(net_download_prefix(site, "/hello.txt", &body, 4096, nullptr, nullptr, &err));
+    CHECK(body == "hello world\n");
+
+    // A cap exactly the size of the file: the transfer ends by itself, and the
+    // answer is the same one.
+    CHECK(net_download_prefix(site, "/hello.txt", &body, 12, nullptr, nullptr, &err));
+    CHECK(body == "hello world\n");
+
+    std::string big = fx.root + "/big.txt";
+    sh("head -c 200000 /dev/zero | tr '\\0' 'z' > " + q(big));
+    CHECK(net_download_prefix(site, "/big.txt", &body, 4096, nullptr, nullptr, &err));
+    CHECK(body.size() == 4096);
+    CHECK(body.find_first_not_of('z') == std::string::npos);
+    remove(big.c_str());
+
+    // A name the URL cannot carry still fetches: escaping is the URL's problem,
+    // not the caller's.
+    CHECK(net_download_prefix(site, "/IDA Pro 9.6.261001/inner.txt", &body, 4096,
+                              nullptr, nullptr, &err));
+    CHECK(body == "nested\n");
+
+    CHECK(!net_download_prefix(site, "/gone.txt", &body, 4096, nullptr, nullptr, &err));
+    CHECK(!err.empty());
+    CHECK(body.empty());
+
+    // The callback is how a caller stops a fetch nobody wants any more, because
+    // the cursor moved on while the bytes were still on the wire.
+    Prog stopper;
+    stopper.after = 0;
+    std::string huge = fx.root + "/huge.txt";
+    sh("head -c 2000000 /dev/zero | tr '\\0' 'q' > " + q(huge));
+    CHECK(!net_download_prefix(site, "/huge.txt", &body, 1000000, prog_cb, &stopper, &err));
+    CHECK(err == "aborted");
+    CHECK(body.empty());
+    CHECK(stopper.calls >= 1);
+    remove(huge.c_str());
+}
+
 // A background transfer runs on its own thread while the panes keep browsing the
 // same site, and one curl handle cannot serve two threads at once - so the handle
 // cache is per thread. That is asserted in the source, but the assertion is only
@@ -879,6 +923,8 @@ static void test_ftp_concurrent(FtpFixture& fx) {
     sh("rm -rf " + q(out));
 }
 
+// The default is that a certificate has to check out. This is the one place the
+// rule is proved: the same server, the same site, one flag apart.
 static void test_ftp_tls(FtpFixture& fx) {
     NetSite site = fixture_site(fx);
     std::string err;
@@ -990,6 +1036,7 @@ int main(void) {
         test_ftp_escaped_names(fx);
         test_ftp_bad_login(fx);
         test_ftp_transfer(fx);
+        test_ftp_prefix(fx);
         test_ftp_concurrent(fx);
         fx.stop();
     }

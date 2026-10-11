@@ -1084,6 +1084,52 @@ bool net_download(const NetSite& site, const std::string& rpath, const char* loc
     return ok;
 }
 
+struct PrefixSink {
+    std::string* out;
+    size_t max;
+    bool full;
+};
+
+// Returning anything other than the chunk's length is how a write callback tells
+// curl to abandon a transfer, which is the only way to stop an FTP retrieve in
+// the middle: the protocol has no range that ends early.
+static size_t write_prefix_cb(char* ptr, size_t size, size_t nmemb, void* user) {
+    PrefixSink* s = (PrefixSink*)user;
+    size_t got = size * nmemb;
+    size_t room = s->max - s->out->size();
+    if (got > room) got = room;
+    s->out->append(ptr, got);
+    if (s->out->size() >= s->max) { s->full = true; return 0; }
+    return got;
+}
+
+bool net_download_prefix(const NetSite& site, const std::string& rpath, std::string* out,
+                         size_t max_bytes, fs_progress_fn cb, void* user, std::string* err) {
+    if (!site.valid()) { if (err) *err = "no host"; return false; }
+    out->clear();
+    if (!max_bytes) return true;
+    std::string url = curl_url(site, rpath);
+    char errbuf[CURL_ERROR_SIZE];
+    PerformCtx pctx = { cb, user, false, false };
+    CURL* h = handle_for(site);
+    if (!h) { if (err) *err = "out of memory"; return false; }
+    setup_handle(h, site, url, errbuf, sizeof errbuf);
+    PrefixSink sink = { out, max_bytes, false };
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_prefix_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, &pctx);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    CURLcode rc = curl_easy_perform(h);
+    // A transfer abandoned on purpose still leaves the control connection inside
+    // a retrieve, so the handle goes the same way it does after a real failure.
+    if (rc != CURLE_OK) net_forget(&site);
+    if (rc == CURLE_OK || (rc == CURLE_WRITE_ERROR && sink.full)) return true;
+    if (err) *err = pctx.aborted ? std::string("aborted") : curl_error(rc, errbuf);
+    out->clear();
+    return false;
+}
+
 bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
                 fs_progress_fn cb, void* user, std::string* err) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
@@ -1319,6 +1365,10 @@ bool net_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, s
 bool net_stat(const NetSite&, const std::string&, FileEntry*, std::string* err) { return no_curl(err); }
 bool net_download(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
 bool net_upload(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
+bool net_download_prefix(const NetSite&, const std::string&, std::string* out, size_t, fs_progress_fn, void*, std::string* err) {
+    out->clear();
+    return no_curl(err);
+}
 bool net_mkdir(const NetSite&, const std::string&, std::string* err) { return no_curl(err); }
 bool net_remove(const NetSite&, const std::string&, bool, std::string* err) { return no_curl(err); }
 bool net_remove_tree(const NetSite&, const std::string&, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
