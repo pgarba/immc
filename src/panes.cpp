@@ -1313,6 +1313,7 @@ void app_about_identity(char* out, size_t n) {
 
     snprintf(out, n,
              "%s %s - a Total Commander style file manager\n"
+             "written by Peter Garba\n"
              "executable %s - Dear ImGui %s, SDL %s\n"
              "settings %s\n"
              "text rasterized with %s\n"

@@ -1902,6 +1902,10 @@ static void test_identity(AppPanes* app) {
     CHECK(strstr(about, "settings ") != NULL);
     CHECK(strstr(about, "rasterized with ") != NULL);   // which loader this build has
     CHECK(strstr(about, "archive tools found: ") != NULL);
+    // The credit line lives in the same measured block as the rest of the header,
+    // so the About window shows one paragraph instead of a name typed into the
+    // widget beside it.
+    CHECK(strstr(about, "Peter Garba") != NULL);
     // The About window is a paragraph, not a wall: it stays inside its buffer.
     CHECK(strlen(about) < sizeof(about) - 1);
 
