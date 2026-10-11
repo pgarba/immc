@@ -289,6 +289,14 @@ public:
     char cmd_history[64][512];
     int cmd_hist_count;
     int cmd_hist_pos; // == cmd_hist_count means "editing a fresh line"
+    // The command line takes the keyboard on every frame (MC-style: always
+    // focused), so merely being the active item is not the signal that the user
+    // means to type here - it would be true whenever nothing else has the
+    // keyboard. `cmd_field_claimed` is the signal: a click into the box sets it,
+    // and the box losing the keyboard clears it. While both hold, the text keys
+    // (Space, Backspace, Del, /, +, -, *) belong to the box and not to the panes.
+    bool cmd_field_active;   // the box is the active item this frame
+    bool cmd_field_claimed;  // ...because the user clicked into it
 
     // Command output window (result of the last executed command)
     bool output_open;

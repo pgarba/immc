@@ -97,6 +97,8 @@ AppPanes::AppPanes() {
     cmd[0] = '\0';
     cmd_hist_count = 0;
     cmd_hist_pos = 0;
+    cmd_field_active = false;
+    cmd_field_claimed = false;
     output_open = false;
     output_text[0] = '\0';
     confirm = CONF_NONE;
@@ -6177,6 +6179,14 @@ void app_panes_render(AppPanes* app) {
             ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-status_w - 1.0f);
         ImGui::InputText("##cmdline", app->cmd, sizeof(app->cmd));
+        // Being the active item is not enough to decide what the text keys mean,
+        // because this field is the active item almost always. The claim is what
+        // matters, and a click into the box is the only way to make one - which is
+        // also how it is given back: clicking a row, a path bar or a menu takes
+        // the keyboard away and the claim goes with it.
+        app->cmd_field_active = ImGui::IsItemActive();
+        if (ImGui::IsItemClicked(0)) app->cmd_field_claimed = true;
+        if (!app->cmd_field_active) app->cmd_field_claimed = false;
         if (shown[0]) {
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
@@ -6836,6 +6846,14 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
         default: break;
         }
     }
+    // While the command line box holds the keyboard *because the user took it*
+    // - by clicking into it - the text keys are typing. The box holds the
+    // keyboard by default on every frame, so plain activity is not the signal:
+    // treating it as one would take Space, Backspace, Del and the marking
+    // shortcuts away from the panes for good, and typing a space as the first
+    // character would mark a file instead.
+    auto cmd_claimed = [app]() { return app && app->cmd_field_active && app->cmd_field_claimed; };
+
     switch (key) {
     case SDLK_UP: case SDLK_DOWN:
     case SDLK_PAGEUP: case SDLK_PAGEDOWN:
@@ -6847,17 +6865,20 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     case SDLK_MENU:
         return true;
     case SDLK_BACKSPACE:
-        return app->cmd[0] == '\0' && !filter_focused();   // empty cmd: go to parent dir
+        // empty cmd: go to parent dir
+        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();
     case SDLK_DELETE:
-        return !filter_focused();   // Del edits the filter text, it does not delete files
+        // Del edits the filter text, it does not delete files
+        return !filter_focused() && !cmd_claimed();
     case SDLK_SPACE:
-        return app->cmd[0] == '\0' && !filter_focused();   // TC: Space marks on an empty cmd
+        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();   // TC: Space marks on an empty cmd
     case SDLK_SLASH: case SDLK_KP_DIVIDE:
-        return app->cmd[0] == '\0' && !filter_focused();   // TC Num/: restore the previous marks
+        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();   // TC Num/: restore the previous marks
     case SDLK_PLUS: case SDLK_KP_PLUS:
     case SDLK_MINUS: case SDLK_KP_MINUS:
     case SDLK_ASTERISK: case SDLK_KP_MULTIPLY:
-        return app->cmd[0] == '\0' && !filter_focused();   // select shortcuts need an empty cmd
+        // select shortcuts need an empty cmd
+        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();
     case SDLK_C: case SDLK_X: case SDLK_V:
         // TC file clipboard keys. With text already in the command line they
         // are text editing keys, so they fall through to ImGui.

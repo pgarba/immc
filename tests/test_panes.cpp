@@ -3442,6 +3442,119 @@ static void test_pane_status_row(AppPanes* app, const std::string& root) {
     ImGui::DestroyContext(ctx);
 }
 
+// Space typed into the command line used to mark a file instead: the app claimed
+// Space whenever the box was empty, and the box is empty and holds the keyboard
+// by default on every frame, so "empty box" was no signal at all. The space never
+// reached the box, and the Enter that followed then acted on the pane - which is
+// the sequence this reports. The rule now is a claim: a click into the box says
+// "I am typing here", and while that holds the text keys belong to the box.
+static void test_cmd_line_text_keys(AppPanes* app, const std::string& root) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1200, 700);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+    fs_set_show_hidden(false);
+    refresh_pane(&app->left, root.c_str());
+    refresh_pane(&app->right, root.c_str());
+    app->left_focus = true;
+    app->cmd[0] = '\0';
+    app->quick_view_pane = false;
+    app->confirm = CONF_NONE;
+    app->op = OP_NONE;
+
+    auto frame = [app]() {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    };
+    for (int i = 0; i < 4; i++) frame();
+
+    // The default state, which is what makes "the box is active" useless as a
+    // signal: it is active whenever nothing else has the keyboard.
+    CHECK(app->cmd[0] == '\0');
+    CHECK(app->cmd_field_active == true);
+    CHECK(app->cmd_field_claimed == false);
+    CHECK(app_key_is_special(SDLK_SPACE, SDL_KMOD_NONE, app));
+    CHECK(app_key_is_special(SDLK_BACKSPACE, SDL_KMOD_NONE, app));
+    CHECK(app_key_is_special(SDLK_DELETE, SDL_KMOD_NONE, app));
+    CHECK(app_key_is_special(SDLK_SLASH, SDL_KMOD_NONE, app));
+    CHECK(app_key_is_special(SDLK_PLUS, SDL_KMOD_NONE, app));
+    CHECK(app_key_is_special(SDLK_ASTERISK, SDL_KMOD_NONE, app));
+
+    // Click into the box: that is the claim. The bar's y is searched for rather
+    // than assumed, because in this harness the pane table's row heights settle
+    // after the first frame and the bar ends up where the budget did not put it -
+    // and opening the filter row moves it again.
+    auto claim_cmd_line = [&]() {
+        for (float probe = 300.0f; probe < 700.0f; probe += 6.0f) {
+            app->cmd_field_claimed = false;
+            io.MousePos = ImVec2(60.0f, probe);
+            frame();
+            io.AddMouseButtonEvent(0, true);
+            frame();
+            io.AddMouseButtonEvent(0, false);
+            frame(); frame();
+            if (app->cmd_field_claimed) return true;
+        }
+        return false;
+    };
+    CHECK(claim_cmd_line());
+    CHECK(app->cmd_field_active == true);
+    CHECK(app->cmd_field_claimed == true);
+
+    // With the claim held, none of them are the app's keys any more.
+    CHECK(!app_key_is_special(SDLK_SPACE, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_BACKSPACE, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_DELETE, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_SLASH, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_PLUS, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_MINUS, SDL_KMOD_NONE, app));
+    CHECK(!app_key_is_special(SDLK_ASTERISK, SDL_KMOD_NONE, app));
+
+    // The claim is given back with the keyboard, which is what keeps the marking
+    // shortcuts alive: Ctrl+S hands the keyboard to the filter and drops the
+    // claim, Esc hands it back to the panes, where Space marks again.
+    app_panes_handle_key(app, SDLK_S, SDL_KMOD_CTRL);
+    frame(); frame();
+    CHECK(app->left.filter_field_active == true);
+    CHECK(app->cmd_field_active == false);
+    CHECK(app->cmd_field_claimed == false);
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->left.filter_field_active == false);
+    CHECK(app_key_is_special(SDLK_SPACE, SDL_KMOD_NONE, app));
+
+    // Back into the box, and the space the report is about. The forwarding is the
+    // one main.cpp does: a key the app claims goes to the pane handler, a key it
+    // does not go to ImGui, where the SDL backend turns it into a character.
+    CHECK(claim_cmd_line());
+    int marks_before = marked_count(app->left);
+    int selected_before = app->left.selected;
+    if (app_key_is_special(SDLK_SPACE, SDL_KMOD_NONE, app))
+        app_panes_handle_key(app, SDLK_SPACE, SDL_KMOD_NONE);
+    else
+        io.AddInputCharacter(' ');
+    frame();
+    CHECK(app->cmd[0] == ' ');            // typed, not swallowed
+    CHECK(marked_count(app->left) == marks_before);
+
+    // Enter on a whitespace-only command runs nothing: exec_command skips it, so
+    // the pane is left alone. Enter on an empty box still opens the cursor's file,
+    // which is the behaviour that was asked to stay.
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->cmd[0] == ' ');
+    CHECK(app->left.selected == selected_before);
+    CHECK(app->viewer_open == false);
+    CHECK(marked_count(app->left) == marks_before);
+
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+    ImGui::DestroyContext(ctx);
+}
+
 // Ctrl+S opens the quick filter and puts the caret in it, so the keys typed
 // straight after belong to the filter and not to the pane behind it.
 static void test_filter_focus(AppPanes* app, const std::string& root) {
@@ -3675,6 +3788,7 @@ int main() {
     test_f10_menu_toggle(&app);
     test_pane_totals(&app, root);
     test_pane_status_row(&app, root);
+    test_cmd_line_text_keys(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

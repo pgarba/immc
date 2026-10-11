@@ -147,6 +147,15 @@ the rows you can see, and in branch view they describe the subtree branch view
 listed. Inside an archive the sizes are the members' sizes as the archive lists
 them, and the row says `packed`.
 
+The command line at the bottom holds the keyboard whenever nothing else has it,
+which is why “the box is focused” cannot decide whether `Space` marks a file or
+types a space. Clicking into the box decides it. While you hold it there, `Space`
+`Backspace` `Del` `/` `+` `-` `*` are typing, so a space as the first character
+arrives as a space instead of marking the cursor’s file and the `Enter` after it
+acts on nothing. `Enter` itself is unchanged: an empty command line still opens
+the file under the cursor. Hand the keyboard to anything else — `Ctrl+S` gives it
+to the filter — and the shortcuts come back.
+
 ### Tabs
 
 | | |
