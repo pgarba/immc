@@ -54,7 +54,7 @@ jobs:
             cmake g++ curl libgl1-mesa-dev libcurl4-openssl-dev \
             libfreetype-dev libx11-dev libxext-dev libxkbcommon-dev \
             libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
-            libibus-1-dev zip unzip p7zip-full python3
+            libibus-1.0-dev zip unzip p7zip-full python3
 
       # The second matrix leg reuses the first leg's SDL3.
       - name: SDL3 cache
