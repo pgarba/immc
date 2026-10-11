@@ -4555,8 +4555,8 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
         app->pane_menu_open = false;
     }
     if (ImGui::BeginPopup("panemenu")) {
-        app->pane_menu_alive = true;
         if (app->popup_close_request) ImGui::CloseCurrentPopup();
+        else app->pane_menu_alive = true;
         render_entry_menu_items(app, pane);
         ImGui::EndPopup();
     }
@@ -4570,8 +4570,8 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
 
     // Right-click context menu
     if (ImGui::BeginPopup("ctxmenu")) {
-        app->ctx_menu_alive = true;
         if (app->popup_close_request) ImGui::CloseCurrentPopup();
+        else app->ctx_menu_alive = true;
         render_entry_menu_items(app, pane);
         ImGui::EndPopup();
     }
@@ -5876,8 +5876,11 @@ void app_panes_render(AppPanes* app) {
     app->ctx_menu_alive = false;
     if (app->menu_open) { ImGui::OpenPopup("appmenu"); app->menu_open = false; }
     if (ImGui::BeginPopup("appmenu")) {
-        app->menu_alive = true;
+        // A close request consumed here must not leave the popup flagged alive:
+        // the next F10 would read that flag as "a menu is up" and dismiss a menu
+        // that is no longer on screen instead of opening a new one.
         if (app->popup_close_request) ImGui::CloseCurrentPopup();
+        else app->menu_alive = true;
         render_commands_items(app);
         ImGui::EndPopup();
     }
@@ -6065,6 +6068,12 @@ void app_panes_render(AppPanes* app) {
     render_options(app);
     render_remote_manager(app);
     render_remote_quick(app);
+
+    // The close request is a one-frame signal and every popup above has had its
+    // chance to consume it. Left standing, it closes the next popup on the very
+    // frame that popup opens, which is what made F10 stop showing the Commands
+    // menu after the first time it dismissed one.
+    app->popup_close_request = false;
 }
 
 AppPanes* app_panes_init() {
@@ -7386,9 +7395,13 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
     if (key == SDLK_ESCAPE) {
         // A keyboard-opened menu closes first (TC F10 toggles, Esc dismisses).
-        if (app->menu_alive || app->pane_menu_alive) {
+        // The local menu counts too: it is opened from the keyboard by Shift+F10
+        // just like the other two, and ImGui's own Esc handling is off because
+        // keyboard navigation is disabled, so nothing else would close it.
+        if (app->menu_alive || app->pane_menu_alive || app->ctx_menu_alive) {
             app->popup_close_request = true;
             app->menu_open = app->pane_menu_open = false;
+            app->entry_menu_open = false;
             return;
         }
         // A quick filter is cleared before the command line (TC Esc).

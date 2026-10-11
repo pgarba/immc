@@ -3120,6 +3120,105 @@ static void test_menu_click(AppPanes* app) {
     ImGui::DestroyContext(ctx);
 }
 
+// F10 is the Commands menu *toggle*. The key handler cannot ask ImGui whether a
+// popup is up from outside a frame, so the render pass leaves the *_alive flags
+// behind for it, and a dismiss travels forward as popup_close_request. Both
+// halves are measurable here: the flags on the app, and ImGui's popup stack.
+// A close request that outlived its own frame closed the next popup on the very
+// frame it opened, and a popup flagged alive on the frame that closed it made the
+// next F10 dismiss a menu that was not there. Together: the menu appears once and
+// never again.
+static void test_f10_menu_toggle(AppPanes* app) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(900, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);   // no click-away while we type
+
+    auto frame = [app]() {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    };
+    auto open = []() {
+        return ImGui::IsPopupOpen((ImGuiID)0, ImGuiPopupFlags_AnyPopup);
+    };
+
+    frame(); frame();
+    CHECK(!open());
+    CHECK(app->menu_alive == false);
+
+    // Open, dismiss, open again: the cycle the F10 key actually walks through.
+    for (int round = 0; round < 3; round++) {
+        app_panes_handle_key(app, SDLK_F10, SDL_KMOD_NONE);
+        frame();
+        CHECK(app->menu_alive == true);              // the menu is up this frame
+        CHECK(open());
+
+        app_panes_handle_key(app, SDLK_F10, SDL_KMOD_NONE);
+        frame();
+        CHECK(app->menu_alive == false);             // and not still flagged up
+        CHECK(!open());
+        CHECK(app->popup_close_request == false);    // the request was spent, not latched
+    }
+
+    // Esc dismisses it the same way; F10 has to bring it back after that too.
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->menu_alive == true);
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->menu_alive == false);
+    CHECK(!open());
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->menu_alive == true);
+    CHECK(open());
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->menu_alive == false);
+    CHECK(!open());
+
+    // The pane menu (F9) and the local menu (Shift+F10) share the same request
+    // flag, so they are walked through the same cycle.
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->pane_menu_alive == true);
+    CHECK(open());
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->pane_menu_alive == false);
+    CHECK(!open());
+    app_panes_handle_key(app, SDLK_F9, SDL_KMOD_NONE);
+    frame();
+    CHECK(app->pane_menu_alive == true);
+    CHECK(open());
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    frame();
+    CHECK(!open());
+
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_SHIFT);
+    frame();
+    CHECK(app->ctx_menu_alive == true);
+    CHECK(open());
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_SHIFT);
+    frame();
+    CHECK(app->ctx_menu_alive == false);
+    CHECK(!open());
+    app_panes_handle_key(app, SDLK_F10, SDL_KMOD_SHIFT);
+    frame();
+    CHECK(app->ctx_menu_alive == true);
+    CHECK(open());
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    frame();
+    CHECK(!open());
+
+    ImGui::DestroyContext(ctx);
+}
+
+
 // Ctrl+S opens the quick filter and puts the caret in it, so the keys typed
 // straight after belong to the filter and not to the pane behind it.
 static void test_filter_focus(AppPanes* app, const std::string& root) {
@@ -3350,6 +3449,7 @@ int main() {
     test_filter_focus(&app, root);
     test_filter_focus_preview(&app, root);
     test_menu_click(&app);
+    test_f10_menu_toggle(&app);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);
