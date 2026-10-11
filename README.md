@@ -67,6 +67,9 @@ configuration is verified as a first-class build, not assumed:
     cmake --build build-nocurl -j4
     (cd build-nocurl && ctest)
 
+`.github/workflows/ci.yml` runs exactly those two configurations on every push, so
+the bootstrap script and the no-libcurl build cannot quietly rot.
+
 ## Keys
 
 The full reference is in the app (`F10` for the menus, `F1` for the About window)

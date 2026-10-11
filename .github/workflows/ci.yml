@@ -1,0 +1,59 @@
+# immc is verified in two configurations and both are built here on every
+# push: with libcurl, which is what turns on FTP/FTPS/SFTP, and without it,
+# which is a supported build rather than a broken one. The suites are headless,
+# so no display is needed, and the remote suite starts its own FTP server on
+# 127.0.0.1 with python3. zip and p7zip-full are installed because the archive
+# suite shells out to the same tools the app does, and skips the formats a
+# machine does not have.
+name: build and test
+
+# Nothing here writes to the repository, so the token the runner gets is
+# read-only, and checkout is told not to leave it behind in .git/config.
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: with libcurl
+            curl_args: ""
+          - name: without libcurl
+            curl_args: "-DCMAKE_DISABLE_FIND_PACKAGE_CURL=ON"
+    steps:
+      # Pinned to a commit rather than a moving tag: a workflow that can install
+      # packages on a runner should not fetch its steps by mutable reference.
+      # 3d3c42e5 is actions/checkout v7.0.1.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libgl1-mesa-dev libsdl3-dev libcurl4-openssl-dev \
+            libfreetype-dev zip unzip p7zip-full python3
+
+      # Dear ImGui is not vendored; this fetches the pinned commit
+      # CMakeLists.txt looks for, the same script a fresh clone runs.
+      - name: fetch Dear ImGui
+        run: scripts/get-deps.sh
+
+      - name: configure (${{ matrix.name }})
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.curl_args }}
+
+      - name: build
+        run: cmake --build build -j4
+
+      - name: test
+        run: ctest --test-dir build --output-on-failure
