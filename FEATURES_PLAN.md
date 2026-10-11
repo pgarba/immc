@@ -582,6 +582,7 @@ handler to keep that honest.
 | 18 | L1 remote sites: libcurl transport, sites file, site manager, browse, download | 1d | — |
 | 19 | L2 remote writes: upload, mkdir, rename, delete, chmod, properties | 0.5d | — |
 | 20 | L3 remote work off the frame loop with `curl_multi` | 0.5d | — |
+| 21 | M pane status bar (sizes, file/dir counts, marked subset) | 1h | — |
 
 Per phase: `cmake --build build` clean (LSP diagnostics on `src/*.cpp` must stay empty), then the
 manual checklist below. Each phase ends with one commit whose message names the TC bindings it adds.
@@ -864,3 +865,246 @@ verified` reaches the UI — the site list, the edit dialog and the status line 
 checks that they do. The `version` test does not assert the FTP line either. One cost the parent-listing
 `net_stat()` introduced: a recursive remote operation lists each directory twice, once for `net_stat()`
 and once for the walk, which is worth collapsing when L3 lands.
+
+## 9. Phase M — pane status bar (~1h, built)
+
+**What it is.** One line under each pane's list: what the files in that folder add up to,
+how many files there are, and how many directories. When entries are marked the counts turn
+into `marked/total` and the size does the same, so the line answers *what am I about to copy*
+without asking `Ctrl+L` first.
+
+```text
+/home/adam/github/immc                       /home/adam/downloads
+  src  tests  samples  scripts                 alpha.tar.gz
+  ...                                         beta.txt
+12 files  3 dirs  4.2M                         2/9 files  1/2 dirs  8.1/64.4M
+```
+
+**Decisions.** Four things were open and are now fixed, because each one changes the answer
+the line gives:
+
+- **Folder only.** The byte total is the sum of the sizes of the *files listed in that folder*.
+  A directory contributes its count and nothing to the bytes — its own `st_size` is an inode,
+  not its content, and a recursive total is a tree walk the frame has no business starting.
+  `Ctrl+L` (`count_marked_sizes` @6567) and `Alt+Shift+Enter` (`fill_dir_sizes` @6588) stay the
+  way to get recursive numbers, and this line is what tells you they are worth running.
+- **Visible rows.** The counts follow `pane.view`, so a quick filter that hides half the folder
+  reports the half on screen. The line has to agree with the rows the user is looking at, or it
+  is a second, contradicting source of truth.
+- **Under the list.** One text row at the bottom of each pane's cell, above the command bar.
+  It costs one row of list height per pane, which is the honest price and is paid once.
+- **Always on.** No key, no config entry, no state. The line is short, it is derived, and a
+  switch for it would be one more thing to remember and one more state to get wrong.
+
+### 9.1 The data: `pane_totals()`
+
+New in the selection-helpers block next to `marked_count` @191. Pure function of the pane, no
+new fields on `Pane`:
+
+```cpp
+struct PaneTotals {
+    long long bytes;          // file sizes over the visible rows
+    int files, dirs;
+    long long m_bytes;        // the same over the marked rows
+    int m_files, m_dirs;
+};
+
+static PaneTotals pane_totals(const Pane& p) {
+    PaneTotals t = {0, 0, 0, 0, 0, 0};
+    for (size_t r = 0; r < p.view.size(); r++) {
+        int i = p.view[r];
+        if (i < 0 || i >= p.entry_count) continue;
+        FileEntry* e = p.entries[i];
+        if (!e || strcmp(e->name, "..") == 0) continue;   // the parent row is not content
+        bool dir    = is_directory(e->name, e->mode);
+        bool marked = i < (int)p.marked.size() && p.marked[i];
+        if (dir) { t.dirs++; if (marked) t.m_dirs++; continue; }
+        t.files++; t.bytes += e->size;
+        if (marked) { t.m_files++; t.m_bytes += e->size; }
+    }
+    return t;
+}
+```
+
+`view` is the only correct source: `entries` holds rows the filter hid, and the filter is the
+one thing about a pane the user changed on purpose. `..` is excluded from both counts and the
+bytes — it is a way out, not an entry in the folder. `marked` is guarded by size the way every
+other reader of it already is (@4360, @4470).
+
+**No cache, nothing to invalidate.** The numbers are derived from `view`, `entries` and
+`marked`, all three of which `refresh_pane` @640-675 already rebuilds, and the walk is
+O(visible rows) twice per frame. A cache here would only be a way to be stale.
+
+### 9.2 The drawing: `render_pane_status()`
+
+```cpp
+static void render_pane_status(AppPanes* app, Pane& pane, bool focused, float width);
+```
+
+- Format, no marks: `12 files  3 dirs  4.2M`.
+- Format, marks present: `2/9 files  1/2 dirs  8.1/64.4M` — marked first, always, so the
+  number that changes is the one on the left.
+- Nothing on screen: `(empty)`, and for a filtered pane `(no rows match)` rather than a bare
+  `0 files 0 dirs`, which reads like the folder is empty when it is the filter that is empty.
+- Sizes go through `human_size` @1025 so the line uses the same `4.2M` the size column uses.
+- Inside an archive (`in_archive` @238) the bytes are the members' packed sizes, so the line
+  says `4.2M packed`. A `.tar.gz` listing that reported 64 MB of members and 8 MB on disk
+  would otherwise be the one number in this app that is quietly wrong.
+- Inside a site (`in_remote` @264) the sizes are what `LIST` reported, which is the same number
+  the size column already shows; directories are excluded from the bytes anyway, so the usual
+  `0`/`4096` a server reports for a directory never reaches the total.
+- Focused pane draws it with `TextUnformatted`, the unfocused one with `TextDisabled`, like the
+  path bars above it.
+- **Width.** This ImGui does not wrap `Text`/`TextDisabled` at the window edge (@2090), so the
+  line is measured with `CalcTextSize` and, if it is wider than the pane, rebuilt in a compact
+  form (`12f 3d 4.2M`) and finally truncated with an ellipsis. A narrow pane must not lose the
+  marked subset, so the compact form drops the words before it drops the numbers.
+
+### 9.3 The layout: one row out of the vertical budget
+
+The budget at @5893-5908 is the only place a row can be taken from, and it has to be taken
+before the table is laid out, not after:
+
+```cpp
+const float info_h = frame;                                   // the status row, per pane
+const float left_child_h  = ImMax(2.0f * frame,
+                                  base_h - (l_filter ? filt_h : 0.0f) - info_h);
+const float right_child_h = ImMax(2.0f * frame,
+                                  base_h - (r_filter ? filt_h : 0.0f) - info_h);
+```
+
+Then one call per column, after the list-or-quick-view branch, so all three list modes get it:
+
+- after @5945 (`left_pane` / `left_qv`), before `ImGui::TableNextColumn()` @5947
+- after @5980 (`right_pane` / `right_qv`), before `ImGui::EndTable()` @5982
+
+Drawing it in the table cell rather than inside `render_file_list_body` @4305 is what makes
+`TREE_EMBED` and `TREE_SPLIT` (@4585-4600) covered without touching either, and keeps the
+`ctxmenu`/`panemenu` popups anchored to the list instead of to the new row.
+
+The `ImMax` is new and is not decoration: the budget is already `win_h` minus five other rows,
+and this feature takes a sixth. Clamped, a short window loses list rows and keeps the line;
+unclamped, `BeginChild` gets a negative height.
+
+`pane.page_size` is measured from the child window's height in `render_file_list_body` @4307,
+so `PgUp`/`PgDn`/`Home`/`End` page one row shorter automatically. That is the whole cost of
+the feature and it should be said out loud rather than discovered by someone who notices the
+pane pages differently.
+
+### 9.4 What the numbers mean in each list mode
+
+| Mode | What the line reports | Note |
+|---|---|---|
+| `LIST_NORMAL` | the folder on screen | the intended case |
+| `LIST_BRANCH` (`Ctrl+B`) | every row the branch view listed, i.e. the subtree | honest, and different from `LIST_NORMAL` on the same folder; the row count is the subtree's, so it must not be read as the folder's |
+| `LIST_ARCHIVE` | the members of the current member directory | `packed` suffix; a member directory is not a tree total |
+| `LIST_REMOTE` | the rows `LIST` returned | sizes are the server's own numbers |
+| `TREE_EMBED` / `TREE_SPLIT` | the pane's *list* half, not the tree | the tree is a navigation model, not a listing |
+| quick view panel (`F3`, `Ctrl+Q`) | still the pane's folder | the panel replaces the list, not the pane |
+
+### 9.5 Tests
+
+`test_pane_totals(&app, root)` — logic only, no display:
+
+1. A folder with three files of known sizes and two directories: `files == 3`, `dirs == 2`,
+   `bytes ==` the sum, and `..` in neither count nor total.
+2. Mark one file and one directory: `m_files == 1`, `m_dirs == 1`, `m_bytes ==` that file's
+   size only — a marked directory adds no bytes.
+3. `pane.filter = "*.txt"` + `rebuild_view` @397: the totals follow the filtered rows, and the
+   marked subset follows them too (a mark on a hidden row is not counted).
+4. An empty directory and a directory holding only `..`: `(empty)` inputs, all totals zero.
+5. Hidden entries: with `fs_set_show_hidden(false)` they are not in `entries` at all, so they
+   are not in the totals; with it on they are. Asserted both ways, because this is where a
+   "total" quietly disagrees with `du`.
+6. Branch view (`Ctrl+B`) on `root/src`: the totals are the subtree's, and differ from the
+   same folder in `LIST_NORMAL`.
+7. An archive pane (the `pkg.zip` the suite already builds): member totals, and the packed
+   wording.
+8. A remote pane with no libcurl: the guard path — the line still draws, from the rows the
+   listing produced.
+
+`test_pane_status_row(&app, root)` — headless ImGui, the `test_menu_click` @3067 harness:
+
+1. `ImGui::FindWindowByName("left_pane")->Size.y` is `info_h` shorter than the budget the
+   layout computes for it, i.e. the row was actually paid for and not overlaid.
+2. `pane.page_size` drops by exactly one row against the same folder measured before.
+3. With a directory name long enough to overflow a 300 px pane, `CalcTextSize(line).x <=
+   width`: the compact fallback runs instead of the line running off the edge.
+4. The `test_ui_id_uniqueness` @1464 mouse sweep still reports zero conflicting item IDs with
+   the new row in both panes.
+5. Both panes show their own numbers, not the active pane's — the case a single shared bar
+   would have got wrong for free.
+
+Manual checklist additions:
+1. `+`/`-`/`*`/`/` and `Ctrl+M` change the marked half of the line immediately, in both panes.
+2. `Ctrl+S` filter narrows the numbers to the rows on screen; clearing it restores them.
+3. `Tab`/`Ctrl+Tab`/`Alt+Left` into and out of a directory re-reads the line for the new folder.
+4. `PgDn` pages one row shorter than before, and the line is still visible at the bottom.
+5. A `.zip` pane says `packed`; a site pane does not.
+6. A 400 px tall window keeps both lines and loses list rows instead of drawing a broken pane.
+
+### 9.6 Deliberately not in this phase
+
+- **Free space per pane** (`statvfs`), which is the other half of TC's panel status. It is a
+  syscall per pane per frame and a second feature with its own questions (which mount, what a
+  site or an archive has instead).
+- **Recursive totals in the line.** `dir_size` @679 is already the cache for it and is filled
+  lazily for exactly this reason; putting a tree walk behind a number that is on screen every
+  frame is the same mistake `fill_dir_sizes` @6588 bounds to 200 per press.
+- **A count of executables, or sizes by type.** TC does not show it and the line has no room
+  for it.
+- **Moving the existing `Marked: N  Clipboard: N` bottom bar.** It answers a different question
+  (what the clipboard holds, which is cross-pane) and the two lines do not duplicate each other
+  once the pane line carries the marked subset.
+
+### 9.7 Built, verified, and where the plan was wrong
+
+**Built.** `struct PaneTotals` and `pane_totals()` in the selection-helpers block next to
+`marked_count`; `human_size_trim()` beside `human_size`; `pane_status_parts()`,
+`pane_status_text()` and `render_pane_status()` after `render_filter_row`; `info_h` in the
+vertical budget with the `ImMax` clamp; one call per table column, after the list-or-quick-view
+branch on each side.
+
+**Three places the plan was changed while building it, each for a reason.**
+
+- The line is assembled from three parts rather than written as two whole formats, because a
+  category only splits into `m/t` when it has something to split. With a mark on a file and none
+  on a directory, `1/2 files  0 dirs  6/12` is the whole truth and `0/0 dirs` is noise that makes
+  the line harder to scan.
+- `human_size` pads to four columns so the size column right-aligns. In a sentence that padding
+  reads as a hole in the middle of it — `3 files  1 dirs    18` is the same fact written worse —
+  so the row goes through `human_size_trim`, which is `human_size` with the leading spaces moved
+  out. The size column keeps its padding.
+- `render_pane_status` takes no `AppPanes*`. The row needs the pane and nothing else, and an
+  unused parameter is a promise that the row will grow a dependency it does not have.
+
+**The layout assertion the plan asked for is not measurable, and what replaced it.** The plan
+asked for `FindWindowByName("left_pane")->Size.y` compared against the budget. Neither half of
+that works. `BeginChildEx` names a child `Midnight Commander/left_pane_<ID>`, not `left_pane`, so
+the lookup finds nothing; and a child window's `Pos` is not a usable measure of where it draws in
+this layout — the left pane's child reports `Pos.y = -250` and the right one `366` for the same
+table row, and it reports exactly the same pair with the `info_h` reservation removed. That is a
+pre-existing property of a table whose cells hold child windows, not something this change
+introduced, and an assertion built on it would have passed or failed for reasons nothing to do
+with the feature. `Size.y` is exact — 567 with the row reserved, 590 without — so the test runs
+the budget chain backwards out of the window the pane was actually given and requires the result
+to land just under the menu bar. Removing `info_h` makes it fail in both panes, which is the
+property an assertion about a reserved row has to have.
+
+**Verified.** `test-panes`: 1773 checks, 0 failures, 43 of them new. `ctest`: 4/4. `mc-clone`
+built and `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone` stays up. The new checks cover:
+counts and bytes over a folder of known sizes; `..` excluded from both counts and the total; a
+marked directory adding a count and no bytes; the filter narrowing the totals, and a mark on a
+hidden row not counted; `(empty)` against `(no rows match)`; hidden entries counted exactly when
+they are listed; branch view describing the subtree and the plain list describing the folder; an
+archive's members with `packed`; each pane reporting its own folder; the width fallback firing and
+keeping the marked subset; `page_size` matching the window the pane was given; and the budget
+chain in both panes.
+
+**Not done from the plan, and named.** The remote-pane case: `test-panes` has no libcurl
+guarantee and the FTP fixture belongs to `test-remote`, so the remote row is covered only in the
+sense that it is the same code over rows a listing produced — the sizes a server reports for a
+directory never reach the total because directories contribute nothing, which is the reason the
+case needed no special handling. The ID sweep here is a coarse pass over the bottom 90 px of the
+window rather than the full-window sweep `test_ui_id_uniqueness` already runs, which covers the
+same strip.

@@ -3218,6 +3218,229 @@ static void test_f10_menu_toggle(AppPanes* app) {
     ImGui::DestroyContext(ctx);
 }
 
+// The status row under each pane. Both halves are asserted on directly: the totals
+// are what the row claims, and the line is what the user reads. A width of 0 means
+// "no width constraint", which keeps this half free of an ImGui context because
+// CalcTextSize needs one.
+static void test_pane_totals(AppPanes* app, const std::string& root) {
+    std::string d = root + "/panel";
+    sh("mkdir -p '" + d + "/logs/archive'");
+    touch_file(d, "a.txt");                       // "hello\n" = 6 bytes
+    touch_file(d, "b.txt");
+    {
+        FILE* f = fopen((d + "/big.bin").c_str(), "wb");
+        if (f) { for (int i = 0; i < 1500; i++) fputc('x', f); fclose(f); }
+    }
+    touch_file(d, ".secret");
+
+    Pane& p = app->left;
+    app->left_focus = true;
+    fs_set_show_hidden(false);
+    refresh_pane(&p, d.c_str());
+    CHECK(p.entry_count == 5);                    // ..  a.txt  b.txt  big.bin  logs
+
+    char line[160];
+    PaneTotals t = pane_totals(p);
+    CHECK(t.files == 3);
+    CHECK(t.dirs == 1);
+    CHECK(t.bytes == 1512);
+    CHECK(t.m_files == 0 && t.m_dirs == 0 && t.m_bytes == 0);
+    // ".." is a way out of the folder, not a thing in it: every row but that one
+    // is counted, and it adds nothing to the bytes.
+    CHECK(t.files + t.dirs == p.entry_count - 1);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    CHECK(strcmp(line, "3 files  1 dirs  1.5K") == 0);
+
+    // Marked: counts and size both become marked/total, and a marked directory
+    // adds its count and no bytes - its own st_size is an inode, not its content.
+    toggle_mark(p, idx_of(p, "a.txt"));
+    toggle_mark(p, idx_of(p, "logs"));
+    t = pane_totals(p);
+    CHECK(t.m_files == 1 && t.m_dirs == 1);
+    CHECK(t.m_bytes == 6);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    CHECK(strcmp(line, "1/3 files  1/1 dirs  6/1.5K") == 0);
+
+    // The filter narrows the row to the rows on screen, marks included: a mark on
+    // a hidden row is not counted, because the row is not offering it.
+    snprintf(p.filter, sizeof(p.filter), "txt");
+    rebuild_view(p);
+    t = pane_totals(p);
+    CHECK(t.files == 2 && t.dirs == 0 && t.bytes == 12);
+    CHECK(t.m_files == 1 && t.m_dirs == 0);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    // A category only splits when it has something to split: "0 dirs" is the
+    // whole truth about directories here, and "0/0 dirs" would be noise.
+    CHECK(strcmp(line, "1/2 files  0 dirs  6/12") == 0);
+
+    // A filter that matches nothing says so, rather than writing "0 files 0 dirs"
+    // for a folder that has three of them.
+    snprintf(p.filter, sizeof(p.filter), "zzz");
+    rebuild_view(p);
+    t = pane_totals(p);
+    CHECK(t.files == 0 && t.dirs == 0);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    CHECK(strcmp(line, "(no rows match)") == 0);
+    p.filter[0] = '\0';
+    rebuild_view(p);
+
+    refresh_pane(&p, (root + "/emptydir").c_str());
+    sh("mkdir -p '" + root + "/emptydir'");
+    refresh_pane(&p, (root + "/emptydir").c_str());
+    t = pane_totals(p);
+    CHECK(t.files == 0 && t.dirs == 0 && t.bytes == 0);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    CHECK(strcmp(line, "(empty)") == 0);
+
+    // Hidden entries are counted exactly when they are listed, which is where a
+    // "total" would otherwise quietly disagree with du.
+    refresh_pane(&p, d.c_str());
+    CHECK(pane_totals(p).files == 3);
+    fs_set_show_hidden(true);
+    refresh_pane(&p, d.c_str());
+    t = pane_totals(p);
+    CHECK(t.files == 4 && t.bytes == 1518);
+    fs_set_show_hidden(false);
+    refresh_pane(&p, d.c_str());
+    CHECK(pane_totals(p).files == 3);
+
+    // Branch view lists a subtree, so the row describes the subtree. Different on
+    // purpose, and different from the same folder in the plain list.
+    branch_toggle(app, p, false);
+    CHECK(p.list_mode == LIST_BRANCH);
+    t = pane_totals(p);
+    CHECK(t.files == 3 && t.dirs == 2 && t.bytes == 1512);
+    branch_toggle(app, p, false);
+    CHECK(p.list_mode == LIST_NORMAL);
+    CHECK(pane_totals(p).dirs == 1);
+
+    // Inside an archive the bytes are the members' sizes as the archive lists
+    // them, and the row has to say so.
+    refresh_pane(&p, root.c_str());
+    int zi = idx_of(p, "pkg.zip");
+    CHECK(zi >= 0);
+    p.selected = zi;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.list_mode == LIST_ARCHIVE);
+    t = pane_totals(p);
+    CHECK(t.files == 2 && t.dirs == 1 && t.bytes == 12);
+    pane_status_text(p, t, 0.0f, line, sizeof(line));
+    CHECK(strcmp(line, "2 files  1 dirs  12 packed") == 0);
+    p.selected = idx_of(p, "..");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(p.list_mode == LIST_NORMAL);
+}
+
+// The row is one text row of pane height, and that is the whole cost of the
+// feature. Measured from ImGui rather than asserted from the arithmetic: the list
+// has to end high enough for a text row to sit between it and the command bar,
+// which is the room being paid for and not overlaid.
+static void test_pane_status_row(AppPanes* app, const std::string& root) {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1200, 700);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+
+    fs_set_show_hidden(false);
+    refresh_pane(&app->left, root.c_str());
+    refresh_pane(&app->right, (root + "/panel").c_str());
+    app->left_focus = true;
+    app->quick_view_pane = false;
+    app->confirm = CONF_NONE;
+    app->op = OP_NONE;
+    for (Pane* q : { &app->left, &app->right }) {
+        q->filter[0] = '\0';
+        q->filter_active = false;
+        q->filter_exec_only = false;
+        q->marked.assign(q->entry_count, false);
+    }
+    toggle_mark(app->left, idx_of(app->left, "alpha.txt"));
+
+    auto frame = [app]() {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    };
+    for (int i = 0; i < 6; i++) frame();
+
+    ImGuiWindow* main = ImGui::FindWindowByName("Midnight Commander");
+    CHECK(main != nullptr);
+    if (!main) { ImGui::DestroyContext(ctx); return; }
+
+    const float row    = ImGui::GetTextLineHeightWithSpacing();
+    const float frh     = ImGui::GetFrameHeightWithSpacing();
+    const float bar_h  = frh + 8.0f;                    // separator + command bar
+    const float xfer_h = bg_strip_height(app, frh);     // no transfers in this test
+    ImGuiWindow* lw = nullptr;
+    ImGuiWindow* rw = nullptr;
+    for (ImGuiWindow* w : ctx->Windows) {
+        if (!(w->Flags & ImGuiWindowFlags_ChildWindow)) continue;
+        if (strstr(w->Name, "left_pane") != nullptr) lw = w;
+        if (strstr(w->Name, "right_pane") != nullptr) rw = w;
+    }
+    CHECK(lw != nullptr && rw != nullptr);
+    if (lw && rw) {
+        // The budget chain, run backwards out of the window the pane was actually
+        // given: main height, minus the list, the command bar, the transfer strip,
+        // the tab strip, the path bar, the separator and the status row, is where
+        // the pane table starts, and that has to be just under the menu bar. If the
+        // status row were not paid for the list would be a frame taller and this
+        // would land a frame too high - which is the whole assertion.
+        for (ImGuiWindow* w : { lw, rw }) {
+            const float chain = main->Size.y - w->Size.y - bar_h - xfer_h
+                              - frh - frh - 6.0f - frh;   // tabs, path, separator, status
+            CHECK(chain >= main->MenuBarHeight &&
+                  chain <= main->MenuBarHeight + 2.0f * ImGui::GetStyle().ItemSpacing.y + 1.0f);
+        }
+        // page_size is measured from the child window, so PgUp/PgDn page shorter
+        // by the same row. Asserted against the window the pane was actually given.
+        CHECK(app->left.page_size  == (int)(lw->Size.y / row));
+        CHECK(app->right.page_size == (int)(rw->Size.y / row));
+    }
+
+    // Each pane reports its own folder: the left one is marked, the right one is
+    // not, and a shared bar would have got this wrong for free.
+    PaneTotals lt = pane_totals(app->left), rt = pane_totals(app->right);
+    CHECK(lt.files + lt.dirs == app->left.entry_count - 1);
+    CHECK(rt.files + rt.dirs == app->right.entry_count - 1);
+    CHECK(lt.m_files == 1 && rt.m_files == 0);
+    char l1[160], r1[160];
+    pane_status_text(app->left,  lt, 0.0f, l1, sizeof(l1));
+    pane_status_text(app->right, rt, 0.0f, r1, sizeof(r1));
+    CHECK(strcmp(l1, r1) != 0);
+
+    // Too wide for the pane: this ImGui does not wrap Text at the window edge, so
+    // the line has to shorten itself, and it drops the words before it drops the
+    // marked subset.
+    char full[160], tight[160];
+    pane_status_text(app->left, lt, 0.0f,  full,  sizeof(full));
+    pane_status_text(app->left, lt, 150.0f, tight, sizeof(tight));
+    CHECK(strcmp(full, tight) != 0);
+    CHECK(ImGui::CalcTextSize(tight).x < ImGui::CalcTextSize(full).x);
+    CHECK(strchr(tight, '/') != nullptr);
+
+    // A coarse sweep over the strip the new row lives in: nothing in it may share
+    // an item ID with its mirror image in the other pane.
+    int conflicts = 0;
+    for (int y = (int)main->Pos.y + (int)main->Size.y - 90; y < (int)(main->Pos.y + main->Size.y); y += 8) {
+        for (int x = 8; x < 1200 && conflicts < 3; x += 24) {
+            io.MousePos = ImVec2((float)x, (float)y);
+            for (int f = 0; f < 2; f++) {
+                ImGui::NewFrame();
+                app_panes_render(app);
+                ImGui::Render();
+                if (ctx->DebugDrawIdConflictsId != 0) conflicts++;
+            }
+        }
+    }
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+    CHECK(conflicts == 0);
+
+    ImGui::DestroyContext(ctx);
+}
 
 // Ctrl+S opens the quick filter and puts the caret in it, so the keys typed
 // straight after belong to the filter and not to the pane behind it.
@@ -3450,6 +3673,8 @@ int main() {
     test_filter_focus_preview(&app, root);
     test_menu_click(&app);
     test_f10_menu_toggle(&app);
+    test_pane_totals(&app, root);
+    test_pane_status_row(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

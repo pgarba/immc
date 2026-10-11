@@ -137,6 +137,16 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | `Alt+Shift+Enter` | fill in the size of every directory |
 | `Alt+Enter` | properties |
 
+Each pane ends with a status row: what the files on screen add up to, how many
+files there are, and how many directories. With marks it becomes
+`2/9 files  1/2 dirs  8.1/64.4M` — marked first — so the row answers *what am I
+about to copy* without asking `Ctrl+L` first. The bytes are the files in that
+folder: a directory contributes its count and no size, which is what `Ctrl+L` and
+`Alt+Shift+Enter` exist for. The counts follow the quick filter, so they describe
+the rows you can see, and in branch view they describe the subtree branch view
+listed. Inside an archive the sizes are the members' sizes as the archive lists
+them, and the row says `packed`.
+
 ### Tabs
 
 | | |

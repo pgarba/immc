@@ -195,6 +195,41 @@ static int marked_count(const Pane& p) {
     return n;
 }
 
+// What the rows on screen add up to, for the status row under each pane.
+//
+// It reads `view` and not `entries`, because a quick filter is the one thing
+// about a pane the user changed on purpose: a total that ignored it would be a
+// second, contradicting source of truth about a folder the user can already see.
+//
+// A directory contributes its count and nothing to the bytes. Its own st_size is
+// an inode, not its content, and the recursive total is a tree walk a frame has
+// no business starting - that is what Ctrl+L and Alt+Shift+Enter exist for, and
+// this row is what tells a user they are worth running.
+struct PaneTotals {
+    long long bytes;      // file sizes over the visible rows
+    int files, dirs;
+    long long m_bytes;    // the same over the marked rows
+    int m_files, m_dirs;
+};
+
+static PaneTotals pane_totals(const Pane& p) {
+    PaneTotals t = {0, 0, 0, 0, 0, 0};
+    for (size_t r = 0; r < p.view.size(); r++) {
+        int i = p.view[r];
+        if (i < 0 || i >= p.entry_count) continue;
+        FileEntry* e = p.entries[i];
+        // ".." is a way out of the folder, not a thing in it.
+        if (!e || strcmp(e->name, "..") == 0) continue;
+        bool dir    = is_directory(e->name, e->mode);
+        bool marked = i < (int)p.marked.size() && p.marked[i];
+        if (dir) { t.dirs++; if (marked) t.m_dirs++; continue; }
+        t.files++;
+        t.bytes += e->size;
+        if (marked) { t.m_files++; t.m_bytes += e->size; }
+    }
+    return t;
+}
+
 // ---------------------------------------------------------------------------
 // Quick filter (TC Schnellfilter)
 // ---------------------------------------------------------------------------
@@ -1027,6 +1062,16 @@ static void human_size(off_t s, char* out, size_t n) {
     else if (s >= 1000000)  snprintf(out, n, "%4.1fM", (double)s / 1e6);
     else if (s >= 1000)     snprintf(out, n, "%4.1fK", (double)s / 1e3);
     else                    snprintf(out, n, "%4lld", (long long)s);
+}
+
+// The same numbers without the four-column padding, which is there to right-align
+// the size column. In a sentence that padding reads as a hole in the middle of it:
+// "3 files  1 dirs    18" is the same fact written worse.
+static void human_size_trim(off_t s, char* out, size_t n) {
+    human_size(s, out, n);
+    char* p = out;
+    while (*p == ' ') p++;
+    if (p != out) memmove(out, p, strlen(p) + 1);
 }
 
 static void fmt_date(time_t t, char* out, size_t n) {
@@ -5060,6 +5105,88 @@ static void render_filter_row(AppPanes* app, Pane& pane, const char* id) {
     ImGui::PopStyleColor(2);
 }
 
+// The three parts of the line. A category shows its marked subset only when it
+// has something to split: "1/2 files  0 dirs" already says everything worth
+// saying, and "0/0 dirs" is noise that makes the line harder to scan.
+static void pane_status_parts(const PaneTotals& t, const char* total_sz, const char* marked_sz,
+                              bool compact, char* out, size_t n) {
+    const bool marks = t.m_files || t.m_dirs;
+    const char* fs = compact ? "f" : " files";
+    const char* ds = compact ? "d" : " dirs";
+    char files_part[48], dirs_part[48], size_part[64];
+
+    if (marks && t.files > 0)
+        snprintf(files_part, sizeof(files_part), "%d/%d%s", t.m_files, t.files, fs);
+    else
+        snprintf(files_part, sizeof(files_part), "%d%s", t.files, fs);
+
+    if (marks && t.dirs > 0)
+        snprintf(dirs_part, sizeof(dirs_part), "%d/%d%s", t.m_dirs, t.dirs, ds);
+    else
+        snprintf(dirs_part, sizeof(dirs_part), "%d%s", t.dirs, ds);
+
+    if (marks && t.bytes > 0)
+        snprintf(size_part, sizeof(size_part), "%s/%s", marked_sz, total_sz);
+    else
+        snprintf(size_part, sizeof(size_part), "%s", total_sz);
+
+    snprintf(out, n, "%s  %s  %s", files_part, dirs_part, size_part);
+}
+
+// The line itself, kept apart from drawing it, because the line *is* the feature:
+// what a user reads is a string, and a string can be asserted on.
+//
+// With marks present the counts and the size both become marked/total, so the row
+// answers "what am I about to copy" without asking Ctrl+L first. Marked first,
+// always: it is the half that changes while the user is marking, and a number that
+// moves on the left of a fixed one is read without hunting for it.
+static void pane_status_text(const Pane& pane, const PaneTotals& t, float width,
+                             char* out, size_t n) {
+    if (t.files == 0 && t.dirs == 0) {
+        // "0 files 0 dirs" reads like the folder is empty when it is the filter
+        // that is empty, and those are different things to find out about.
+        const bool filtered = pane.filter[0] != '\0' || pane.filter_active || pane.filter_exec_only;
+        snprintf(out, n, "%s", filtered ? "(no rows match)" : "(empty)");
+        return;
+    }
+
+    char total_sz[32], marked_sz[32];
+    human_size_trim((off_t)t.bytes, total_sz, sizeof(total_sz));
+    human_size_trim((off_t)t.m_bytes, marked_sz, sizeof(marked_sz));
+    pane_status_parts(t, total_sz, marked_sz, false, out, n);
+
+    // Inside an archive the bytes are the members' sizes as the archive lists
+    // them, which is not the size the archive file has on disk. Saying so is the
+    // difference between a total and a quietly wrong one.
+    if (in_archive(pane) && t.bytes > 0 && strlen(out) + 8 < n)
+        strncat(out, " packed", n - strlen(out) - 1);
+
+    // This ImGui does not wrap Text/TextDisabled at the window edge (@2090), so a
+    // line too wide for the pane has to be shortened here rather than clipped by
+    // it. The compact forms drop the words before they drop the marked subset,
+    // because the subset is the half the user is watching.
+    if (width > 0.0f && ImGui::CalcTextSize(out).x > width) {
+        pane_status_parts(t, total_sz, marked_sz, true, out, n);
+        if (ImGui::CalcTextSize(out).x > width) {
+            if (t.m_files || t.m_dirs)
+                snprintf(out, n, "%d/%df %d/%dd", t.m_files, t.files, t.m_dirs, t.dirs);
+            else
+                snprintf(out, n, "%df %dd", t.files, t.dirs);
+        }
+    }
+}
+
+// The status row under a pane: what the files on screen add up to, how many files
+// there are, and how many directories.
+static void render_pane_status(const Pane& pane, bool focused, float width) {
+    char line[160];
+    pane_status_text(pane, pane_totals(pane), width, line, sizeof(line));
+    // The focused pane is the one being read, so it gets the normal text colour
+    // and the other one goes dim, like the path bars above them.
+    if (focused) ImGui::TextUnformatted(line);
+    else ImGui::TextDisabled("%s", line);
+}
+
 // "needle anywhere in hay", case-insensitively. The font filter is a substring
 // box, not a glob: someone looking for DejaVu types "dejavu" and means that.
 static bool icontains(const char* hay, const char* needle) {
@@ -5899,13 +6026,17 @@ void app_panes_render(AppPanes* app) {
     const float title_h  = frame;         // pane path bar
     const float sep_h    = 6.0f;          // separator under the path bar
     const float filt_h   = frame + 2.0f;  // quick filter row, when shown
+    const float info_h   = frame;         // status row under each pane's list
     const float win_h    = ImGui::GetWindowHeight();
     const float table_h  = win_h - ImGui::GetCursorPosY() - bar_h - xfer_h;
     const float base_h   = table_h - tabbar_h - title_h - sep_h;
     const bool  l_filter = left.filter_active || left.filter[0] != '\0' || left.filter_exec_only;
     const bool  r_filter = right.filter_active || right.filter[0] != '\0' || right.filter_exec_only;
-    const float left_child_h  = base_h - (l_filter ? filt_h : 0.0f);
-    const float right_child_h = base_h - (r_filter ? filt_h : 0.0f);
+    // Clamped, because this budget already spends five rows and the status row
+    // is a sixth: a short window should lose list rows and keep the line, not
+    // hand BeginChild a negative height.
+    const float left_child_h  = ImMax(2.0f * frame, base_h - (l_filter ? filt_h : 0.0f) - info_h);
+    const float right_child_h = ImMax(2.0f * frame, base_h - (r_filter ? filt_h : 0.0f) - info_h);
     ImGui::BeginTable("panes_table", 2,
                       ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInner,
                       ImVec2(0, table_h));
@@ -5944,6 +6075,12 @@ void app_panes_render(AppPanes* app) {
     else
         render_file_list(app, left, left_focus, left_w, left_child_h, "left_pane");
 
+    // Drawn in the table cell rather than inside the list: the quick view panel
+    // replaces the list, and the tree modes render their own rows, so this is
+    // the one place all three paths have already been taken. It also keeps the
+    // pane and context menus anchored to the list instead of to this row.
+    render_pane_status(left, left_focus, left_w);
+
     ImGui::TableNextColumn();
 
     // Right pane
@@ -5978,6 +6115,8 @@ void app_panes_render(AppPanes* app) {
         render_quick_view_panel(app, right_w, right_child_h, "right_qv");
     else
         render_file_list(app, right, !left_focus, right_w, right_child_h, "right_pane");
+
+    render_pane_status(right, !left_focus, right_w);
 
     ImGui::EndTable();
 
