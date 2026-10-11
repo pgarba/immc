@@ -5,6 +5,11 @@
 # 127.0.0.1 with python3. zip and p7zip-full are installed because the archive
 # suite shells out to the same tools the app does, and skips the formats a
 # machine does not have.
+#
+# SDL3 is built from the release tarball rather than installed from apt:
+# ubuntu-latest is noble, and noble carries no libsdl3-dev at all. The version
+# is pinned to the one the app is developed against, so CI builds the same SDL
+# the code was written for instead of whatever a distro happens to ship.
 name: build and test
 
 # Nothing here writes to the repository, so the token the runner gets is
@@ -15,6 +20,13 @@ permissions:
 on:
   push:
   pull_request:
+
+env:
+  SDL3_VERSION: 3.4.18
+  # A fixed absolute path, because the CMake config installed into the prefix
+  # bakes its own location in and the cache has to restore it there. Kept out
+  # of the workspace so it is never mistaken for build output.
+  SDL3_PREFIX: /tmp/sdl3
 
 jobs:
   linux:
@@ -28,7 +40,7 @@ jobs:
           - name: without libcurl
             curl_args: "-DCMAKE_DISABLE_FIND_PACKAGE_CURL=ON"
     steps:
-      # Pinned to a commit rather than a moving tag: a workflow that can install
+      # Pinned to a commit rather than a moving tag: a workflow that installs
       # packages on a runner should not fetch its steps by mutable reference.
       # 3d3c42e5 is actions/checkout v7.0.1.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,8 +51,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake g++ libgl1-mesa-dev libsdl3-dev libcurl4-openssl-dev \
-            libfreetype-dev zip unzip p7zip-full python3
+            cmake g++ curl libgl1-mesa-dev libcurl4-openssl-dev \
+            libfreetype-dev libx11-dev libxext-dev libxkbcommon-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
+            libibus-1-dev zip unzip p7zip-full python3
+
+      # The second matrix leg reuses the first leg's SDL3.
+      - name: SDL3 cache
+        id: sdl3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SDL3_PREFIX }}
+          key: sdl3-${{ runner.os }}-${{ env.SDL3_VERSION }}
+
+      - name: build SDL3
+        if: steps.sdl3.outputs.cache-hit != 'true'
+        run: |
+          base=https://github.com/libsdl-org/SDL/releases/download
+          curl -fsSLO "$base/release-$SDL3_VERSION/SDL3-$SDL3_VERSION.tar.gz"
+          tar xzf "SDL3-$SDL3_VERSION.tar.gz"
+          cmake -S "SDL3-$SDL3_VERSION" -B sdl3-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$SDL3_PREFIX" \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdl3-build -j4
+          cmake --install sdl3-build
 
       # Dear ImGui is not vendored; this fetches the pinned commit
       # CMakeLists.txt looks for, the same script a fresh clone runs.
@@ -50,7 +85,7 @@ jobs:
       - name: configure (${{ matrix.name }})
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          ${{ matrix.curl_args }}
+          -DCMAKE_PREFIX_PATH="$SDL3_PREFIX" ${{ matrix.curl_args }}
 
       - name: build
         run: cmake --build build -j4

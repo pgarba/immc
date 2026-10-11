@@ -23,7 +23,23 @@ OpenGL 3 implementation. Two optional dependencies change what the app can do:
 
 On a Debian-ish box:
 
-    apt install cmake g++ libsdl3-dev libcurl4-openssl-dev libfreetype-dev
+    apt install cmake g++ libcurl4-openssl-dev libfreetype-dev
+
+SDL3 is the one dependency that may not be packaged. Ubuntu 24.04, which is
+what GitHub's `ubuntu-latest` runner is, has no `libsdl3-dev` at all. Check
+with `apt-cache policy libsdl3-dev`, and if it is missing, build it from the
+release tarball the way CI does:
+
+    curl -fsSLO https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+    tar xzf SDL3-3.4.18.tar.gz
+    cmake -S SDL3-3.4.18 -B sdl3 -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF
+    cmake --build sdl3 -j4
+    sudo cmake --install sdl3
+
+SDL3 will not configure without X11 or Wayland development headers, so give it
+those first (`libx11-dev libxext-dev libxkbcommon-dev`, plus `libasound2-dev`
+and `libpulse-dev` for audio). Installing it elsewhere works too; point CMake
+at the prefix with `-DCMAKE_PREFIX_PATH=/path/to/prefix`.
 
 Dear ImGui is not vendored in this repository. Fetch the pinned copy first:
 
