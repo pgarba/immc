@@ -613,6 +613,12 @@ void refresh_pane(Pane* pane, const char* path) {
     char previous[4096];
     snprintf(previous, sizeof(previous), "%s", pane->current_dir);
     free_entries(pane->entries, pane->entry_count);
+    // Nothing is a listing until one of the three branches below puts one there.
+    // A pane that walks onto a site with no saved login gets no listing at all,
+    // and rows that have been freed are only safe to leave behind with a count of
+    // zero to reach them.
+    pane->entries = nullptr;
+    pane->entry_count = 0;
     strncpy(pane->current_dir, path, sizeof(pane->current_dir) - 1);
     pane->current_dir[sizeof(pane->current_dir) - 1] = '\0';
     pane->selected = 0;

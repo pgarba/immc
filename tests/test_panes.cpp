@@ -2519,6 +2519,27 @@ static void test_bg_transfers(AppPanes* app) {
     CHECK(app->transfers.empty());
 }
 
+// A pane that walks onto a site it has no login for gets no listing. The rows it
+// freed on the way in are gone, so the count that used to reach them has to go
+// with them: a count over freed rows is a crash waiting for the next frame that
+// draws the pane, and the way to reach it is a saved tab for a site the user has
+// since deleted from the site list.
+static void test_failed_list_has_no_rows(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    const std::string d = root + "/no-listing";
+    sh("rm -rf '" + d + "' && mkdir -p '" + d + "' && touch '" + d + "/one.txt'");
+    refresh_pane(&p, d.c_str());
+    CHECK(p.entry_count > 0);
+    refresh_pane(&p, "ftp://nobody@nowhere.invalid/pub");
+    CHECK(in_remote(p));
+    CHECK(p.entries == nullptr);
+    CHECK(p.entry_count == 0);
+    // The pane is still a pane: walking back to a real directory lists it again.
+    refresh_pane(&p, d.c_str());
+    CHECK(p.entry_count > 0);
+    sh("rm -rf '" + d + "'");
+}
+
 // The dialog has to fit the window it is opened in, and a font path has to stay
 // inside it: the list is a column of long absolute paths, which is exactly what
 // pushes a frame wider than the screen.
@@ -2913,6 +2934,7 @@ int main() {
     test_options_keys(&app);
     test_remote_keys(&app);
     test_bg_transfers(&app);
+    test_failed_list_has_no_rows(&app, root);
     test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);
