@@ -134,6 +134,33 @@ std::string net_url_unescape(const std::string& s) {
     return out;
 }
 
+// Percent-encode the bytes a URL path may not carry. A name on a server is
+// bytes, and a space, a '#' or a '%' in one is ordinary. In a URL they are not:
+// a space makes curl answer "URL rejected: Malformed input to a URL function"
+// before it has opened a socket, and a '#' ends the path where the name has not.
+// The pane that walked into "IDA Pro 9.6.261001" was left holding an empty
+// listing and a message about a filter it had never set. curl decodes what it
+// reads back, so the server is given the bytes it was asked for. Only the
+// unreserved set of RFC 3986 stays plain, which keeps the encoding the one thing
+// doing the work; '/' separates components when the string is a path.
+std::string net_url_escape(const std::string& s, bool keep_slash) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') ||
+                    c == '-' || c == '.' || c == '_' || c == '~';
+        if (!keep && keep_slash && c == '/') keep = true;
+        if (keep) { out += (char)c; continue; }
+        out += '%';
+        out += kHex[(c >> 4) & 0xF];
+        out += kHex[c & 0xF];
+    }
+    return out;
+}
+
 // The scheme prefix of a path, if it has one.
 static const struct { const char* scheme; NetProto proto; } kSchemes[] = {
     { "ftp://",  NET_FTP  },
@@ -502,6 +529,22 @@ mode_t net_mode_from_rwx(const char* rwx) {
     return m;
 }
 
+// A fact is "token=value". An entry name is bytes and can carry '=' itself -
+// "a=b" is an ordinary file name - so a segment counts as a fact only when what
+// comes before its '=' reads like a fact name: letters, digits, and the dots and
+// underscores the registry uses. Without that, "type=file;size=4;modify=...; a=b"
+// took its own name for a fact and the row disappeared from the pane.
+static bool mlsd_fact_key(const std::string& seg, size_t eq) {
+    if (!eq) return false;
+    for (size_t i = 0; i < eq; i++) {
+        char c = seg[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
 bool net_parse_mlsd(const char* line, FileEntry* out) {
     // "type=file;size=1234;modify=20230131120000;name with spaces"
     // The facts are the segments that contain a '='. The first one that does not
@@ -521,7 +564,7 @@ bool net_parse_mlsd(const char* line, FileEntry* out) {
         const char* semi = strchr(p, ';');
         std::string seg(semi ? std::string(p, (size_t)(semi - p)) : std::string(p));
         size_t eq = seg.find('=');
-        if (eq == std::string::npos) {   // not a fact: the name starts here
+        if (eq == std::string::npos || !mlsd_fact_key(seg, eq)) {   // not a fact: the name starts here
             // RFC 3659 separates the facts from the entry with one space, and real
             // servers send it: "type=file;size=12;modify=...; report.pdf". Taking
             // the rest of the line whole gave every name on a real server a leading
@@ -860,7 +903,11 @@ static std::string curl_url(const NetSite& site, const std::string& rpath) {
     std::string root = net_site_root(site);
     if (wanted != shown && root.compare(0, shown.size(), shown) == 0)
         root.replace(0, shown.size(), wanted);
-    return net_virtual_path(root, rpath);
+    // The path is escaped here and nowhere else. The pane's virtual path keeps
+    // the name as the server spells it, because that is what the path bar shows,
+    // what a tab and a history entry carry, and what a transfer names back; only
+    // the URL has to speak URL.
+    return net_virtual_path(root, net_url_escape(rpath, true));
 }
 
 // The URL of a directory on the server, and the reason it has to end in '/'.

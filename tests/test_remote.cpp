@@ -242,6 +242,33 @@ static void test_unescape(void) {
 // listing parsers
 // ---------------------------------------------------------------------------
 
+static void test_escape(void) {
+    CHECK(net_url_escape("plain", true) == "plain");
+    // The one that made a whole directory unreachable: curl refuses a URL with a
+    // space in it before it has opened a socket, so the pane was left showing an
+    // empty listing for a directory that had contents.
+    CHECK(net_url_escape("IDA Pro 9.6.261001", true) == "IDA%20Pro%209.6.261001");
+    // '/' separates the components of a path and stays; inside one name it is a
+    // byte like any other.
+    CHECK(net_url_escape("/sub/a file.txt", true) == "/sub/a%20file.txt");
+    CHECK(net_url_escape("a/b", false) == "a%2Fb");
+    // The characters a URL would read as something other than a name: a fragment,
+    // a query, and the escape character itself.
+    CHECK(net_url_escape("a#b", true) == "a%23b");
+    CHECK(net_url_escape("q?x", true) == "q%3Fx");
+    CHECK(net_url_escape("100%done", true) == "100%25done");
+    // RFC 3986's unreserved set stays plain, so an ordinary name is untouched.
+    CHECK(net_url_escape("a-b.c_d~e", true) == "a-b.c_d~e");
+    // A name is bytes, and bytes need encoding.
+    CHECK(net_url_escape("\xc3\xbcnicode", true) == "%C3%BCnicode");
+    // The round trip is what the transport depends on: the pane holds the name as
+    // the server spells it, curl decodes the URL, and the server is asked for the
+    // same bytes the listing gave.
+    CHECK(net_url_unescape(net_url_escape("IDA Pro 9.6.261001", true)) == "IDA Pro 9.6.261001");
+    CHECK(net_url_unescape(net_url_escape("100%done", true)) == "100%done");
+    CHECK(net_url_unescape(net_url_escape("a#b", true)) == "a#b");
+}
+
 static void test_mlsd_parser(void) {
     FileEntry e{};
 
@@ -287,6 +314,15 @@ static void test_mlsd_parser(void) {
     CHECK(!strcmp(e.name, "leading.txt"));
     CHECK(net_parse_mlsd("type=file;size=1;  two spaces.txt", &e));
     CHECK(!strcmp(e.name, " two spaces.txt"));
+
+    // A name is bytes, and bytes can contain the '=' that separates a fact's key
+    // from its value. Reading every segment with an '=' as a fact swallowed the
+    // name and dropped the row, so the file was simply not on screen.
+    CHECK(net_parse_mlsd("type=file;size=3;modify=20230131120000; a=b", &e));
+    CHECK(!strcmp(e.name, "a=b"));
+    CHECK(e.size == 3);
+    CHECK(net_parse_mlsd("type=file;size=1; type=conf.txt", &e));
+    CHECK(!strcmp(e.name, "type=conf.txt"));
 
     CHECK(!net_parse_mlsd("", &e));
     CHECK(!net_parse_mlsd("just some banner text", &e));
@@ -623,6 +659,98 @@ static void test_ftp_listing(FtpFixture& fx) {
     CHECK(!net_stat(site, "/gone.txt", &e, &err));
 }
 
+// A name the URL cannot carry is ordinary on a server. The path is escaped where
+// the URL is built and nowhere else, so the pane keeps the name as the server
+// spells it - which is what the path bar shows and what a transfer names back -
+// and curl is handed a URL it will accept. Before that, curl answered "URL
+// rejected: Malformed input to a URL function" for a directory named
+// "IDA Pro 9.6.261001", and the pane showed an empty listing under a message
+// about a filter nobody had set.
+static void test_ftp_escaped_names(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    std::string err;
+    std::vector<FileEntry> rows;
+    std::string out = fx.root + "-spaced";
+    sh("mkdir -p " + q(out));
+
+    // The row keeps the space, because everything downstream is built from it.
+    CHECK(net_list(site, "/", &rows, &err));
+    const FileEntry* spaced = find_row(rows, "IDA Pro 9.6.261001");
+    CHECK(spaced != nullptr);
+    if (spaced) CHECK(S_ISDIR(spaced->mode));
+
+    // Walking in is the reported failure.
+    rows.clear(); err.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001", &rows, &err));
+    CHECK(find_row(rows, "inner.txt") != nullptr);
+
+    FileEntry e{};
+    CHECK(net_stat(site, "/IDA Pro 9.6.261001/inner.txt", &e, &err));
+    CHECK(!strcmp(e.name, "inner.txt"));
+
+    std::string down = out + "/got inner.txt";
+    CHECK(net_download(site, "/IDA Pro 9.6.261001/inner.txt", down.c_str(), nullptr, nullptr, &err));
+    CHECK(read_file(down) == "nested\n");
+    // A download that fails leaves nothing behind, and the name it failed on had
+    // a space in it.
+    CHECK(!net_download(site, "/IDA Pro 9.6.261001/gone.txt", (out + "/gone.txt").c_str(),
+                        nullptr, nullptr, &err));
+    CHECK(!exists(out + "/gone.txt"));
+
+    std::string up = out + "/put source.txt";
+    write_file(up, "up\n");
+    CHECK(net_upload(site, "/IDA Pro 9.6.261001/put source.txt", up.c_str(), nullptr, nullptr, &err));
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001", &rows, &err));
+    CHECK(find_row(rows, "put source.txt") != nullptr);
+
+    // A whole tree goes across in one call, and every component of every path
+    // inside it needs the same encoding: the directory the server has to create
+    // carries a space, and so does a file inside it.
+    std::string tree = out + "/my tree";
+    sh("rm -rf " + q(tree) + " && mkdir -p " + q(tree + "/deep dir") +
+       " && printf 'one\\n' > " + q(tree + "/one two.txt") +
+       " && printf 'two\\n' > " + q(tree + "/deep dir/two.txt"));
+    CHECK(net_upload_tree(site, tree.c_str(), "/IDA Pro 9.6.261001/my tree", nullptr, nullptr, &err));
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001/my tree", &rows, &err));
+    CHECK(find_row(rows, "one two.txt") != nullptr);
+    CHECK(find_row(rows, "deep dir") != nullptr);
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001/my tree/deep dir", &rows, &err));
+    CHECK(find_row(rows, "two.txt") != nullptr);
+
+    std::string back = out + "/back";
+    CHECK(net_download_tree(site, "/IDA Pro 9.6.261001/my tree", back.c_str(), nullptr, nullptr, &err));
+    CHECK(read_file(back + "/one two.txt") == "one\n");
+    CHECK(read_file(back + "/deep dir/two.txt") == "two\n");
+
+    // MKD, RNFR/RNTO and DELE carry the name as a command argument rather than in
+    // a URL, and the directory they are sent against is the one with the space in
+    // its path.
+    CHECK(net_mkdir(site, "/IDA Pro 9.6.261001/new sub", &err));
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001", &rows, &err));
+    CHECK(find_row(rows, "new sub") != nullptr);
+    CHECK(net_rename(site, "/IDA Pro 9.6.261001/put source.txt", "renamed one.txt", &err));
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001", &rows, &err));
+    CHECK(find_row(rows, "renamed one.txt") != nullptr);
+    CHECK(net_remove(site, "/IDA Pro 9.6.261001/renamed one.txt", false, &err));
+    rows.clear();
+    CHECK(net_list(site, "/IDA Pro 9.6.261001", &rows, &err));
+    CHECK(find_row(rows, "renamed one.txt") == nullptr);
+
+    // '#' ends a path where the name has not and '%' starts an escape; both are
+    // ordinary characters in a name.
+    rows.clear(); err.clear();
+    CHECK(net_list(site, "/hash#and;percent%", &rows, &err));
+    CHECK(find_row(rows, "p#1.txt") != nullptr);
+    std::string odd = out + "/odd";
+    CHECK(net_download(site, "/hash#and;percent%/p#1.txt", odd.c_str(), nullptr, nullptr, &err));
+    CHECK(read_file(odd) == "odd\n");
+}
+
 static void test_ftp_transfer(FtpFixture& fx) {
     NetSite site = fixture_site(fx);
     std::string err;
@@ -777,6 +905,7 @@ int main(void) {
     test_parse_url();
     test_virtual_paths();
     test_unescape();
+    test_escape();
     test_mlsd_parser();
     test_list_parser();
     test_mode_from_rwx();
@@ -802,8 +931,12 @@ int main(void) {
     }
     std::string root = std::string(base) + "/root";
     sh("mkdir -p " + q(root + "/sub") +
+       " && mkdir -p " + q(root + "/IDA Pro 9.6.261001") +
+       " && mkdir -p " + q(root + "/hash#and;percent%") +
        " && printf 'hello world\\n' > " + q(root + "/hello.txt") +
        " && printf 'nested\\n' > " + q(root + "/sub/a file.txt") +
+       " && printf 'nested\\n' > " + q(root + "/IDA Pro 9.6.261001/inner.txt") +
+       " && printf 'odd\\n' > " + q(root + "/hash#and;percent%/p#1.txt") +
        " && chmod 640 " + q(root + "/hello.txt"));
 
     FtpFixture fx;
@@ -811,6 +944,7 @@ int main(void) {
         printf("the test ftp server did not start: the transport tests are skipped\n");
     } else {
         test_ftp_listing(fx);
+        test_ftp_escaped_names(fx);
         test_ftp_bad_login(fx);
         test_ftp_transfer(fx);
         fx.stop();

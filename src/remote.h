@@ -84,6 +84,14 @@ std::string net_join_remote(const std::string& dir, const std::string& name);
 // Percent-decode the name of a listing row: MLSD and LIST both escape names
 // that would otherwise be ambiguous.
 std::string net_url_unescape(const std::string& s);
+// Percent-encode what a URL cannot carry. A name on a server is bytes, and a
+// space, a '#' or a '%' in one is ordinary; in a URL a space stops curl before
+// it opens a socket and a '#' ends the path early. `keep_slash` says whether '/'
+// separates path components (a whole path) or is a byte to encode (one name).
+// The pane's paths and the URL are different strings on purpose: the path holds
+// the name as the server spells it, which is what the path bar shows and what a
+// transfer names back; only the URL is escaped.
+std::string net_url_escape(const std::string& s, bool keep_slash);
 
 // Saved sites live in their own file, created 0600, because the main config is
 // written with a plain fopen() and lands world-readable. Passwords are stored in
