@@ -207,10 +207,11 @@ int main(int argc, char** argv)
                     continue;
                 }
 
-                // An operation dialog is up (F5/F6/F7/F2/Shift+F4): Enter runs it,
-                // Esc cancels, everything else (typing, caret keys) goes to ImGui.
+                // An operation dialog is up (F5/F6/F7/F2/Shift+F4): Enter runs what
+                // the keyboard ring is on, Tab moves the ring, Esc cancels. Everything
+                // else (typing, caret keys) goes to ImGui, which owns the text field.
                 if (panes->op != OP_NONE) {
-                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE)
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE || k == SDLK_TAB)
                         app_panes_handle_key(panes, k, m);
                     else
                         ImGui_ImplSDL3_ProcessEvent(&event);

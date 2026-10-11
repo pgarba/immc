@@ -2231,6 +2231,112 @@ static void test_remote_keys(AppPanes* app) {
     app->remote_adhoc.clear();
 }
 
+// The operation dialog is the one place in this app with buttons, and ImGui's
+// keyboard navigation is switched off here because the panes own the arrow keys. So
+// the ring that reaches those buttons is the app's own, and the only way to know it
+// works is to drive the keys: which control Tab lands on, what Enter does there, and
+// what Tab has to stop doing while a destination is being typed.
+static void test_op_tab_ring(AppPanes* app) {
+    const bool focus_was = app->left_focus;
+
+    // A local copy offers three controls: the field, Copy, Cancel.
+    app->op = OP_COPY;
+    app->op_plan = OpPlan();
+    app->op_plan.dst_dir = "/tmp";
+    snprintf(app->op_name, sizeof(app->op_name), "/tmp/");
+    app->op_focus = OF_FIELD;
+
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_RUN);
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_CANCEL);      // a local plan has no background button
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_FIELD);       // the ring wraps back through the field
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_SHIFT);
+    CHECK(app->op_focus == OF_CANCEL);      // Shift+Tab walks back the same way
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_SHIFT);
+    CHECK(app->op_focus == OF_RUN);
+
+    // Tab is the pane switch when no dialog is up. It has to stop being one the
+    // moment the dialog owns the keyboard, or reaching for "Cancel" moves a pane
+    // behind the dialog and changes what the operation applies to.
+    CHECK(app->left_focus == focus_was);
+
+    // A copy to a site gains a button, so the ring is four long. The ids keep their
+    // meaning as it grows: Cancel is still Cancel, not whatever shifted into its place.
+    snprintf(app->op_name, sizeof(app->op_name), "ftp://nowhere.example/pub/");
+    CHECK(op_dialog_network(app));
+    app->op_focus = OF_FIELD;
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_RUN);
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_BG);
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_CANCEL);
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_FIELD);
+
+    // Enter runs what the ring sits on. On Cancel that means closing the dialog with
+    // nothing recorded, so no operation is left waiting to run between frames.
+    app->op_focus = OF_CANCEL;
+    app->pending_op = DEFER_NONE;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op == OP_NONE);
+    CHECK(app->pending_op == DEFER_NONE);
+
+    // On "Run in background" it is the same commit the button makes, with the
+    // request raised and no Shift held. The site is unknown, so the commit keeps the
+    // dialog up instead of reaching the network; the request is what is being read.
+    app->op = OP_COPY;
+    app->op_plan = OpPlan();
+    app->op_plan.dst_dir = "/tmp";
+    snprintf(app->op_name, sizeof(app->op_name), "ftp://nowhere.example/pub/");
+    app->op_focus = OF_BG;
+    app->op_run_bg = false;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->op_run_bg);
+    CHECK(app->op == OP_COPY);
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+
+    // A focus the dialog can no longer draw is not left pointing at a button that is
+    // not there: the destination was edited from a site to a local directory and the
+    // ring lost a member, so Tab starts from the field rather than from a gap.
+    app->op = OP_COPY;
+    app->op_plan = OpPlan();
+    app->op_plan.dst_dir = "/tmp";
+    snprintf(app->op_name, sizeof(app->op_name), "ftp://nowhere.example/pub/");
+    app->op_focus = OF_BG;
+    snprintf(app->op_name, sizeof(app->op_name), "/tmp/");
+    CHECK(!op_dialog_network(app));
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_RUN);
+
+    // Both ways of opening a dialog start the ring on the field, whatever the last
+    // one was left on: the first thing a user does with a dialog is type in it.
+    app->op = OP_NONE;
+    app->op_focus = OF_CANCEL;
+    open_name_dialog(app, OP_MKDIR, "");
+    CHECK(app->op == OP_MKDIR && app->op_focus == OF_FIELD);
+    app_panes_cancel_op(app);
+
+    app->op_focus = OF_CANCEL;
+    OpPlan p;
+    p.src_dir = "/tmp";
+    p.dst_dir = "/tmp";
+    p.names.push_back("a");
+    open_op_dialog(app, p);
+    CHECK(app->op == OP_COPY && app->op_focus == OF_FIELD);
+    app_panes_cancel_op(app);
+
+    app->op = OP_NONE;
+    app->op_plan = OpPlan();
+    app->op_name[0] = '\0';
+    app->op_focus = OF_FIELD;
+    app->op_run_bg = false;
+    app->pending_op = DEFER_NONE;
+    app->left_focus = focus_was;
+}
+
 // A copy or move across a network can be handed to a thread, and the strip under
 // the panes is the only thing that says what that thread is doing. The numbers are
 // the part worth checking: they are read off atomics by a frame that can catch the
@@ -3235,6 +3341,7 @@ int main() {
     test_tab_restore(&app, root);
     test_options_keys(&app);
     test_remote_keys(&app);
+    test_op_tab_ring(&app);
     test_bg_transfers(&app);
     test_failed_list_has_no_rows(&app, root);
     test_quick_view(&app, root);

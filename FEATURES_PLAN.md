@@ -63,7 +63,7 @@ actually draws at for either font, the framebuffer scale derived from a
 window's logical and pixel sizes, the identity strings, the title
 bar's elision, the Options dialog's keys and layout, the menu bar actually being
 drawn, and the quick filter taking the caret with the keys typed straight after
-it) run headless — 1662 checks in `test-panes` plus 220 in `test-archive`:
+it) run headless — 1692 checks in `test-panes` plus 220 in `test-archive`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -374,6 +374,21 @@ already taken) leaves the dialog open with the reason in it, so the fix is typed
 whole operation restarted. While it is up the arrows, `Home`, `End` and `Delete` belong to the text field
 rather than the file list, and the OK button only records the request — the run happens between frames,
 like every other long operation.
+
+**`Tab` walks the dialog, and `Enter` runs what it lands on.** The ring is the dialog read top to bottom:
+the field, the verb (`Copy`, `Move`, `Rename`), `Run in background` when the plan crosses a network, and
+`Cancel`; it wraps back through the field, because that is where the destination gets corrected. `Enter`
+then means the same thing it means on the field wherever it lands — commit, commit-with-background, or
+close — so the dialog is finishable without reaching for the mouse, which until now it was not: a copy to
+a site could be started from the keyboard and had to be aimed at `Run in background` with a pointer.
+`Space` is deliberately not an activation key, because the field keeps the caret while the ring is on a
+button and a space is a character in a path. ImGui's own navigation is off in this app — the panes own the
+arrow keys, and nav would take them — so the ring is the app's state and its mark is drawn by hand with
+`cursor_outline`, the same outline the pane puts around its cursor row. Two things this sits on: the ring
+length is asked of the plan through one helper, so the drawing and the key handler cannot disagree about
+whether `Run in background` is on screen; and `Tab` is intercepted before the pane handler, because it is
+the pane switch when no dialog is up, and moving a pane underneath an open copy dialog would change what
+the operation acts on.
 
 ### 4.7 Phase G — delete-to-trash option (~1h)
 - `MCConfig::trash` (default on when `gio` or `trash-put` is on PATH). `fs_delete_entry` routes

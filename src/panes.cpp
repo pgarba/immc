@@ -34,6 +34,17 @@
 // Rows per Page Up / Page Down step (approx. visible rows in a 800px pane)
 static const int PAGE_SIZE = 18;
 
+// Which control in the operation dialog the keyboard is on. The ids are fixed
+// rather than positions in a list: the dialog draws "Run in background" only for a
+// copy or move that crosses a network, so the ring changes length, and an id that
+// meant Cancel keeps meaning that whatever else moved.
+enum OpFocus {
+    OF_FIELD  = 0,   // the text field: a name, or the destination
+    OF_RUN    = 1,   // the dialog's own verb: Copy, Move, Rename...
+    OF_BG     = 2,   // "Run in background", when the dialog offers it
+    OF_CANCEL = 3,
+};
+
 AppPanes::AppPanes() {
     left.entries = nullptr;
     left.entry_count = 0;
@@ -81,6 +92,7 @@ AppPanes::AppPanes() {
     op_name[0] = '\0';
     op_error[0] = '\0';
     op_focus_request = false;
+    op_focus = OF_FIELD;
     status_msg[0] = '\0';
     cmd[0] = '\0';
     cmd_hist_count = 0;
@@ -2248,6 +2260,51 @@ static bool plan_crosses_network(const OpPlan& plan, const char* typed) {
     return typed && net_is_remote(typed);
 }
 
+// Does the dialog offer "Run in background" this frame? Asked of the plan here, in
+// one place, so the drawing and the key handler cannot disagree about how long the
+// ring is. The plan is not resolved until commit, so a local path typed over a
+// remote source is still a network copy and still offers the button.
+static bool op_dialog_network(const AppPanes* app) {
+    if (app->op != OP_COPY && app->op != OP_MOVE) return false;
+    return plan_crosses_network(app->op_plan, app->op_name);
+}
+
+// The ring: the field, then the buttons in the order the dialog draws them.
+static void op_ring(const AppPanes* app, std::vector<int>* out) {
+    out->clear();
+    out->push_back(OF_FIELD);
+    out->push_back(OF_RUN);
+    if (op_dialog_network(app)) out->push_back(OF_BG);
+    out->push_back(OF_CANCEL);
+}
+
+// Tab and Shift+Tab. The ring wraps through the field, because the field is where
+// the destination is typed and a keyboard user leaving the last button wants to be
+// back there, not parked on the first one. A ring the current id is no longer in -
+// the destination was edited from a site to a local directory and the background
+// button went away - restarts at the field instead of pointing at nothing.
+static void op_tab(AppPanes* app, bool shift) {
+    std::vector<int> ring;
+    op_ring(app, &ring);
+    int i = 0;
+    while (i < (int)ring.size() && ring[i] != app->op_focus) i++;
+    if (i >= (int)ring.size()) i = 0;
+    int step = shift ? (int)ring.size() - 1 : 1;
+    app->op_focus = ring[(i + step) % (int)ring.size()];
+}
+
+// The ring's mark. ImGui's keyboard navigation is switched off in this app - the
+// panes own the arrow keys, and nav would take them - so nothing else says which
+// button the keyboard is on. It gets the same outline the pane draws around its
+// cursor row, which is the app's existing sign for "the keyboard is here".
+static void op_focus_ring() {
+    const ImVec2 lo = ImGui::GetItemRectMin();
+    const ImVec2 hi = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddRect(ImVec2(lo.x - 3.0f, lo.y - 3.0f),
+                                        ImVec2(hi.x + 3.0f, hi.y + 3.0f),
+                                        mc_theme_colors()->cursor_outline, 0.0f, 0, 1.5f);
+}
+
 static void render_op_dialog(AppPanes* app) {
     if (app->op == OP_NONE) return;
     ImGuiIO& io = ImGui::GetIO();
@@ -2280,6 +2337,9 @@ static void render_op_dialog(AppPanes* app) {
         pack_fill("To:");
         if (app->op_focus_request) { claim_focus(app); app->op_focus_request = false; }
         ImGui::InputText("To:", app->op_name, sizeof(app->op_name));
+        // Clicking into the field is the keyboard going back to it, so the ring
+        // follows rather than staying marked on a button the mouse just ignored.
+        if (ImGui::IsItemClicked()) app->op_focus = OF_FIELD;
         if (plan.archive.empty())
             text_wrap_disabled("End with / (or name a folder that exists) and every item keeps its "
                                "own name. With one item, the field is the target itself, so it can "
@@ -2306,6 +2366,7 @@ static void render_op_dialog(AppPanes* app) {
         pack_fill(field);
         if (app->op_focus_request) { claim_focus(app); app->op_focus_request = false; }
         ImGui::InputText(field, app->op_name, sizeof(app->op_name));
+        if (ImGui::IsItemClicked()) app->op_focus = OF_FIELD;
     }
 
     if (app->op_error[0]) {
@@ -2314,15 +2375,24 @@ static void render_op_dialog(AppPanes* app) {
     }
 
     ImGui::Spacing();
+    // The keyboard ring, drawn by hand: ImGui's own navigation is switched off in
+    // this app because the panes own the arrow keys, so nothing else would say
+    // which button the keyboard is on. It gets the same outline the pane draws
+    // around its cursor row, the app's existing sign for "the keyboard is here".
+    const bool network = op_dialog_network(app);
+    // The button can vanish under a focus that is on it - the destination was
+    // edited from a site to a local directory, and the ring loses a member. Step
+    // back to the field instead of leaving the mark on a button that is not drawn.
+    if (app->op_focus == OF_BG && !network) app->op_focus = OF_FIELD;
     // The button only records the request: copy and move block and pump their own
     // ImGui frames, which cannot happen while this dialog's frame is open.
     if (ImGui::Button(op_button_label(app->op))) app->pending_op = DEFER_OP_COMMIT;
+    if (app->op_focus == OF_RUN) op_focus_ring();
     ImGui::SameLine();
     // The same operation, handed to a thread instead of run in front of the
     // panes. It commits exactly like the button above it and records the request
     // with the commit, because the choice has to survive the overwrite confirm
     // that may follow - which is why it lands in app->op_run_bg and not in a local.
-    const bool network = copy_move && plan_crosses_network(plan, app->op_name);
     if (network) {
         if (ImGui::Button("Run in background")) {
             app->op_run_bg = true;
@@ -2330,11 +2400,13 @@ static void render_op_dialog(AppPanes* app) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The panes stay usable. The transfer is listed under them.");
+        if (app->op_focus == OF_BG) op_focus_ring();
         ImGui::SameLine();
     }
     if (ImGui::Button("Cancel")) app_panes_cancel_op(app);
+    if (app->op_focus == OF_CANCEL) op_focus_ring();
     ImGui::SameLine();
-    text_wrap_disabled("Enter runs it, Esc cancels.%s",
+    text_wrap_disabled("Tab moves between these, Enter runs what it is on, Esc cancels.%s",
                        network ? "  Shift+Enter runs it in the background." : "");
     if (!open) app_panes_cancel_op(app);
     ImGui::End();
@@ -3010,6 +3082,7 @@ static void open_op_dialog(AppPanes* app, const OpPlan& plan) {
     app->op = plan.is_move ? OP_MOVE : OP_COPY;
     app->op_error[0] = '\0';
     app->op_run_bg = false;
+    app->op_focus = OF_FIELD;
     app->op_focus_request = true;
     // One entry: the field holds the whole target, so changing just the name is
     // one edit. Several, or members coming out of an archive: it holds the
@@ -3035,6 +3108,7 @@ static void open_name_dialog(AppPanes* app, AppOp op, const char* prefill) {
     if (op == OP_RENAME && active.selected >= 0 && active.selected < active.entry_count)
         app->op_plan.names.push_back(active.entries[active.selected]->name);
     app->op_error[0] = '\0';
+    app->op_focus = OF_FIELD;
     app->op_focus_request = true;
 }
 
@@ -6663,20 +6737,33 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     // ---- the operation dialog (F5, F6, F7, Shift+F4, F2) ----
-    // Enter runs what the dialog describes and Esc drops it; every other key is
-    // either text for the field or nothing. Text keys never reach here -
-    // app_key_is_special lets the editing keys through so the caret, selection
-    // and clipboard in the field keep working - so a stray 'd' cannot delete a
-    // file while a destination is being typed.
+    // Tab walks the dialog's controls, Enter runs whatever it is sitting on, and
+    // Esc drops the dialog; every other key is either text for the field or
+    // nothing. Text keys never reach here - app_key_is_special lets the editing
+    // keys through so the caret, selection and clipboard in the field keep
+    // working - so a stray 'd' cannot delete a file while a destination is being
+    // typed. Space is deliberately not an activation key: the field keeps the caret
+    // while the ring is on a button, and a space is a character in a path.
     if (app->op != OP_NONE) {
+        if (key == SDLK_TAB) { op_tab(app, shift); return; }
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
             // Shift+Enter is the keyboard half of the dialog's "Run in
             // background" button. It is raised for any copy or move and honoured
             // only if the plan turns out to cross a network: the destination is
             // not resolved until commit_op() runs, so the key cannot know yet,
             // and run_op_plan() clears the request either way.
-            if ((mod & SDL_KMOD_SHIFT) && (app->op == OP_COPY || app->op == OP_MOVE))
-                app->op_run_bg = true;
+            switch (app->op_focus) {
+            case OF_CANCEL:
+                app_panes_cancel_op(app);
+                return;
+            case OF_BG:
+                if (app->op == OP_COPY || app->op == OP_MOVE) app->op_run_bg = true;
+                break;
+            default:
+                if ((mod & SDL_KMOD_SHIFT) && (app->op == OP_COPY || app->op == OP_MOVE))
+                    app->op_run_bg = true;
+                break;
+            }
             app_panes_commit_op(app);
         } else if (key == SDLK_ESCAPE) app_panes_cancel_op(app);
         return;

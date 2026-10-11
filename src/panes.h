@@ -274,6 +274,12 @@ public:
     char op_name[4096];   // the dialog's field: a name, or a destination path
     OpPlan op_plan;       // sources and resolved destination for OP_COPY/OP_MOVE
     bool op_focus_request;   // focus the dialog's field on the frame it opens
+    // Which control in the operation dialog the keyboard is on: the field, or one
+    // of its buttons. Tab walks it and Enter runs whatever it sits on. The ids are
+    // fixed rather than positions in a list, because the dialog draws "Run in
+    // background" only for a copy or move that crosses a network - the ring changes
+    // length, and an id that meant Cancel keeps meaning that whatever else moved.
+    int op_focus;
     char op_error[512];   // the dialog's own error line, cleared on open
     char status_msg[512]; // last operation result, shown in the status bar
 
