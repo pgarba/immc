@@ -1,5 +1,7 @@
 # immc
 
+[![build and test]][ci]
+
 A dual-pane file manager for the keyboard. Two file panes, a command line, and the
 file operations under the F-keys, in the shape Total Commander and Midnight
 Commander trained people on: `F5` copies, `F6` moves, `F7` makes a folder, `F3`
@@ -218,3 +220,5 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 ## License
 
 MIT — see `LICENSE`.
+
+[ci]: https://github.com/pgarba/immc/actions/workflows/ci.yml
