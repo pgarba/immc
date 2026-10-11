@@ -47,14 +47,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # SDL3 is picky about names: noble calls ibus's dev package
+      # libibus-1.0-dev, and it treats its X11 sub-modules (xcursor, xfixes,
+      # xrandr, xss, xtst, xi) as required rather than optional, so a missing
+      # one stops configure instead of turning a feature off. Every name here
+      # is checked against noble's own Packages index.
       - name: install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake g++ curl libgl1-mesa-dev libcurl4-openssl-dev \
-            libfreetype-dev libx11-dev libxext-dev libxkbcommon-dev \
-            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
-            libibus-1.0-dev zip unzip p7zip-full python3
+            libfreetype-dev libxkbcommon-dev libasound2-dev libpulse-dev \
+            libdbus-1-dev libudev-dev libibus-1.0-dev \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxfixes-dev \
+            libxrandr-dev libxss-dev libxtst-dev libxrender-dev \
+            zip unzip p7zip-full python3
 
       # The second matrix leg reuses the first leg's SDL3.
       - name: SDL3 cache

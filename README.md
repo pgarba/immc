@@ -36,9 +36,17 @@ release tarball the way CI does:
     cmake --build sdl3 -j4
     sudo cmake --install sdl3
 
-SDL3 will not configure without X11 or Wayland development headers, so give it
-those first (`libx11-dev libxext-dev libxkbcommon-dev`, plus `libasound2-dev`
-and `libpulse-dev` for audio). Installing it elsewhere works too; point CMake
+SDL3 needs X11 development headers before it will configure, and it treats its
+X11 sub-modules as required rather than optional: a missing `libxcursor-dev`
+stops configure instead of quietly dropping cursor support. So the list is
+longer than it looks:
+
+    libx11-dev libxext-dev libxcursor-dev libxi-dev libxfixes-dev \
+    libxrandr-dev libxss-dev libxtst-dev libxrender-dev libxkbcommon-dev
+
+Add `libasound2-dev` and `libpulse-dev` for audio. `.github/workflows/ci.yml`
+installs exactly that set, which is the quickest way to check the list is still
+correct. Installing it elsewhere works too; point CMake
 at the prefix with `-DCMAKE_PREFIX_PATH=/path/to/prefix`.
 
 Dear ImGui is not vendored in this repository. Fetch the pinned copy first:
