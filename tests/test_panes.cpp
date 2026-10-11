@@ -1996,6 +1996,61 @@ static void test_options_config(AppPanes* app) {
     for (int i = 0; i < n; i++) CHECK(fs_exists(names[i]) == false || names[i][0] != '\0');
 }
 
+// A session that ended on a site or inside an archive has to come back to the
+// same place. Both of those tab paths are virtual - "ftp://host/dir" and
+// "pkg.zip/inner" are not names the filesystem has - so a restore that asks
+// stat() about them throws the tab away, leaves the pane on the startup
+// directory, and turns the copy the user starts there into an ordinary local one.
+static void test_tab_restore(AppPanes* app, const std::string& root) {
+    MCConfig cfg;
+    mc_config_default(&cfg);
+
+    snprintf(cfg.left_tabs[0], 4096, "%s", (root + "/sub").c_str());
+    snprintf(cfg.left_tabs[1], 4096, "ftp://someone@example.com:2121/pub");
+    cfg.left_tab_count = 2;
+    cfg.left_tab_active = 1;
+
+    snprintf(cfg.right_tabs[0], 4096, "%s", (root + "/gone").c_str());
+    snprintf(cfg.right_tabs[1], 4096, "%s", (root + "/pkg.zip/sub").c_str());
+    cfg.right_tab_count = 2;
+    cfg.right_tab_active = 1;
+
+    AppPanes next;
+    net_bind(&next);              // app_panes_init() does this before restoring
+    app_panes_apply_state(&next, &cfg);
+
+    // The site tab survived and the pane is a remote pane pointing at it. There
+    // is no saved login for it, which is a note in the status line, not a reason
+    // to lose where the user was.
+    CHECK(next.left.tab_count == 2);
+    CHECK(next.left.tab_active == 1);
+    CHECK(!strcmp(next.left.current_dir, "ftp://someone@example.com:2121/pub"));
+    CHECK(in_remote(next.left));
+    CHECK(!strcmp(next.left.remote_root, "ftp://someone@example.com:2121"));
+    CHECK(!strcmp(next.left.remote_path, "/pub"));
+
+    // A plain directory that went away is still dropped, and the archive tab that
+    // took its place is the one showing, opened at the level it was left at.
+    CHECK(next.right.tab_count == 1);
+    CHECK(next.right.tab_active == 0);
+    CHECK(in_archive(next.right));
+    CHECK(!strcmp(next.right.archive_path, (root + "/pkg.zip").c_str()));
+    CHECK(!strcmp(next.right.archive_prefix, "sub"));
+
+    // An archive whose file is gone is dead like any other dead path, and a pane
+    // with nothing left to restore is left alone.
+    mc_config_default(&cfg);
+    snprintf(cfg.right_tabs[0], 4096, "%s", (root + "/nothing.zip/sub").c_str());
+    cfg.right_tab_count = 1;
+    cfg.right_tab_active = 0;
+    AppPanes third;
+    net_bind(&third);
+    app_panes_apply_state(&third, &cfg);
+    CHECK(third.right.tab_count == 0);
+
+    net_bind(app);
+}
+
 // Esc closes the dialog, and while its filter field holds the keyboard the
 // arrows edit the word instead of walking the file list behind it.
 static void test_options_keys(AppPanes* app) {
@@ -2854,6 +2909,7 @@ int main() {
     test_identity(&app);
     test_title(&app);
     test_options_config(&app);
+    test_tab_restore(&app, root);
     test_options_keys(&app);
     test_remote_keys(&app);
     test_bg_transfers(&app);

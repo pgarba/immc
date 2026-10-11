@@ -5806,8 +5806,28 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
 
 // Restore tabs from the config. Directories that no longer exist are
 // dropped; if nothing survives the app defaults from init stay in place.
-void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
+// Can a restored tab still be opened? The question has to be asked of the right
+// thing, because a tab's path is not always a filesystem path. A site tab and an
+// archive tab are virtual: "ftp://host/dir" and "pkg.zip::sub" are names the
+// filesystem has never heard of, so checking them with stat() fails and a session
+// that ended on a site or inside an archive came back with those tabs quietly
+// thrown away - the pane landed on the startup directory instead, and the copy
+// the user then started looked like an ordinary local one. A site tab is kept
+// whatever the server is doing right now: the login is looked up when the pane is
+// refreshed, and a site that cannot be reached says so in the status line rather
+// than taking the user's place back from them. An archive tab is kept while the
+// archive file itself is still on disk.
+static bool tab_dir_still_there(const char* path) {
     struct stat st;
+    std::string vroot, vpath;
+    if (net_split_virtual(path, &vroot, &vpath)) return true;
+    char archive[4096], prefix[1024];
+    if (arch_split_virtual(path, archive, sizeof archive, prefix, sizeof prefix))
+        return stat(archive, &st) == 0 && S_ISREG(st.st_mode);
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     if (cfg->view_mode >= 0 && cfg->view_mode <= 2) app->view_mode = cfg->view_mode;
     if (cfg->theme[0]) snprintf(app->theme, sizeof(app->theme), "%s", cfg->theme);
     snprintf(app->font, sizeof(app->font), "%s", cfg->font);
@@ -5836,7 +5856,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
         int n = 0, new_active = 0;
         for (int t = 0; t < count && n < MAX_TABS; t++) {
             if (!tabs[t][0]) continue;
-            if (stat(tabs[t], &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            if (!tab_dir_still_there(tabs[t])) continue;
             if (t == active) new_active = n;
             snprintf(dirs[n], 4096, "%s", tabs[t]);
             n++;
