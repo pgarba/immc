@@ -1470,6 +1470,28 @@ static void test_ui_id_uniqueness(AppPanes* app) {
     io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
 
     int conflicts = 0;
+    // The transfer strip is the one part of this frame whose row count changes
+    // while the app runs, so it is scanned with the panes instead of assumed
+    // safe. One running row and one finished row put both the progress bar and
+    // the button in the frame, and the strip takes room the panes then lose.
+    for (int i = 0; i < 2; i++) {
+        std::unique_ptr<BgTransfer> up = std::make_unique<BgTransfer>();
+        BgTransfer* t = up.get();
+        t->state = i == 0 ? BgTransfer::BG_RUNNING : BgTransfer::BG_DONE;
+        t->abort = t->settled = t->dismiss = false;
+        t->done = 3000000;
+        t->total = 9000000;
+        t->files_done = 1;
+        t->files_total = 4;
+        t->is_move = i == 1;
+        t->download = true;
+        t->t0 = SDL_GetTicks() / 1000.0 - 6.0;
+        t->src = "ftp://files.example.org/pub/IDA Pro 9.6.261001";
+        t->dst = "/home/adam/Downloads/IDA Pro 9.6.261001";
+        app->transfers.push_back(std::move(up));
+    }
+    CHECK(bg_strip_height(app, ImGui::GetTextLineHeight()) > 0.0f);
+
     for (int y = 8; y < 800 && conflicts < 3; y += 12) {
         for (int x = 4; x < 1280 && conflicts < 3; x += 12) {
             io.MousePos = ImVec2((float)x, (float)y);
@@ -1489,6 +1511,7 @@ static void test_ui_id_uniqueness(AppPanes* app) {
     }
     io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
     CHECK(conflicts == 0);
+    app->transfers.clear();
     ImGui::DestroyContext(ctx);
 }
 
@@ -2097,6 +2120,350 @@ static void test_remote_keys(AppPanes* app) {
     app->remote_adhoc.clear();
 }
 
+// A copy or move across a network can be handed to a thread, and the strip under
+// the panes is the only thing that says what that thread is doing. The numbers are
+// the part worth checking: they are read off atomics by a frame that can catch the
+// transfer at any moment, and they have to stay readable when the size is not
+// known yet or the transfer has already ended.
+static void test_bg_transfers(AppPanes* app) {
+    char out[256];
+
+    fmt_secs(0.4, out, sizeof(out));   CHECK(!strcmp(out, "0s"));
+    fmt_secs(59.4, out, sizeof(out));  CHECK(!strcmp(out, "59s"));
+    fmt_secs(125, out, sizeof(out));   CHECK(!strcmp(out, "2m05s"));
+    fmt_secs(3720, out, sizeof(out));  CHECK(!strcmp(out, "1h02m"));
+    fmt_secs(-5, out, sizeof(out));    CHECK(!strcmp(out, "0s"));   // never a negative ETA
+
+    BgTransfer t;
+    t.state  = BgTransfer::BG_RUNNING;
+    t.abort = t.settled = t.dismiss = false;
+    t.done = t.total = 0;
+    t.files_done = t.files_total = 0;
+    t.is_move = false;
+    t.download = true;
+    // Ten seconds of history makes the rate exact enough to assert on.
+    t.t0 = SDL_GetTicks() / 1000.0 - 10.0;
+    t.done = 5000000;
+    t.total = 10000000;
+    bg_line(&t, out, sizeof(out));
+    CHECK(strstr(out, "5.0M of 10.0M") != nullptr);
+    CHECK(strstr(out, "5.0M left") != nullptr);
+    CHECK(strstr(out, "eta 10s") != nullptr);
+
+    // A tree whose sizes the server has not named yet: a bar that never moves
+    // needs a line that says why.
+    t.total = 0;
+    bg_line(&t, out, sizeof(out));
+    CHECK(strstr(out, "size not known yet") != nullptr);
+    CHECK(strstr(out, "eta") == nullptr);
+
+    // An ended transfer has no rate to quote, only what it moved and how long
+    // that took.
+    t.state = BgTransfer::BG_DONE;
+    bg_line(&t, out, sizeof(out));
+    CHECK(strstr(out, "5.0M in 10s") != nullptr);
+
+    // The worker's callback publishes instead of drawing, and its false answer is
+    // what unwinds the transport after the file it is on.
+    t.state = BgTransfer::BG_RUNNING;
+    CHECK(bg_progress_cb(1024, 4096, 2, 5, &t));
+    CHECK(t.done == 1024 && t.total == 4096);
+    CHECK(t.files_done == 2 && t.files_total == 5);
+    t.abort = true;
+    CHECK(!bg_progress_cb(2048, 4096, 3, 5, &t));
+    t.abort = false;
+
+    // Only a transfer that crosses a network can be handed over. A local copy is
+    // bounded by the disk, and a second thread into the same tree buys a race. The
+    // destination can still be sitting in the dialog's field rather than in the
+    // plan, so the field is asked as well.
+    OpPlan plan;
+    plan.dst_dir = "/tmp";
+    CHECK(!plan_crosses_network(plan, "/tmp/out"));
+    CHECK(plan_crosses_network(plan, "ftp://example.com/pub/"));   // typed into the field
+    plan.remote = "ftp://example.com";
+    CHECK(plan_crosses_network(plan, "/tmp/out"));
+    plan.remote.clear();
+    plan.dst_dir = "ftp://example.com/pub";
+    CHECK(plan_crosses_network(plan, "/tmp/out"));
+
+    // Shift+Enter is the keyboard half of the dialog's button. The destination is
+    // not resolved until the commit runs, so the key raises the request for any
+    // copy or move and the run is what decides whether it meant anything - which
+    // is also what stops it leaking into the next operation.
+    app->op = OP_COPY;
+    app->op_plan = OpPlan();
+    app->op_plan.dst_dir = "/tmp";
+    snprintf(app->op_name, sizeof(app->op_name), "ftp://nowhere.example/pub/");
+    app->op_run_bg = false;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_SHIFT);
+    CHECK(app->op_run_bg);                       // the request is raised...
+    CHECK(app->op == OP_COPY);                   // ...and the dialog is still up, refusing the site
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(!app->op_run_bg);                      // cancelling drops it with the plan
+
+    app->op = OP_COPY;
+    app->op_plan = OpPlan();
+    app->op_plan.dst_dir = "/tmp";
+    snprintf(app->op_name, sizeof(app->op_name), "/tmp/");
+    app->op_run_bg = false;
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_SHIFT);
+    CHECK(app->op_run_bg);
+    app_panes_run_pending(app);                  // a local plan runs, and drops the request
+    CHECK(!app->op_run_bg);
+    app->op = OP_NONE;
+    app->op_plan = OpPlan();
+
+    // The strip takes no room at all while there is nothing in it.
+    CHECK(bg_strip_height(app, 20.0f) == 0.0f);
+
+    // A finished transfer is settled once: one status line, one refresh of the
+    // panes that can see the destination. It stays on screen until dismissed.
+    app->transfers.clear();
+    std::unique_ptr<BgTransfer> up = std::make_unique<BgTransfer>();
+    BgTransfer* row = up.get();
+    row->state = BgTransfer::BG_DONE;
+    row->abort = row->settled = row->dismiss = false;
+    row->done = row->total = 0;
+    row->files_done = row->files_total = 0;
+    row->is_move = false;
+    row->download = true;
+    row->t0 = SDL_GetTicks() / 1000.0;
+    row->dst = "/tmp/bg-dest";
+    row->ok_names = 3;
+    row->worker = std::thread([] {});
+    app->transfers.push_back(std::move(up));
+    CHECK(bg_strip_height(app, 20.0f) > 0.0f);
+
+    app->status_msg[0] = '\0';
+    bg_reap(app);
+    CHECK(strstr(app->status_msg, "Copied 3 items to /tmp/bg-dest") != nullptr);
+    CHECK(row->settled.load());
+    snprintf(app->status_msg, sizeof(app->status_msg), "untouched");
+    bg_reap(app);
+    CHECK(!strcmp(app->status_msg, "untouched"));   // a second frame says it once
+    CHECK(app->transfers.size() == 1);              // it stays until dismissed
+    row->dismiss = true;
+    bg_reap(app);
+    CHECK(app->transfers.empty());                  // joined, then dropped
+
+    // Quit asks every running transfer to stop and waits for it to come back, so
+    // nothing is still inside libcurl when the library is released.
+    up = std::make_unique<BgTransfer>();
+    row = up.get();
+    row->state = BgTransfer::BG_RUNNING;
+    row->abort = row->settled = row->dismiss = false;
+    row->done = row->total = 0;
+    row->files_done = row->files_total = 0;
+    row->is_move = false;
+    row->download = true;
+    row->t0 = SDL_GetTicks() / 1000.0;
+    row->worker = std::thread([row] {
+        while (!row->abort.load()) SDL_Delay(1);
+        row->state.store(BgTransfer::BG_ABORTED, std::memory_order_release);
+    });
+    app->transfers.push_back(std::move(up));
+    bg_stop_all(app);
+    CHECK(app->transfers.empty());                  // joined, not abandoned
+
+    // A background transfer needs a login before a thread is worth starting, and
+    // the refusal says so the way the foreground path does.
+    app->transfers.clear();
+    OpPlan want;
+    want.remote = "ftp://nowhere.example";
+    want.remote_prefix = "/pub";
+    want.dst_dir = "/tmp/bg-dest";
+    want.names.push_back("gone.txt");
+    app->status_msg[0] = '\0';
+    bg_start_remote_plan(app, want);
+    CHECK(app->transfers.empty());
+    CHECK(strstr(app->status_msg, "No login for ftp://nowhere.example") != nullptr);
+
+    // Finished rows are retired to make room for a new transfer, but a running one
+    // is never taken out from under the thread that is reporting into it.
+    std::unique_ptr<BgTransfer> running = std::make_unique<BgTransfer>();
+    BgTransfer* live = running.get();
+    live->state = BgTransfer::BG_RUNNING;
+    live->abort = live->settled = live->dismiss = false;
+    live->done = live->total = 0;
+    live->files_done = live->files_total = 0;
+    live->is_move = false;
+    live->download = true;
+    live->t0 = SDL_GetTicks() / 1000.0;
+    live->worker = std::thread([live] {
+        while (!live->abort.load()) SDL_Delay(1);
+        live->state.store(BgTransfer::BG_ABORTED, std::memory_order_release);
+    });
+    up = std::make_unique<BgTransfer>();
+    row = up.get();
+    row->state = BgTransfer::BG_DONE;
+    row->abort = row->settled = row->dismiss = false;
+    row->done = row->total = 0;
+    row->files_done = row->files_total = 0;
+    row->is_move = false;
+    row->download = true;
+    row->t0 = SDL_GetTicks() / 1000.0;
+    row->worker = std::thread([] {});
+    app->transfers.push_back(std::move(running));
+    app->transfers.push_back(std::move(up));
+    bg_retire_oldest_finished(app);
+    CHECK(app->transfers.size() == 1);
+    CHECK(app->transfers[0].get() == live);   // the finished one went, the running one stayed
+    bg_stop_all(app);
+    CHECK(app->transfers.empty());
+
+    // The bar says "running" by moving; the number it cannot show by itself is how
+    // far along the transfer is, so that is what goes on the bar. A finished row
+    // keeps its word, and a running row with no total yet has no percentage to show.
+    char ov[32];
+    bg_overlay(BgTransfer::BG_RUNNING, 5, 10, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "50%"));
+    bg_overlay(BgTransfer::BG_RUNNING, 1, 3, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "33%"));
+    bg_overlay(BgTransfer::BG_RUNNING, 12, 10, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "100%"));                 // a total that grew mid-transfer
+    bg_overlay(BgTransfer::BG_RUNNING, 0, 0, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "running"));              // nothing known about the size yet
+    bg_overlay(BgTransfer::BG_DONE, 10, 10, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "done"));
+    bg_overlay(BgTransfer::BG_FAILED, 3, 10, ov, sizeof(ov));
+    CHECK(!strcmp(ov, "failed"));
+
+    // A copy that crosses a network is on its own thread whether or not the user
+    // asked for the background, so the progress dialog can stop watching at any
+    // moment - the handover changes who is watching, not what is running.
+    std::unique_ptr<BgTransfer> hand = std::make_unique<BgTransfer>();
+    BgTransfer* ht = hand.get();
+    ht->state = BgTransfer::BG_RUNNING;
+    ht->abort = ht->settled = ht->dismiss = false;
+    ht->src = "ftp://site/big.bin";
+    ht->dst = "/tmp/bg-dst/big.bin";
+    ht->done = 5; ht->total = 10;
+    ht->files_done = 0; ht->files_total = 1;
+    ht->is_move = false;
+    ht->download = true;
+    ht->t0 = SDL_GetTicks() / 1000.0;
+    snprintf(app->status_msg, sizeof(app->status_msg), "untouched");
+    ht->worker = std::thread([ht] {
+        while (!ht->abort.load()) SDL_Delay(2);
+        ht->ok_names = 1;
+        ht->state.store(BgTransfer::BG_ABORTED, std::memory_order_release);
+    });
+    app->transfers.push_back(std::move(hand));
+
+    prog_begin_watch(app, ht);
+    CHECK(app->prog_watch == ht);
+    CHECK(app->prog_active);
+    CHECK(!app->prog_handoff);
+    CHECK(!strcmp(app->prog_src, "ftp://site/big.bin"));   // the dialog speaks of the same thing
+    CHECK(watch_transfer_tick(app, ht));                    // still going, so keep watching
+    app->prog_handoff = true;                              // what the dialog's button sets
+    CHECK(!watch_transfer_tick(app, ht));                   // and the watching stops
+    app->prog_active = false;
+    app->prog_watch = nullptr;
+    CHECK(!ht->abort.load());                               // the transfer was not asked to stop
+    CHECK(ht->state.load() == BgTransfer::BG_RUNNING);
+    CHECK(app->transfers.size() == 1);                     // the row under the panes has it already
+
+    // Watching one that finishes on its own ends by itself, and the settle - the
+    // status line, the refresh of the destination pane - is still the list's job.
+    std::unique_ptr<BgTransfer> fin = std::make_unique<BgTransfer>();
+    BgTransfer* over = fin.get();
+    over->state = BgTransfer::BG_RUNNING;
+    over->abort = over->settled = over->dismiss = false;
+    over->src = "ftp://site/one.txt";
+    over->dst = "/tmp/bg-dst/one.txt";
+    over->done = over->total = 10;
+    over->files_done = 1; over->files_total = 1;
+    over->is_move = false;
+    over->download = true;
+    over->t0 = SDL_GetTicks() / 1000.0;
+    over->worker = std::thread([over] {
+        SDL_Delay(40);
+        over->ok_names = 1;
+        over->state.store(BgTransfer::BG_DONE, std::memory_order_release);
+    });
+    app->transfers.push_back(std::move(fin));
+    watch_remote_transfer(app, over);
+    CHECK(!app->prog_active);
+    CHECK(app->prog_watch == nullptr);
+    CHECK(!app->prog_handoff);
+    CHECK(over->state.load() == BgTransfer::BG_DONE);
+    bg_reap(app);
+    CHECK(strstr(app->status_msg, "Copied 1 item to") != nullptr);
+
+    // The button is in the dialog only when there is a thread to hand over to. A
+    // copy running on this thread is the dialog, so there is nothing to hand over.
+    {
+        ImGuiContext* ctx = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.DisplaySize = ImVec2(900, 700);
+        unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+        io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+
+        // Hover is decided while the item is being submitted, so every probe
+        // frame has to draw the dialog again with the mouse already moved. The
+        // button's id is the window's seed hashed with its label, which is what
+        // GetID() would return at the window's root - and it cannot be asked
+        // outside a frame, where the window's id stack is empty.
+        auto dialog = [app]() { ImGui::NewFrame(); render_progress_dialog(app); ImGui::Render(); };
+        auto hover = [&](ImGuiWindow* w, ImGuiID want) -> ImVec2 {
+            for (int y = (int)w->Pos.y; y < (int)(w->Pos.y + w->Size.y); y += 4)
+                for (int x = (int)w->Pos.x; x < (int)(w->Pos.x + w->Size.x); x += 4) {
+                    io.AddMousePosEvent((float)x, (float)y);
+                    dialog();
+                    if (ImGui::GetHoveredID() == want) return ImVec2((float)x, (float)y);
+                }
+            return ImVec2(-1.0f, -1.0f);
+        };
+        auto button_id = [](ImGuiWindow* w, const char* label) {
+            return ImHashStr(label, 0, w->ID);
+        };
+
+        app->prog_active = true;
+        app->prog_is_move = false;
+        app->prog_is_delete = false;
+        app->prog_abort = false;
+        app->prog_handoff = false;
+        app->prog_done = 5; app->prog_total = 10;
+        snprintf(app->prog_src, sizeof(app->prog_src), "/local/src");
+        snprintf(app->prog_dst, sizeof(app->prog_dst), "/local/dst");
+        app->prog_watch = nullptr;
+        dialog();
+        ImGuiWindow* w = ImGui::FindWindowByName("Copying");
+        CHECK(w != nullptr);
+        if (w) {
+            CHECK(hover(w, button_id(w, "Run in background")).x < 0.0f);   // nothing to hand over
+            CHECK(hover(w, button_id(w, "Abort")).x >= 0.0f);              // but Abort always is
+        }
+
+        app->prog_watch = over;      // a transfer that is on a thread
+        app->prog_handoff = false;
+        dialog();
+        w = ImGui::FindWindowByName("Copying");
+        if (w) {
+            ImVec2 at = hover(w, button_id(w, "Run in background"));
+            CHECK(at.x >= 0.0f);
+            if (at.x >= 0.0f) {
+                io.AddMousePosEvent(at.x, at.y);
+                io.AddMouseButtonEvent(0, true);
+                dialog();
+                io.AddMouseButtonEvent(0, false);
+                dialog();
+            }
+            CHECK(app->prog_handoff);
+            CHECK(!over->abort.load());   // handing over is not asking it to stop
+        }
+        app->prog_watch = nullptr;
+        app->prog_active = false;
+        ImGui::DestroyContext(ctx);
+    }
+
+    bg_stop_all(app);
+    CHECK(app->transfers.empty());
+}
+
 // The dialog has to fit the window it is opened in, and a font path has to stay
 // inside it: the list is a column of long absolute paths, which is exactly what
 // pushes a frame wider than the screen.
@@ -2489,6 +2856,7 @@ int main() {
     test_options_config(&app);
     test_options_keys(&app);
     test_remote_keys(&app);
+    test_bg_transfers(&app);
     test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);

@@ -26,6 +26,8 @@
 
 #ifdef MC_HAVE_CURL
 #include <curl/curl.h>
+#include <mutex>   // call_once: curl_global_init is not thread safe, and a
+                   // background transfer calls it from its own thread
 #endif
 
 // ---------------------------------------------------------------------------
@@ -728,15 +730,33 @@ bool net_parse_list_line(const char* line, FileEntry* out) {
 
 #ifdef MC_HAVE_CURL
 
-static bool g_curl_global_done = false;
+// curl_global_init is not thread safe and must happen once for the process. A
+// background transfer runs on its own thread and reaches this on its first
+// request, so the lazy flag it used to guard with is a race between that thread
+// and whichever listing started first.
+static std::once_flag g_curl_global_once;
 
 struct CachedHandle {
     std::string key;      // the site root: scheme, user, host, port
     CURL* h;
 };
 
-static std::vector<CachedHandle>& handle_cache(void) {
-    static std::vector<CachedHandle> c;
+// A handle belongs to the thread that opened it: one CURL* cannot be used by two
+// threads at once, and that is exactly the collision a background transfer
+// creates, because the transfer runs on the site the pane behind it is listing.
+// So the cache is per thread. The worker gets its own connection - it loses the
+// login reuse the cache exists for, which is the price of not sharing, and it
+// still reuses that connection across the files of one tree. The destructor is
+// what returns a worker's handle to curl when its thread ends; nothing on the UI
+// thread can reach it, and that is deliberate: net_forget() on the site list
+// must not clean up a handle a transfer is still writing through.
+struct HandleCache {
+    std::vector<CachedHandle> entries;
+    ~HandleCache() { for (CachedHandle& e : entries) curl_easy_cleanup(e.h); }
+};
+
+static HandleCache& handle_cache(void) {
+    static thread_local HandleCache c;
     return c;
 }
 
@@ -751,40 +771,37 @@ void net_what(char* out, size_t n) {
 
 void net_forget(const NetSite* site) {
     std::string key = site ? net_site_root(*site) : std::string();
-    std::vector<CachedHandle>& c = handle_cache();
-    for (size_t i = 0; i < c.size();) {
-        if (key.empty() || c[i].key == key) {
-            curl_easy_cleanup(c[i].h);
-            c.erase(c.begin() + (long)i);
+    HandleCache& c = handle_cache();
+    for (size_t i = 0; i < c.entries.size();) {
+        if (key.empty() || c.entries[i].key == key) {
+            curl_easy_cleanup(c.entries[i].h);
+            c.entries.erase(c.entries.begin() + (long)i);
         } else {
             i++;
         }
     }
 }
 
+// Only safe once every transfer thread has been joined: this closes the
+// connections and then the library they belong to.
 void net_shutdown(void) {
     net_forget(nullptr);
-    if (g_curl_global_done) {
-        curl_global_cleanup();
-        g_curl_global_done = false;
-    }
+    std::call_once(g_curl_global_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    curl_global_cleanup();
 }
 
-// One handle per site, reused across navigations. That is the whole reason this
-// backend links a library: the second listing into the same server does not log
-// in again or redo the TLS handshake.
+// One handle per site per thread, reused across navigations. That is the whole
+// reason this backend links a library: the second listing into the same server
+// does not log in again or redo the TLS handshake.
 static CURL* handle_for(const NetSite& site) {
-    if (!g_curl_global_done) {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_curl_global_done = true;
-    }
+    std::call_once(g_curl_global_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
     std::string key = net_site_root(site);
-    std::vector<CachedHandle>& c = handle_cache();
-    for (CachedHandle& e : c)
+    HandleCache& c = handle_cache();
+    for (CachedHandle& e : c.entries)
         if (e.key == key) return e.h;
     CURL* h = curl_easy_init();
     if (!h) return nullptr;
-    c.push_back({ key, h });
+    c.entries.push_back({ key, h });
     return h;
 }
 

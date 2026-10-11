@@ -2,7 +2,10 @@
 #define PANES_H
 
 #include <stdbool.h>
+#include <atomic>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <SDL3/SDL.h>
 #include "filesystem.h"
@@ -142,6 +145,39 @@ struct OpPlan {
     std::string remote;          // non-empty: the sources are entries on this site
     std::string remote_prefix;   // level inside that site, when the pane was deeper
     bool is_move = false;
+};
+
+// A copy or move across a network that runs on its own thread instead of
+// blocking the panes. The counters are written by the worker and read by the
+// frame that draws the transfer list, so they are atomic. The record itself
+// belongs to the UI thread, which creates it, starts the worker, draws it and
+// joins the worker before erasing the record - a std::thread that is still
+// joinable when it is destroyed ends the process. `error` and `ok_names` are the
+// worker's: it writes them and then stores the finishing state, and a frame that
+// reads that state is allowed to read them.
+struct BgTransfer {
+    enum State { BG_RUNNING = 0, BG_DONE, BG_FAILED, BG_ABORTED };
+
+    std::atomic<int>       state;       // one of State
+    std::atomic<bool>      abort;       // the UI's request; the worker polls it
+    std::atomic<bool>      settled;     // the finish has been handled once already
+    std::atomic<bool>      dismiss;     // the row's button: retire it next frame
+    std::atomic<long long> done;        // bytes moved so far
+    std::atomic<long long> total;       // bytes the transfer knows it owes
+    std::atomic<int>       files_done;
+    std::atomic<int>       files_total;
+
+    // Fixed before the worker starts; the worker only reads them.
+    bool   is_move;
+    bool   download;        // true: server -> disk, false: disk -> server
+    double t0;              // SDL_GetTicks() seconds at the start
+    std::string src, dst;
+
+    // The worker's answer. Read once state is no longer BG_RUNNING.
+    std::string error;
+    int ok_names = 0;
+
+    std::thread worker;
 };
 
 // Pending file operation, shown as a dialog with an editable destination
@@ -296,6 +332,27 @@ public:
     // poll the progress callback, which returns false while this is set, so the
     // stop lands between files rather than in the middle of one.
     bool      prog_abort;
+    // The transfer the progress dialog is watching. A copy that crosses a network
+    // runs on its own thread whether or not the user asked for the background, so
+    // the dialog is a window onto a row in `transfers` rather than the thing
+    // driving the copy - which is what lets it be handed over mid-file. Null for
+    // an operation running on this thread, where there is nothing to hand over.
+    BgTransfer* prog_watch;
+    // The progress dialog's "Run in background" button: stop watching, leave the
+    // transfer running, and let the list under the panes carry it from here.
+    bool      prog_handoff;
+
+    // Copy/move transfers running on their own thread instead of blocking the
+    // panes, oldest first. The frame draws them; bg_reap() settles the finished
+    // ones (join, refresh, status line) and retires the ones the user dismissed.
+    // app_panes_free() asks the running ones to stop and joins them before the
+    // app goes away.
+    std::vector<std::unique_ptr<BgTransfer>> transfers;
+    // The op dialog's "Run in background" request. It lives here rather than in
+    // the plan because it has to survive the overwrite confirm, and only
+    // run_op_plan() knows whether the plan crosses a network at all - which is
+    // the only kind of transfer that can be handed to a thread.
+    bool      op_run_bg;
 
     // Deferred actions: menu/context-menu/dialog-button triggers fire inside
     // the ImGui frame, but a long operation pumps its own progress UI, and that

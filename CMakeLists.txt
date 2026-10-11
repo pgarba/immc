@@ -17,6 +17,10 @@ find_package(SDL3 REQUIRED)
 # OpenGL
 find_package(OpenGL REQUIRED)
 
+# Background transfers run on their own thread, so the app needs a real pthread
+# link rather than whatever the SDL3 dependency happens to pull in.
+find_package(Threads REQUIRED)
+
 # ImGui from local extern_dont_commit
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/extern_dont_commit/imgui)
 add_library(imgui STATIC
@@ -72,7 +76,7 @@ endif()
 
 # Build the application
 add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
-target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS})
+target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 
 # Logic tests. tests/test_panes.cpp includes src/panes.cpp so the file-static
@@ -80,7 +84,7 @@ target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 # checked without a display.
 enable_testing()
 add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
-target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS})
+target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 add_test(NAME panes COMMAND test-panes)
 

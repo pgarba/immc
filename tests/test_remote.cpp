@@ -16,10 +16,12 @@
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <atomic>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
@@ -836,6 +838,47 @@ static void test_ftp_transfer(FtpFixture& fx) {
 
 // The default is that a certificate has to check out. This is the one place the
 // rule is proved: the same server, the same site, one flag apart.
+// A background transfer runs on its own thread while the panes keep browsing the
+// same site, and one curl handle cannot serve two threads at once - so the handle
+// cache is per thread. That is asserted in the source, but the assertion is only
+// worth anything if something exercises the overlap: three threads list and
+// download from one site at the same time, and a handle shared between them
+// answers one of them with another's bytes, or with nothing at all. Correct
+// answers out of all three is the check.
+static void test_ftp_concurrent(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    const int kThreads = 3;
+    const int kRounds = 6;
+    std::string out = fx.root + "-concurrent";
+    sh("rm -rf " + q(out) + " && mkdir -p " + q(out));
+
+    std::atomic<int> listed{0};
+    std::atomic<int> got{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; t++) {
+        threads.push_back(std::thread([&, t] {
+            // Each thread works from its own copy of the site: a pane hands a
+            // background transfer a copy for the same reason, because the saved
+            // sites can be edited while the thread is still running.
+            NetSite mine = site;
+            std::string local = out + "/dl" + std::to_string(t);
+            for (int i = 0; i < kRounds; i++) {
+                std::vector<FileEntry> rows;
+                std::string err;
+                if (net_list(site, "/", &rows, &err) && find_row(rows, "hello.txt"))
+                    listed++;
+                if (net_download(mine, "/hello.txt", local.c_str(), nullptr, nullptr, &err) &&
+                    read_file(local) == "hello world\n")
+                    got++;
+            }
+        }));
+    }
+    for (std::thread& th : threads) th.join();
+    CHECK(listed.load() == kThreads * kRounds);
+    CHECK(got.load() == kThreads * kRounds);
+    sh("rm -rf " + q(out));
+}
+
 static void test_ftp_tls(FtpFixture& fx) {
     NetSite site = fixture_site(fx);
     std::string err;
@@ -947,6 +990,7 @@ int main(void) {
         test_ftp_escaped_names(fx);
         test_ftp_bad_login(fx);
         test_ftp_transfer(fx);
+        test_ftp_concurrent(fx);
         fx.stop();
     }
 

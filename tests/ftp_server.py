@@ -8,9 +8,12 @@ carries the few hundred lines of socket code that speak enough of RFC 959 for
 libcurl: USER/PASS, PASV, CWD/PWD, LIST, MLSD, MLST, RETR, STOR, MKD, RMD, DELE,
 RNFR/RNTO, SIZE, MDTM and SITE CHMOD.
 
-It is deliberately narrow. Passive mode only, one control connection at a time,
-one user, and every path confined to --root. It is a test fixture, not a server,
-and it says so rather than pretending otherwise.
+It is deliberately narrow. Passive mode only, one user, and every path confined
+to --root. Sessions run on their own thread, because the application being tested
+keeps browsing a site while a transfer of its own is running against the same
+server, and a fixture that served one session at a time would hide exactly the
+overlap that matters. It is a test fixture, not a server, and it says so rather
+than pretending otherwise.
 
 The first thing it does is print one JSON line naming the port it bound, so the
 test can start it and learn where it landed.
@@ -26,6 +29,7 @@ import socket
 import ssl
 import stat
 import sys
+import threading
 import time
 
 # Set FTP_SERVER_LOG=1 to watch the protocol on stderr; the fixture is otherwise
@@ -438,17 +442,23 @@ def main():
 
     print(json.dumps({"port": port, "root": root}), flush=True)
 
+    def session(ctl):
+        try:
+            Session(ctl, root, args.user, args.password, tls_ctx).serve()
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                ctl.close()
+
     try:
         while True:
             ctl, _ = srv.accept()
             ctl.settimeout(30)
-            try:
-                Session(ctl, root, args.user, args.password, tls_ctx).serve()
-            except (OSError, ssl.SSLError):
-                pass
-            finally:
-                with contextlib.suppress(OSError):
-                    ctl.close()
+            # One thread per session. The client under test opens a second control
+            # connection while a transfer is already running, and a session that
+            # held the accept loop would make that overlap untestable.
+            threading.Thread(target=session, args=(ctl,), daemon=True).start()
     except KeyboardInterrupt:
         pass
     finally:

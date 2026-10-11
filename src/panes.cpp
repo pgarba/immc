@@ -160,6 +160,9 @@ AppPanes::AppPanes() {
     prog_t0 = 0;
     prog_last_pump = 0;
     prog_abort = false;
+    prog_watch = nullptr;
+    prog_handoff = false;
+    op_run_bg = false;
     pending_op = DEFER_NONE;
     pending_confirm_yes = false;
     sdl_window = nullptr;
@@ -1651,6 +1654,15 @@ static void render_progress_dialog(AppPanes* app) {
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
     ImGui::Text("%s", app->prog_src);
+    // A transfer that is running on its own thread reports through its row. The
+    // dialog reads the same atomics the list under the panes reads, which is why
+    // one of them can stop reading without disturbing the other.
+    if (app->prog_watch) {
+        app->prog_done        = app->prog_watch->done.load();
+        app->prog_total       = app->prog_watch->total.load();
+        app->prog_files_done  = app->prog_watch->files_done.load();
+        app->prog_files_total = app->prog_watch->files_total.load();
+    }
     if (!app->prog_is_delete) {
         ImGui::SameLine();
         ImGui::TextUnformatted("->");
@@ -1688,12 +1700,29 @@ static void render_progress_dialog(AppPanes* app) {
     // unwinds after the file it is on rather than mid-write. The pumped frame
     // loop keeps redrawing this dialog, so the button is live throughout.
     ImGui::Spacing();
-    if (ImGui::Button("Abort")) app->prog_abort = true;
-    ImGui::SameLine();
-    if (app->prog_abort)
+    if (ImGui::Button("Abort")) {
+        app->prog_abort = true;
+        if (app->prog_watch) app->prog_watch->abort = true;
+    }
+    // Only a transfer that is already on a thread of its own can be handed over,
+    // and the handover asks nothing of the transfer: the row under the panes has
+    // the numbers, the Abort button and the finish already. That is why this can
+    // be pressed at any moment, in the middle of a file, and why it is not
+    // offered for an operation that is running on this thread - there the dialog
+    // is not watching the copy, it is the copy.
+    if (app->prog_watch) {
+        ImGui::SameLine();
+        if (ImGui::Button("Run in background")) app->prog_handoff = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The transfer goes on, and the list under the panes carries it.\n"
+                              "Nothing about the transfer itself changes.");
+    }
+    if (app->prog_abort) {
+        ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "stopping after the current file...");
-    else
+    } else {
         ImGui::TextDisabled("Abort stops the operation. What is already transferred stays.");
+    }
     ImGui::End();
 }
 
@@ -1751,6 +1780,40 @@ static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_
     app->prog_files_total = 0;
     app->prog_t0 = SDL_GetTicks() / 1000.0;
     app->prog_last_pump = 0.0;
+}
+
+// A copy that crosses a network is on its own thread whether or not the user
+// asked for the background, so the foreground form of it is a window onto that
+// thread rather than a copy running inside the UI. That is the whole reason the
+// progress dialog can offer "Run in background" at any moment, in the middle of
+// a file: handing over changes who is watching, not what is running.
+static void prog_begin_watch(AppPanes* app, BgTransfer* t) {
+    prog_begin(app, t->src.c_str(), t->dst.c_str(), t->is_move);
+    app->prog_watch   = t;
+    app->prog_handoff = false;
+    app->prog_t0      = t->t0;   // the transfer started before this dialog did
+}
+
+// One frame of watching: draw, breathe, and say whether the watching goes on.
+// Kept apart from the loop so the handover can be checked without a display.
+static bool watch_transfer_tick(AppPanes* app, BgTransfer* t) {
+    pump_progress_ui(app);
+    SDL_Delay(30);
+    if (app->quit_request || app->prog_handoff) return false;
+    return t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
+}
+
+// Watch it here, in this dialog, until it is over or the user decides otherwise.
+// Either way the row stays in the transfer list: it has been the transfer's
+// report all along, and it goes on being one after the dialog closes.
+static void watch_remote_transfer(AppPanes* app, BgTransfer* t) {
+    prog_begin_watch(app, t);
+    while (watch_transfer_tick(app, t)) {}
+    app->prog_active = false;
+    app->prog_watch  = nullptr;
+    if (app->prog_handoff)
+        snprintf(app->status_msg, sizeof(app->status_msg), "Running in the background: %s -> %s",
+                 t->src.c_str(), t->dst.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,6 +2230,17 @@ static const char* op_button_label(AppOp op) {
 // directory that has to be visible while typing it. Copy and move add the
 // destination as an editable path, which is what makes renaming or redirecting a
 // copy possible instead of an all-or-nothing drop into the other pane.
+// Only a transfer that crosses a network can be handed to a thread, so the
+// dialog only offers the choice for one. The destination may still be sitting in
+// the field rather than in the plan, so both are asked. A local copy is bounded by
+// the disk, and a second thread writing into the same tree would buy nothing but
+// a race.
+static bool plan_crosses_network(const OpPlan& plan, const char* typed) {
+    if (!plan.remote.empty()) return true;
+    if (net_is_remote(plan.dst_dir.c_str())) return true;
+    return typed && net_is_remote(typed);
+}
+
 static void render_op_dialog(AppPanes* app) {
     if (app->op == OP_NONE) return;
     ImGuiIO& io = ImGui::GetIO();
@@ -2237,9 +2311,24 @@ static void render_op_dialog(AppPanes* app) {
     // ImGui frames, which cannot happen while this dialog's frame is open.
     if (ImGui::Button(op_button_label(app->op))) app->pending_op = DEFER_OP_COMMIT;
     ImGui::SameLine();
+    // The same operation, handed to a thread instead of run in front of the
+    // panes. It commits exactly like the button above it and records the request
+    // with the commit, because the choice has to survive the overwrite confirm
+    // that may follow - which is why it lands in app->op_run_bg and not in a local.
+    const bool network = copy_move && plan_crosses_network(plan, app->op_name);
+    if (network) {
+        if (ImGui::Button("Run in background")) {
+            app->op_run_bg = true;
+            app->pending_op = DEFER_OP_COMMIT;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The panes stay usable. The transfer is listed under them.");
+        ImGui::SameLine();
+    }
     if (ImGui::Button("Cancel")) app_panes_cancel_op(app);
     ImGui::SameLine();
-    text_wrap_disabled("Enter runs it, Esc cancels.");
+    text_wrap_disabled("Enter runs it, Esc cancels.%s",
+                       network ? "  Shift+Enter runs it in the background." : "");
     if (!open) app_panes_cancel_op(app);
     ImGui::End();
 }
@@ -2465,11 +2554,169 @@ static void refresh_for_destination(AppPanes* app, const std::string& dst) {
     }
 }
 
-// One copy or move that crosses the network: a download into a local pane, or an
-// upload into a remote one. A move is a transfer and then a delete of the source,
-// which is the only way a move across a network exists, and it happens only once
-// the copy is known good. plan_from_pane() already refuses site to site.
-static void run_remote_plan(AppPanes* app, const OpPlan& plan) {
+// ---------------------------------------------------------------------------
+// Background transfers. A copy or move that crosses a network is the one
+// operation that can run for minutes, and the only one where a thread buys
+// something: the panes stay usable while it goes, and the list under them says
+// what the thread is doing. Everything else stays synchronous - a local copy is
+// bounded by the disk, and two threads writing into one directory tree is a new
+// problem bought for no gain.
+//
+// The rule that keeps this safe is ownership. The worker gets a copy of the site
+// and a copy of the plan, reports into atomics, and never touches AppPanes, which
+// the UI thread is drawing with at the same moment. libcurl is safe for the same
+// reason it is safe in the panes: the transfer thread holds its own handle, and
+// the handle cache is per thread (see remote.cpp).
+// ---------------------------------------------------------------------------
+
+// The worker's progress callback. Same contract as copy_progress_cb - the numbers
+// up, false to stop - but it publishes instead of drawing. This thread has no
+// business inside ImGui.
+static bool bg_progress_cb(long long done, long long total, int fd, int ft, void* user) {
+    BgTransfer* t = (BgTransfer*)user;
+    t->done        = done;
+    t->total       = total;
+    t->files_done  = fd;
+    t->files_total = ft;
+    // Quitting asks every transfer to stop (app_panes_free), so the request
+    // reaches the transport through the same flag the Abort button sets.
+    return !t->abort.load();
+}
+
+// Seconds as a clock. An ETA of "3720s" is a number the user has to do
+// arithmetic on; "1h02m" is not.
+static void fmt_secs(double s, char* out, size_t n) {
+    if (!(s > 0.0)) s = 0.0;            // also catches a NaN rate from a tiny transfer
+    long t = (long)(s + 0.5);
+    if (t < 60)        snprintf(out, n, "%lds", t);
+    else if (t < 3600) snprintf(out, n, "%ldm%02lds", t / 60, t % 60);
+    else               snprintf(out, n, "%ldh%02ldm", t / 3600, (t % 3600) / 60);
+}
+
+static const char* bg_state_name(int st) {
+    switch (st) {
+    case BgTransfer::BG_DONE:    return "done";
+    case BgTransfer::BG_FAILED:  return "failed";
+    case BgTransfer::BG_ABORTED: return "stopped";
+    default:                     return "running";
+    }
+}
+
+// The word or number drawn on the bar. A running row says so by moving, and what
+// a bar cannot say by itself is how far along it is, so that is the number that
+// goes on it. A row that has finished keeps its word instead: "done" is the news,
+// "100%" is not. A running row that has no total yet - the listing has not come
+// back, or the server would not say the size - has no percentage to show, so it
+// falls back to the word.
+static void bg_overlay(int st, long long done, long long total, char* out, size_t n) {
+    if (st == BgTransfer::BG_RUNNING && total > 0) {
+        int pct = (int)((double)done / (double)total * 100.0 + 0.5);
+        if (pct > 100) pct = 100;      // a total that grew mid-transfer is not the row's problem
+        snprintf(out, n, "%d%%", pct);
+        return;
+    }
+    snprintf(out, n, "%s", bg_state_name(st));
+}
+
+// One line of numbers for the transfer list: how much has moved, how much is
+// left, how fast, and when it will be over. Kept apart from the drawing so the
+// arithmetic can be checked without a display, and so a transfer that has not
+// reported a size yet says so instead of dividing by zero.
+static void bg_line(const BgTransfer* t, char* out, size_t n) {
+    long long done  = t->done.load();
+    long long total = t->total.load();
+    double now     = SDL_GetTicks() / 1000.0;
+    double elapsed = now - t->t0;
+    if (elapsed < 0.0) elapsed = 0.0;
+    double rate = elapsed > 0.05 ? (double)done / elapsed : 0.0;
+
+    char done_s[32], total_s[32], left_s[32], rate_s[32];
+    human_size((off_t)done, done_s, sizeof(done_s));
+    human_size((off_t)total, total_s, sizeof(total_s));
+    human_size((off_t)(total > done ? total - done : 0), left_s, sizeof(left_s));
+    human_size((off_t)rate, rate_s, sizeof(rate_s));
+
+    // A finished row has no rate to speak of - the average over a transfer that
+    // is over is not what anyone wants to read - so it reports what it moved and
+    // how long that took.
+    if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) {
+        snprintf(out, n, "%s in %.0fs", done_s, elapsed);
+        return;
+    }
+    if (total <= 0) {
+        // A tree whose sizes the server has not given yet. Saying "unknown" is
+        // better than a bar that never moves.
+        snprintf(out, n, "%s so far  %s/s  size not known yet", done_s, rate_s);
+        return;
+    }
+    char eta[32] = "";
+    if (rate > 1.0) fmt_secs((double)(total - done) / rate, eta, sizeof(eta));
+    snprintf(out, n, "%s of %s   %s left   %s/s%s%s", done_s, total_s, left_s, rate_s,
+             eta[0] ? "   eta " : "", eta);
+}
+
+// The worker's half of a copy or move that crosses the network: the same transfer
+// the dialog used to drive on the UI thread, the same rule that a move across a
+// network is a transfer and then a delete of the source, and the same order - the
+// source is only removed once the copy is known good. What is different is that it
+// may not touch AppPanes. The site arrives by value for the same reason: the user
+// can edit or remove the saved site mid-transfer, and the transfer keeps the login
+// it started with.
+static void bg_run_remote(BgTransfer* t, const NetSite& site, const OpPlan& plan) {
+    // Pure string work, no globals, so it is safe to do here rather than hand the
+    // result over with the plan.
+    std::string droot, drpath;
+    net_split_virtual(plan.dst_dir.c_str(), &droot, &drpath);
+
+    std::string err;
+    int ok = 0;
+    for (size_t i = 0; i < plan.names.size(); i++) {
+        std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
+        bool r;
+        if (t->download) {
+            std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
+            std::string local = plan.dst_dir + "/" + base;
+            r = net_download_tree(site, src, local.c_str(), bg_progress_cb, t, &err);
+            if (r && plan.is_move) net_remove_tree(site, src, bg_progress_cb, t, &err);
+        } else {
+            std::string local = plan.src_dir + "/" + plan.names[i];
+            std::string dst = drpath.empty() ? base : drpath + "/" + base;
+            r = net_upload_tree(site, local.c_str(), dst, bg_progress_cb, t, &err);
+            if (r && plan.is_move) fs_delete_entry_progress(local.c_str(), bg_progress_cb, t);
+        }
+        if (r) ok++;
+        if (t->abort) break;
+    }
+    t->ok_names = ok;
+    if (!ok)
+        t->error = t->abort.load() ? "stopped before anything transferred"
+                                   : (err.empty() ? std::string("transfer failed") : err);
+    // The store is what publishes ok_names and error: a frame that reads the
+    // state with acquire sees everything written before it.
+    int st = t->abort.load() ? BgTransfer::BG_ABORTED
+                             : (ok ? BgTransfer::BG_DONE : BgTransfer::BG_FAILED);
+    t->state.store(st, std::memory_order_release);
+}
+
+// Join and drop the oldest finished row, so a long session does not fill the
+// strip with history. A running transfer is never taken out from under the thread
+// reporting into it, so if every row is running this gives up and the new
+// transfer simply waits for a slot.
+static void bg_retire_oldest_finished(AppPanes* app) {
+    for (size_t i = 0; i < app->transfers.size(); i++) {
+        BgTransfer* old = app->transfers[i].get();
+        if (old->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) continue;
+        if (old->worker.joinable()) old->worker.join();
+        app->transfers.erase(app->transfers.begin() + (long)i);
+        return;
+    }
+}
+
+// Hand the plan to a thread. The plan arrives by value because run_op_plan()
+// clears app->op_plan the moment this returns, and the sources have to outlive
+// that. The row is returned so the caller can watch it: staying in the progress
+// dialog is a choice about who is watching, not about where the copy runs.
+static BgTransfer* bg_start_remote_plan(AppPanes* app, const OpPlan& plan) {
     std::string droot, drpath;
     bool dst_remote = net_split_virtual(plan.dst_dir.c_str(), &droot, &drpath);
     const NetSite* dsite = dst_remote ? net_site_for(droot) : nullptr;
@@ -2478,41 +2725,177 @@ static void run_remote_plan(AppPanes* app, const OpPlan& plan) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "No login for %s: Ctrl+F edits the saved sites, Ctrl+N connects again",
                  dst_remote ? droot.c_str() : plan.remote.c_str());
-        return;
+        return nullptr;
+    }
+    // plan_from_pane() refuses site to site, so exactly one side is remote.
+    const bool download = ssite != nullptr;
+    const NetSite& site = download ? *ssite : *dsite;
+
+    while (app->transfers.size() >= 12) {
+        size_t before = app->transfers.size();
+        bg_retire_oldest_finished(app);
+        if (app->transfers.size() == before) break;
     }
 
-    std::string err;
-    prog_begin(app, plan.src_dir.c_str(), plan.dst_dir.c_str(), plan.is_move);
-    int ok = 0;
-    for (size_t i = 0; i < plan.names.size(); i++) {
-        std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
-        bool r;
-        if (ssite) {
-            std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
-            std::string local = plan.dst_dir + "/" + base;
-            r = net_download_tree(*ssite, src, local.c_str(), copy_progress_cb, app, &err);
-            if (r && plan.is_move) net_remove_tree(*ssite, src, copy_progress_cb, app, &err);
-        } else {
-            std::string local = plan.src_dir + "/" + plan.names[i];
-            std::string dst = drpath.empty() ? base : drpath + "/" + base;
-            r = net_upload_tree(*dsite, local.c_str(), dst, copy_progress_cb, app, &err);
-            if (r && plan.is_move) fs_delete_entry_progress(local.c_str(), copy_progress_cb, app);
+    std::unique_ptr<BgTransfer> up = std::make_unique<BgTransfer>();
+    BgTransfer* t = up.get();
+    t->state  = BgTransfer::BG_RUNNING;
+    t->abort  = false;
+    t->settled = false;
+    t->dismiss = false;
+    t->done   = 0;
+    t->total  = 0;
+    t->files_done = 0;
+    t->files_total = 0;
+    t->is_move  = plan.is_move;
+    t->download = download;
+    t->t0       = SDL_GetTicks() / 1000.0;
+    t->src      = plan.remote.empty()
+                      ? plan.src_dir
+                      : net_virtual_path(plan.remote, plan.remote_prefix);
+    t->dst      = plan.dst_dir;
+    // Everything above is fixed before the thread starts, so the worker never
+    // sees a half-built record.
+    t->worker = std::thread(bg_run_remote, t, site, plan);
+    app->transfers.push_back(std::move(up));
+    return t;
+}
+
+// Between frames, before anything is drawn. A transfer that has finished gets its
+// destination refreshed and its result in the status bar exactly once; a row the
+// user dismissed is joined and removed. The join happens here rather than in the
+// widget so that no button press can wait on a thread inside an ImGui frame - the
+// thread is already finished by then, but the ordering is the part that matters.
+static void bg_reap(AppPanes* app) {
+    for (size_t i = 0; i < app->transfers.size();) {
+        BgTransfer* t = app->transfers[i].get();
+        bool running = t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
+        if (!running && !t->settled.exchange(true)) {
+            if (t->ok_names)
+                snprintf(app->status_msg, sizeof(app->status_msg),
+                         "%s %d item%s to %s%s", t->is_move ? "Moved" : "Copied", t->ok_names,
+                         t->ok_names == 1 ? "" : "s", t->dst.c_str(),
+                         t->abort.load() ? " (aborted)" : "");
+            else
+                snprintf(app->status_msg, sizeof(app->status_msg), "%s failed: %s",
+                         t->is_move ? "Move" : "Copy", t->error.c_str());
+            refresh_for_destination(app, t->dst);
         }
-        if (r) ok++;
-        if (app->quit_request || app->prog_abort) break;
+        if (!running && t->dismiss.load()) {
+            if (t->worker.joinable()) t->worker.join();
+            app->transfers.erase(app->transfers.begin() + (long)i);
+            continue;
+        }
+        i++;
     }
-    app->prog_active = false;
-    if (app->prog_abort && !ok)
-        snprintf(app->status_msg, sizeof(app->status_msg), "Stopped: nothing transferred");
-    else if (ok)
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 "%s %d item%s to %s%s",
-                 plan.is_move ? "Moved" : "Copied", ok, ok == 1 ? "" : "s", plan.dst_dir.c_str(),
-                 app->prog_abort ? " (aborted)" : "");
-    else
-        snprintf(app->status_msg, sizeof(app->status_msg),
-                 plan.is_move ? "Move failed: %s" : "Copy failed: %s", err.c_str());
-    refresh_for_destination(app, plan.dst_dir);
+}
+
+// Ask every running transfer to stop and wait for it to finish the file it is on.
+// This is what Quit does, and it is the same promise the Abort button makes: the
+// stop lands between files, never in the middle of one, because a half-written
+// file is worse than no file.
+static void bg_stop_all(AppPanes* app) {
+    for (std::unique_ptr<BgTransfer>& t : app->transfers) t->abort = true;
+    for (std::unique_ptr<BgTransfer>& t : app->transfers) {
+        if (t->worker.joinable()) t->worker.join();
+    }
+    app->transfers.clear();
+}
+
+// How much room the transfer strip needs, so the panes can be given what is left
+// of the window before the strip is drawn. One row per transfer plus a header, at
+// most seven rows before the list scrolls.
+static float bg_strip_height(const AppPanes* app, float frame) {
+    if (app->transfers.empty()) return 0.0f;
+    int rows = 1 + (int)app->transfers.size();
+    if (rows > 7) rows = 7;
+    return 6.0f + (float)rows * frame;
+}
+
+// The transfer list, between the panes and the command line. It claims no space
+// while it is empty, so a session that never touches the network never sees it.
+static void render_transfers(AppPanes* app, float h) {
+    if (app->transfers.empty()) return;
+    ImGui::Spacing();
+    ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
+    if (app->transfers.size() > 6) flags |= ImGuiTableFlags_ScrollY;
+    if (!ImGui::BeginTable("bg_transfers", 5, flags, ImVec2(0, h - 6.0f))) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 40.0f);   // get / put
+    ImGui::TableSetupColumn("Transfer", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 150.0f);  // the bar
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 330.0f);  // the numbers
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 80.0f);   // the button
+
+    // Header: how many, and one place to clear the finished rows, which
+    // otherwise sit there until the session ends.
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%d transfer%s", (int)app->transfers.size(),
+                        app->transfers.size() == 1 ? "" : "s");
+    ImGui::TableNextColumn();
+    bool any_finished = false;
+    for (const std::unique_ptr<BgTransfer>& t : app->transfers)
+        if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) any_finished = true;
+    if (any_finished && ImGui::SmallButton("clear finished"))
+        for (std::unique_ptr<BgTransfer>& t : app->transfers)
+            if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) t->dismiss = true;
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+
+    for (std::unique_ptr<BgTransfer>& up : app->transfers) {
+        BgTransfer* t = up.get();
+        int st = t->state.load(std::memory_order_acquire);
+        bool running = st == BgTransfer::BG_RUNNING;
+        // The rows all carry the same button labels, so the pointer is the id.
+        ImGui::PushID(t);
+        ImGui::TableNextRow();
+
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", t->download ? "get" : "put");
+
+        ImGui::TableNextColumn();
+        // The name that is moving, not the whole path: the path is what the row
+        // is too narrow for, and the tooltip carries it.
+        std::string base = t->src;
+        size_t slash = base.find_last_of('/');
+        if (slash != std::string::npos && slash + 1 < base.size()) base = base.substr(slash + 1);
+        std::string what = base + (t->is_move ? " (move)" : "");
+        ImGui::TextUnformatted(elide_middle(what.c_str(), ImGui::GetContentRegionAvail().x).c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n-> %s\n%s\nfiles: %d of %d", t->src.c_str(), t->dst.c_str(),
+                              bg_state_name(st), t->files_done.load(), t->files_total.load());
+
+        ImGui::TableNextColumn();
+        long long done = t->done.load(), total = t->total.load();
+        float frac = total > 0 ? (float)((double)done / (double)total)
+                               : (running ? 0.0f : 1.0f);
+        char overlay[32];
+        bg_overlay(st, done, total, overlay, sizeof(overlay));
+        ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
+
+        ImGui::TableNextColumn();
+        char line[256];
+        bg_line(t, line, sizeof(line));
+        // A row that ended badly is read for the reason, not for its averages.
+        if (!running && !t->error.empty())
+            text_wrap_colored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", t->error.c_str());
+        else
+            ImGui::TextUnformatted(line);
+
+        ImGui::TableNextColumn();
+        // Abort is a request, not a stop: the transport polls the progress
+        // callback, which returns false while this is set, so the transfer
+        // unwinds after the file it is on. "clear" only appears once it has.
+        if (running) {
+            if (ImGui::SmallButton(t->abort.load() ? "stopping" : "Abort")) t->abort = true;
+        } else {
+            if (ImGui::SmallButton("clear")) t->dismiss = true;
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
 }
 
 // The one runner for copy, move and copying out of an archive. The dialog, the
@@ -2521,6 +2904,10 @@ static void run_remote_plan(AppPanes* app, const OpPlan& plan) {
 static void run_op_plan(AppPanes* app) {
     OpPlan plan = app->op_plan;
     app->op_plan = OpPlan();
+    // Taken here and cleared here, so the choice cannot leak into the next
+    // operation whatever kind of plan this one turned out to be.
+    bool run_bg = app->op_run_bg;
+    app->op_run_bg = false;
     Pane& active = app->left_focus ? app->left : app->right;
 
     // Remember the slot being vacated so the cursor can land on the entry that
@@ -2550,7 +2937,20 @@ static void run_op_plan(AppPanes* app) {
     }
 
     if (!plan.remote.empty() || net_is_remote(plan.dst_dir.c_str())) {
-        run_remote_plan(app, plan);
+        // The one operation worth a thread, and worth it either way: a transfer
+        // over a network can run for minutes, and the panes do not have to be
+        // frozen while it does. Running it on the thread even when the user chose
+        // to wait is what makes "Run in background" a decision that can still be
+        // taken halfway through, instead of one that has to be taken in advance.
+        BgTransfer* t = bg_start_remote_plan(app, plan);
+        if (!t) return;
+        if (run_bg)
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "%s %s in the background: %s -> %s",
+                     plan.is_move ? "Moving" : "Copying",
+                     plan.names.size() == 1 ? "item" : "items", t->src.c_str(), t->dst.c_str());
+        else
+            watch_remote_transfer(app, t);
         return;
     }
 
@@ -2593,6 +2993,7 @@ static void open_op_dialog(AppPanes* app, const OpPlan& plan) {
     app->op_plan = plan;
     app->op = plan.is_move ? OP_MOVE : OP_COPY;
     app->op_error[0] = '\0';
+    app->op_run_bg = false;
     app->op_focus_request = true;
     // One entry: the field holds the whole target, so changing just the name is
     // one edit. Several, or members coming out of an archive: it holds the
@@ -5099,6 +5500,12 @@ void app_panes_render(AppPanes* app) {
     Pane& left = app->left;
     Pane& right = app->right;
 
+    // A transfer that finished since the last frame gets its panes refreshed and
+    // its result in the status bar here, and a row the user dismissed is joined
+    // and dropped. Between frames, because joining a thread is not something to
+    // do inside one - and because the status line it writes is read just below.
+    bg_reap(app);
+
     // ImGui answers one keyboard-focus request per frame, and the last one
     // submitted wins. The command line at the bottom asks on every frame, so any
     // field that wants the caret has to claim it here and be left alone after.
@@ -5162,12 +5569,16 @@ void app_panes_render(AppPanes* app) {
     // pinned to the window bottom so it can never spill outside.
     const float frame    = ImGui::GetFrameHeightWithSpacing();
     const float bar_h    = frame + 8.0f;  // separator + single-line command bar
+    // The transfer strip, when there are transfers. Its rows come out of the
+    // panes' height, which is why the room is measured before the panes are laid
+    // out and not after they have taken all of it.
+    const float xfer_h   = bg_strip_height(app, frame);
     const float tabbar_h = frame;         // tab strip
     const float title_h  = frame;         // pane path bar
     const float sep_h    = 6.0f;          // separator under the path bar
     const float filt_h   = frame + 2.0f;  // quick filter row, when shown
     const float win_h    = ImGui::GetWindowHeight();
-    const float table_h  = win_h - ImGui::GetCursorPosY() - bar_h;
+    const float table_h  = win_h - ImGui::GetCursorPosY() - bar_h - xfer_h;
     const float base_h   = table_h - tabbar_h - title_h - sep_h;
     const bool  l_filter = left.filter_active || left.filter[0] != '\0' || left.filter_exec_only;
     const bool  r_filter = right.filter_active || right.filter[0] != '\0' || right.filter_exec_only;
@@ -5247,6 +5658,10 @@ void app_panes_render(AppPanes* app) {
         render_file_list(app, right, !left_focus, right_w, right_child_h, "right_pane");
 
     ImGui::EndTable();
+
+    // The transfer list, between the panes and the command line. It draws
+    // nothing at all while no transfer is running or remembered.
+    render_transfers(app, xfer_h);
 
     // Bottom bar: pinned to the window bottom so it can never overflow. The op
     // prompt used to live here as a one-line field; the operations are real
@@ -5452,6 +5867,10 @@ void app_panes_commit_path(AppPanes* app) {
 
 void app_panes_free(AppPanes* app) {
     if (!app) return;
+    // A transfer thread is inside libcurl with a handle of its own. Ask it to
+    // stop, wait for it to finish the file it is on, and only then release the
+    // connections and the library, which is what net_shutdown() does.
+    bg_stop_all(app);
     free_entries(app->left.entries, app->left.entry_count);
     free_entries(app->right.entries, app->right.entry_count);
     // The cached handles belong to this app's site list, and so do the pointers
@@ -5725,6 +6144,7 @@ void app_panes_cancel_op(AppPanes* app) {
     app->op = OP_NONE;
     app->op_name[0] = '\0';
     app->op_error[0] = '\0';
+    app->op_run_bg = false;
     app->op_plan = OpPlan();
 }
 
@@ -5970,8 +6390,16 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // and clipboard in the field keep working - so a stray 'd' cannot delete a
     // file while a destination is being typed.
     if (app->op != OP_NONE) {
-        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) app_panes_commit_op(app);
-        else if (key == SDLK_ESCAPE) app_panes_cancel_op(app);
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+            // Shift+Enter is the keyboard half of the dialog's "Run in
+            // background" button. It is raised for any copy or move and honoured
+            // only if the plan turns out to cross a network: the destination is
+            // not resolved until commit_op() runs, so the key cannot know yet,
+            // and run_op_plan() clears the request either way.
+            if ((mod & SDL_KMOD_SHIFT) && (app->op == OP_COPY || app->op == OP_MOVE))
+                app->op_run_bg = true;
+            app_panes_commit_op(app);
+        } else if (key == SDLK_ESCAPE) app_panes_cancel_op(app);
         return;
     }
 

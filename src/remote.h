@@ -108,8 +108,12 @@ const NetSite* net_sites_find(const std::vector<NetSite>& sites, const std::stri
 bool net_available();
 void net_what(char* out, size_t n);
 // Release the cached handles. Called when a site is edited or removed, so an
-// old login is not reused after its password changed.
+// old login is not reused after its password changed. The cache is per thread:
+// this reaches the calling thread's handles only, and deliberately not the ones
+// a background transfer opened, which its own thread releases when it ends.
 void net_forget(const NetSite* site);   // null = every site
+// Release the connections and then the library. Every transfer thread has to be
+// joined before this runs.
 void net_shutdown();
 
 // List one directory on the server. MLSD is tried first because it is
