@@ -245,6 +245,11 @@ public:
     char remote_quick[512];    // the quick-connect field
     char remote_note[512];     // the last connect or listing failure
     int  remote_edit;          // index into remote_sites being edited; -1 = add one
+    // Which connection the arrow keys have highlighted in the manager. The list
+    // it walks is the saved sites followed by this session's quick connects, so
+    // the site you reached with Ctrl+N a moment ago is one keypress from a
+    // keyboard. -1 = nothing highlighted.
+    int  remote_cursor;
     bool remote_focus_request; // the quick-connect field wants the caret
     bool dirhist_open;    // Alt+Down: visited directories
     bool cmdhist_open;    // Alt+F8: command line history

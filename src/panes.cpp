@@ -99,6 +99,7 @@ AppPanes::AppPanes() {
     remote_quick[0] = '\0';
     remote_note[0] = '\0';
     remote_edit = -1;
+    remote_cursor = -1;
     remote_focus_request = false;
     search_open = false;
     search_pattern[0] = '\0';
@@ -4663,6 +4664,55 @@ static void remote_save_form(AppPanes* app) {
              site.name.empty() ? net_site_root(site).c_str() : site.name.c_str());
 }
 
+// One row of the site manager's list. The saved sites and the connections this
+// session made with Ctrl+N live in two vectors, and only one of them is written
+// back to the sites file, but to the arrow keys they are one list: the site you
+// connected to a moment ago is the one you are most likely to want next.
+struct NetRow {
+    bool adhoc;   // false = saved site at idx, true = this session's quick connect
+    int  idx;
+};
+
+static std::vector<NetRow> net_rows(const AppPanes* app) {
+    std::vector<NetRow> rows;
+    for (int i = 0; i < (int)app->remote_sites.size(); i++) rows.push_back({ false, i });
+    for (int i = 0; i < (int)app->remote_adhoc.size(); i++) rows.push_back({ true, i });
+    return rows;
+}
+
+// Set when the keyboard moved the manager's cursor, so the row it landed on is
+// scrolled into view. The mouse does not set it: a click already put the row
+// under the pointer, and scrolling on a click would move the list the user is
+// looking at.
+static bool g_net_cursor_moved = false;
+
+// Move the manager's cursor over its list of connections. From no cursor at all
+// Down enters at the top and Up at the bottom, which is how the panes' own cursor
+// behaves; past either end the cursor stops instead of wrapping, because a
+// cursor that wraps in a three-row list is a way to lose the row you were on.
+// A key that is not a navigation key leaves the cursor where it is, which is how
+// the caller tells the difference between taking the key and dropping it.
+static int net_cursor_step(int cur, int count, SDL_Keycode key) {
+    if (count <= 0) return -1;
+    switch (key) {
+    case SDLK_DOWN:
+        return cur < 0 ? 0 : (cur + 1 < count ? cur + 1 : count - 1);
+    case SDLK_UP:
+        return cur < 0 ? count - 1 : (cur > 0 ? cur - 1 : 0);
+    case SDLK_HOME:
+        return 0;
+    case SDLK_END:
+        return count - 1;
+    case SDLK_PAGEUP:
+        return (cur < 0 || cur - 10 < 0) ? 0 : cur - 10;
+    case SDLK_PAGEDOWN:
+        return cur < 0 ? (count - 1 < 10 ? count - 1 : 9)
+                       : (cur + 10 < count ? cur + 10 : count - 1);
+    default:
+        return cur;
+    }
+}
+
 static void render_remote_manager(AppPanes* app) {
     if (!app->remote_mgr_open) return;
     ImGuiIO& io = ImGui::GetIO();
@@ -4691,13 +4741,28 @@ static void render_remote_manager(AppPanes* app) {
     ImGui::TextDisabled("%s", what);
     ImGui::Separator();
 
-    if (app->remote_sites.empty())
+    if (app->remote_sites.empty() && app->remote_adhoc.empty())
         ImGui::TextUnformatted("(no saved sites - add one below, or press Ctrl+N to connect once)");
 
+    std::vector<NetRow> rows = net_rows(app);
+    // Removing a site, or a promote moving one out of the session list, can leave
+    // the cursor past the end of a list that got shorter. It lands on the last row
+    // rather than on nothing, so the keyboard never loses its place.
+    if (app->remote_cursor >= (int)rows.size())
+        app->remote_cursor = rows.empty() ? -1 : (int)rows.size() - 1;
+
     int remove_idx = -1;
-    for (int i = 0; i < (int)app->remote_sites.size(); i++) {
-        const NetSite& s = app->remote_sites[i];
-        ImGui::PushID(i);
+    int promote_idx = -1;
+    bool adhoc_header = false;
+    for (int r = 0; r < (int)rows.size(); r++) {
+        const NetRow& row = rows[r];
+        const NetSite& s = row.adhoc ? app->remote_adhoc[row.idx] : app->remote_sites[row.idx];
+        if (row.adhoc && !adhoc_header) {
+            adhoc_header = true;
+            ImGui::TextDisabled("connected this session (not saved)");
+        }
+        ImGui::PushID(row.adhoc ? 1 : 0);
+        ImGui::PushID(row.idx);
         std::string root = net_site_root(s);
         char label[768];
         snprintf(label, sizeof(label), "%s  %s%s", s.name.empty() ? root.c_str() : s.name.c_str(),
@@ -4711,17 +4776,40 @@ static void render_remote_manager(AppPanes* app) {
         float buttons_x = ImGui::GetWindowWidth() - 190.0f;
         float row_w = buttons_x - ImGui::GetCursorPosX();
         if (row_w < 40.0f) row_w = 40.0f;
-        if (ImGui::Selectable(label, app->remote_edit == i, 0, ImVec2(row_w, 0))) {
-            app->remote_edit = i;
+        if (ImGui::Selectable(label, app->remote_cursor == r, 0, ImVec2(row_w, 0))) {
+            app->remote_cursor = r;
+            // A session connection has no saved entry to edit, so the form opens
+            // as a new site carrying its fields, which is how a quick connect
+            // becomes a saved one.
+            app->remote_edit = row.adhoc ? -1 : row.idx;
             remote_form_fill(s);
         }
+        if (g_net_cursor_moved && app->remote_cursor == r)
+            ImGui::SetScrollHereY(0.5f);
         ImGui::SameLine(buttons_x);
-        if (ImGui::SmallButton("connect")) remote_open(app, s);
+        if (ImGui::SmallButton("connect")) { app->remote_cursor = r; remote_open(app, s); }
         ImGui::SameLine();
-        if (ImGui::SmallButton("edit")) { app->remote_edit = i; remote_form_fill(s); }
+        if (ImGui::SmallButton("edit")) {
+            app->remote_cursor = r;
+            app->remote_edit = row.adhoc ? -1 : row.idx;
+            remote_form_fill(s);
+        }
         ImGui::SameLine();
-        if (ImGui::SmallButton("remove")) remove_idx = i;
+        if (row.adhoc) {
+            if (ImGui::SmallButton("save")) promote_idx = row.idx;
+        } else {
+            if (ImGui::SmallButton("remove")) remove_idx = row.idx;
+        }
         ImGui::PopID();
+        ImGui::PopID();
+    }
+    g_net_cursor_moved = false;
+    if (promote_idx >= 0) {
+        // "save" on a session connection fills the form with what was just used
+        // and leaves it as a new site, so the name and the password are chosen in
+        // the fields rather than guessed at by the button.
+        app->remote_edit = -1;
+        remote_form_fill(app->remote_adhoc[promote_idx]);
     }
     if (remove_idx >= 0) {
         net_forget(&app->remote_sites[remove_idx]);
@@ -5910,11 +5998,30 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             return;
         }
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
-            if (g_net_form.open) remote_save_form(app);
-            else if (app->remote_edit >= 0 &&
-                     app->remote_edit < (int)app->remote_sites.size())
-                remote_open(app, app->remote_sites[app->remote_edit]);
+            if (g_net_form.open) { remote_save_form(app); return; }
+            std::vector<NetRow> rows = net_rows(app);
+            int c = app->remote_cursor;
+            if (c < 0 && app->remote_edit >= 0 &&
+                app->remote_edit < (int)app->remote_sites.size())
+                c = app->remote_edit;   // a row picked with the mouse before the cursor moved
+            if (c >= 0 && c < (int)rows.size()) {
+                const NetRow& row = rows[c];
+                remote_open(app, row.adhoc ? app->remote_adhoc[row.idx]
+                                           : app->remote_sites[row.idx]);
+            }
             return;
+        }
+        // The arrows walk the list of connections and Enter opens what they land
+        // on. While the editor is showing the arrows belong to the caret inside a
+        // field, and app_key_is_special has already handed them to ImGui, so this
+        // only ever runs over the bare list.
+        if (!g_net_form.open) {
+            int next = net_cursor_step(app->remote_cursor, (int)net_rows(app).size(), key);
+            if (next != app->remote_cursor) {
+                app->remote_cursor = next;
+                g_net_cursor_moved = true;
+                return;
+            }
         }
         // The manager is a window over the panes, not a widget beside them. Until
         // this returned, Enter on a bare list activated whatever the pane cursor

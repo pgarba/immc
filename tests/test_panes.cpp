@@ -2019,6 +2019,52 @@ static void test_remote_keys(AppPanes* app) {
     CHECK(p.selected == sel);                                  // nor did the arrow walk it
     app_panes_handle_key(app, SDLK_SPACE, SDL_KMOD_NONE);
     CHECK(!p.marked[sel]);                                     // nor did Space mark it
+
+    // The list of connections is walked with the arrows and opened with Enter. It
+    // is the saved sites followed by this session's quick connects, so a site
+    // connected to with Ctrl+N a moment ago is one keypress from a keyboard even
+    // though it was never written to the sites file.
+    app->remote_sites.clear();
+    app->remote_adhoc.clear();
+    NetSite one; one.name = "one";     one.host = "one.example";   one.proto = NET_FTP;
+    NetSite two; two.name = "two";     two.host = "two.example";   two.proto = NET_FTP;
+    NetSite three; three.name = "three"; three.host = "three.example"; three.proto = NET_FTP;
+    app->remote_sites.push_back(one);
+    app->remote_sites.push_back(two);
+    app->remote_adhoc.push_back(three);
+    CHECK(net_rows(app).size() == 3);
+    CHECK(!net_rows(app)[1].adhoc && net_rows(app)[1].idx == 1);
+    CHECK(net_rows(app)[2].adhoc && net_rows(app)[2].idx == 0);
+
+    CHECK(net_cursor_step(-1, 3, SDLK_DOWN) == 0);   // no cursor: Down enters at the top
+    CHECK(net_cursor_step(-1, 3, SDLK_UP) == 2);     // and Up at the bottom
+    CHECK(net_cursor_step(2, 3, SDLK_DOWN) == 2);    // it stops at the ends
+    CHECK(net_cursor_step(0, 3, SDLK_UP) == 0);
+    CHECK(net_cursor_step(1, 3, SDLK_HOME) == 0);
+    CHECK(net_cursor_step(1, 3, SDLK_END) == 2);
+    CHECK(net_cursor_step(0, 30, SDLK_PAGEDOWN) == 10);
+    CHECK(net_cursor_step(29, 30, SDLK_PAGEUP) == 19);
+    CHECK(net_cursor_step(1, 3, SDLK_SPACE) == 1);   // not a navigation key
+    CHECK(net_cursor_step(2, 0, SDLK_DOWN) == -1);   // an empty list has no cursor
+
+    app->remote_cursor = -1;
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(app->remote_cursor == 0);
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(app->remote_cursor == 2);                  // clamped at the end, not wrapped
+    app_panes_handle_key(app, SDLK_UP, SDL_KMOD_NONE);
+    CHECK(app->remote_cursor == 1);
+    CHECK(app->left.selected == sel);                // the pane behind is still untouched
+    // With the editor up the arrows are caret keys, so the cursor holds still.
+    g_net_form.open = true;
+    CHECK(!app_key_is_special(SDLK_DOWN, SDL_KMOD_NONE, app));
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(app->remote_cursor == 1);
+    g_net_form.open = false;
+    app_panes_handle_key(app, SDLK_END, SDL_KMOD_NONE);
+    CHECK(app->remote_cursor == 2);
     // Ctrl+F is the documented way out of the manager, so it is the one key the
     // catch-all deliberately leaves through.
     app_panes_handle_key(app, SDLK_F, SDL_KMOD_CTRL);
@@ -2045,7 +2091,10 @@ static void test_remote_keys(AppPanes* app) {
 
     app->remote_mgr_open = false;
     app->remote_edit = -1;
+    app->remote_cursor = -1;
     app->remote_note[0] = '\0';
+    app->remote_sites.clear();
+    app->remote_adhoc.clear();
 }
 
 // The dialog has to fit the window it is opened in, and a font path has to stay
@@ -2439,7 +2488,8 @@ int main() {
     test_title(&app);
     test_options_config(&app);
     test_options_keys(&app);
-    test_remote_keys(&app);    test_options_dialog_layout(&app);
+    test_remote_keys(&app);
+    test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);
     test_filter_focus_preview(&app, root);
