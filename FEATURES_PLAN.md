@@ -35,7 +35,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
 | K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes; the size rides on `style.FontScaleMain` for every font, because the size passed to `AddFont()` is read once, on the first frame, and never again |
-| L remote sites | done except L3 | `src/remote.{h,cpp}` — libcurl transport, `0600` sites file, MLSD and LIST parsers — and the remote pane mode in `panes.cpp`, compiling **and linking** with and without libcurl. `Ctrl+F` manager, `Ctrl+N` quick connect, `cd ftp://…`, and upload/download/mkdir/rename/delete/chmod are wired. `test-remote` runs 224 checks with 0 failures (171 without libcurl), `ctest` is 4/4 in both configurations, and the offscreen smoke run stays up in both. What libcurl forced into the design, and what is still open, is in §8.1. |
+| L remote sites | done except L3 | `src/remote.{h,cpp}` — libcurl transport, `0600` sites file, MLSD and LIST parsers — and the remote pane mode in `panes.cpp`, compiling **and linking** with and without libcurl. `Ctrl+F` manager, `Ctrl+N` quick connect, `cd ftp://…`, and upload/download/mkdir/rename/delete/chmod are wired. `test-remote` runs 295 checks with 0 failures (188 without libcurl), `ctest` is 4/4 in both configurations, and the offscreen smoke run stays up in both. A remote copy runs on a worker thread with a transfer list under the panes, and quick view previews a row on a site or inside an archive — both are in §8.1, along with what libcurl forced into the design and what is still open. |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`
 and `font_hinting`. The hinting value is a name and not a number, so a hand-edited config says what the
@@ -59,7 +59,7 @@ actually draws at for either font, the framebuffer scale derived from a
 window's logical and pixel sizes, the identity strings, the title
 bar's elision, the Options dialog's keys and layout, the menu bar actually being
 drawn, and the quick filter taking the caret with the keys typed straight after
-it) run headless — 1477 checks in `test-panes` plus 220 in `test-archive`:
+it) run headless — 1662 checks in `test-panes` plus 220 in `test-archive`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -688,7 +688,8 @@ non-zero aborts in curl — so the dialog's Abort stops a transfer the way killi
 `F5` between a remote pane and a local one is the direction test. `F6` between two remote panes is a
 separate question — a server-side rename when both sit on one host, otherwise download, upload, delete
 — and should refuse until that is answered. Refused inside a remote pane, as inside an archive: branch
-view, tree panel, directory sizes, search, quick view, the editor, "open with". An archive *on* a
+view, tree panel, directory sizes, search, the editor, "open with". Quick view is the exception — it
+previews a row on a server and a member of an archive, and §8.1 records what that took. An archive *on* a
 server is two steps — fetch it to a temporary file, then browse it, the `arch_extract_temp()` analogue
 — and is a stretch goal, not part of L1.
 
@@ -699,6 +700,9 @@ and Abort through the xferinfo callback. A LAN listing is one round trip and fee
 listing leaves the window unresponsive for 200-500 ms. If that is not acceptable, the fix is
 `curl_multi_*` driven once per frame — no threads, the pane fills in when the transfer completes —
 which is phase L3 and a larger change than L1, so it is a phase and not a footnote.
+
+The answer the build took is the one this paragraph argued against. Transfers and previews run on worker
+threads, one connection per thread, and `curl_multi_*` is left to listings, which still block.
 
 **Testing is a localhost server, not a real one.** `tests/ftp_server.py`, about 100 lines: an FTP
 server on `127.0.0.1` with an ephemeral port serving a fixture tree, speaking
@@ -798,15 +802,42 @@ two) keeps one.
 module is compiled either way now; only the library and `MC_HAVE_CURL` are conditional. The claim that
 this configuration built had never actually been checked — it is checked in both `ctest` runs now.
 
-**Verified.** `test-remote`: 224 checks, 0 failures — 171 in a build without libcurl, where the
+**A preview of a file that is not on this disk fetches it on a thread.** `F3` and `Ctrl+Q` read the
+beginning of the row under the cursor, and both used to say `unreadable` about a text file the pane was
+looking straight at, because the only reader was `fopen()` and neither a site's path nor an archive
+member's is a path `fopen()` knows. `net_download_prefix()` takes the first 64 KB — FTP cannot be asked
+for a range that ends early, `REST` sets a starting point and the server sends everything after it, so
+the transfer is abandoned once the bytes arrive, which is what makes a preview of a 4 GB log cost the
+same as one of a 4 KB file — and `arch_extract_temp()` unpacks a member into a temporary directory the
+fetch removes. A local file is still read inside the frame, because it costs microseconds; anything else
+goes on a worker, because a WAN fetch is slower than the frame that asked for it. The answer lands in a
+later frame, filed under the path it was *asked for*: the cursor moves with the arrow keys, so an answer
+is almost always about a row the user has already left. `qv_reap()` at the head of each frame joins the
+fetches that have finished and tells the ones no quick view asked for in the frame that just drew to stop
+pulling bytes. That question is asked there, and not where a new fetch starts, because two quick views
+can be open at once — `F3` over each pane, or `F3` and the `Ctrl+Q` panel — and a rule that cancelled
+everything else in order to start one view's fetch cancelled the other view's, which restarted next frame
+and cancelled the first back: neither preview ever arrived, and the server took a connect and an abort
+per frame. `k_qv_inflight_max` is therefore one per quick view the app can show at once, which is three.
+A fetch copies the `NetSite` rather than pointing at one, because a saved site is edited while its fetch
+is running, and its connection belongs to the thread that opened it — `handle_cache()` is `thread_local`,
+which is also why a background copy gets its own login. A binary file on this disk still gets its hex
+dump; a row that is not on this disk does not, because pulling one down to find out is not what a preview
+is for.
+
+**Verified.** `test-remote`: 295 checks, 0 failures — 188 in a build without libcurl, where the
 transport half is skipped and the parsers, the URL layer and the sites file still run. `ctest`: 4/4 in
 both configurations. `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone` stays up in both. `--version`
 prints `remote sites: libcurl 8.22.0 (OpenSSL/3.6.5)`, or `remote sites: no FTP support in this build
 (install libcurl and rebuild to browse FTP)`.
 
-**Still open, and named.** L3's `curl_multi_*`, so a WAN listing does not freeze the frame loop — the
-transport blocks today, with `CONNECTTIMEOUT_MS` and `LOW_SPEED_LIMIT`/`LOW_SPEED_TIME` there so a dead
-server ends rather than hangs. The SFTP host-key UX: trust-on-first-use with the fingerprint remembered
+**Still open, and named.** L3's `curl_multi_*`, so a WAN *listing* does not freeze the frame loop.
+Transfers and previews have left that problem — they run on worker threads now — but `net_list()` is
+still called from the frame, with `CONNECTTIMEOUT_MS` and `LOW_SPEED_LIMIT`/`LOW_SPEED_TIME` there so a
+dead server ends rather than hangs. The previews themselves are keyed by path, so a file the app rewrites
+keeps previewing its old bytes until the entry is pushed out of the 32-deep cache; a local read costs
+microseconds, so the cache is there for arrowing back and forth over a site, and the honest fix is to
+invalidate an entry when the app is the one that wrote the file. The SFTP host-key UX: trust-on-first-use with the fingerprint remembered
 in the sites file, still the weakest part of the feature. Two checks the testing paragraph above asks for
 and does not have: a transfer the server stalls past `LOW_SPEED_TIME`, which needs the stall window
 shortened for the test to run in seconds rather than twenty; and an assertion that `certificate not

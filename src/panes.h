@@ -180,6 +180,27 @@ struct BgTransfer {
     std::thread worker;
 };
 
+// The preview a quick view shows when the file is not on this disk: a member of
+// an archive, or a file on a site. The cursor moves with the arrow keys and a
+// fetch over a network takes longer than the frame that asked for it, so the
+// fetch runs on a thread and the answer lands in a later frame. A fetch carries
+// the path it was asked for, because by the time it answers the cursor is
+// usually somewhere else and the answer is only good for that path. Same
+// ownership rule as BgTransfer: the UI thread joins the worker before the record
+// goes away, and only ever joins one that has already finished.
+struct QvFetch {
+    std::atomic<bool> cancel{false};   // nobody is looking; stop early if you can
+    std::atomic<bool> done{false};     // text and err are readable by the UI thread
+    // Set by a quick view that asked for this key in the frame that just drew,
+    // and cleared again by qv_reap() at the head of the next frame. Only the UI
+    // thread touches it, which is why it is not atomic the way cancel is.
+    bool wanted = false;
+    std::string key;                   // the path this is a preview of
+    std::string text;                  // the worker's answer, written before done
+    std::string err;
+    std::thread worker;
+};
+
 // Pending file operation, shown as a dialog with an editable destination
 enum AppOp {
     OP_NONE = 0,
@@ -348,6 +369,11 @@ public:
     // app_panes_free() asks the running ones to stop and joins them before the
     // app goes away.
     std::vector<std::unique_ptr<BgTransfer>> transfers;
+    // Quick view. `qv_cache` is the text already read, keyed by the path the pane
+    // shows, so moving the cursor back onto a name costs nothing; `qv_fetches`
+    // are the previews that are not on this disk and are still on their way.
+    std::vector<std::pair<std::string, std::string>> qv_cache;
+    std::vector<std::unique_ptr<QvFetch>> qv_fetches;
     // The op dialog's "Run in background" request. It lives here rather than in
     // the plan because it has to survive the overwrite confirm, and only
     // run_op_plan() knows whether the plan crosses a network at all - which is

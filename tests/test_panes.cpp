@@ -2540,6 +2540,234 @@ static void test_failed_list_has_no_rows(AppPanes* app, const std::string& root)
     sh("rm -rf '" + d + "'");
 }
 
+// The fetch a quick view has running for a path, if it has one.
+static QvFetch* qv_fetch_for(AppPanes* app, const std::string& key) {
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
+        if (f->key == key) return f.get();
+    return nullptr;
+}
+
+// Quick view over a file the pane is looking at but cannot fopen(): a member of
+// an archive, and a file on a site. The archive half runs the real worker thread
+// and the real unpacking, so the whole path is covered - ask, fetch off the UI
+// thread, reap the answer into the cache, and answer the next frame from the
+// cache without asking the disk or the server again.
+static void test_quick_view(AppPanes* app, const std::string& root) {
+    Pane& p = app->left;
+    const std::string qv = root + "/qv";
+    sh("rm -rf '" + qv + "' && mkdir -p '" + qv + "/src'");
+    sh("printf 'alpha\\r\\nbeta\\n' > '" + qv + "/src/plain.txt'");
+    sh("printf 'inner line\\n' > '" + qv + "/src/inner.txt'");
+    {
+        FILE* f = fopen((qv + "/src/bin.dat").c_str(), "wb");
+        if (f) { fwrite("a\0b", 1, 3, f); fclose(f); }
+    }
+    {
+        StringList names;
+        names.push_back("plain.txt");
+        names.push_back("inner.txt");
+        names.push_back("bin.dat");
+        std::string err;
+        CHECK(arch_pack((qv + "/pkg.zip").c_str(), (qv + "/src").c_str(), names,
+                        nullptr, nullptr, &err));
+    }
+
+    // A CRLF becomes one newline and a lone CR becomes one: ImGui advances over a
+    // carriage return instead of breaking the line, so a text file written on
+    // Windows would otherwise preview as one very long row.
+    std::string crlf = "two\r\nlines\n";
+    CHECK(qv_to_text(&crlf));
+    CHECK(crlf == "two\nlines\n");
+    std::string lone = "a\rb";
+    CHECK(qv_to_text(&lone));
+    CHECK(lone == "a\nb");
+    std::string nul("a\0b", 3);
+    CHECK(!qv_to_text(&nul));
+
+    // A local file is read in the frame and filed under its path, so the row keeps
+    // answering after the file goes: arrowing through a directory asks once per
+    // name, not once per keypress.
+    refresh_pane(&p, (qv + "/src").c_str());
+    int plain = idx_of(p, "plain.txt");
+    CHECK(plain >= 0);
+    CHECK(qv_preview(app, p, plain) == "alpha\nbeta\n");
+    sh("rm -f '" + qv + "/src/plain.txt'");
+    CHECK(qv_preview(app, p, plain) == "alpha\nbeta\n");
+    CHECK(qv_preview(app, p, idx_of(p, "bin.dat")) == k_qv_binary);
+    CHECK(qv_preview(app, p, 0).empty());      // ".." is a directory: nothing to show
+
+    // A row whose file is gone says so, and the answer is not kept, so the name is
+    // read again once the file comes back.
+    sh("touch '" + qv + "/src/ghost.txt'");
+    refresh_pane(&p, (qv + "/src").c_str());
+    int ghost = idx_of(p, "ghost.txt");
+    CHECK(ghost >= 0);
+    sh("rm -f '" + qv + "/src/ghost.txt'");
+    const std::string ghost_path = qv + "/src/ghost.txt";
+    CHECK(qv_preview(app, p, ghost) == "(cannot read " + ghost_path + ")");
+    CHECK(qv_cache_find(app, ghost_path) == nullptr);
+
+    // What reading a row would take, for a row of each kind.
+    QvJob job;
+    CHECK(qv_job_for(app, p, idx_of(p, "inner.txt"), &job));
+    CHECK(job.kind == QV_LOCAL);
+    CHECK(job.key == qv + "/src/inner.txt");
+    CHECK(job.path == job.key);
+    CHECK(pane_row_path(p, idx_of(p, "inner.txt")) == qv + "/src/inner.txt");
+
+    // Inside an archive: the member is unpacked on a thread, and the frame that
+    // asked gets a placeholder while it is on its way.
+    refresh_pane(&p, (qv + "/pkg.zip").c_str());
+    CHECK(in_archive(p));
+    int member = idx_of(p, "inner.txt");
+    CHECK(member >= 0);
+    CHECK(qv_job_for(app, p, member, &job));
+    CHECK(job.kind == QV_ARCHIVE);
+    CHECK(job.path == qv + "/pkg.zip");
+    CHECK(job.member == "inner.txt");
+    const std::string member_key = qv + "/pkg.zip/inner.txt";
+    CHECK(job.key == member_key);
+    CHECK(qv_preview(app, p, member) == k_qv_reading);
+    CHECK(app->qv_fetches.size() == 1);
+    CHECK(app->qv_fetches[0]->key == member_key);
+    // Asking again while it is running must not start a second fetch for it.
+    CHECK(qv_preview(app, p, member) == k_qv_reading);
+    CHECK(app->qv_fetches.size() == 1);
+    // The answer lands on a later frame. The wait is bounded so a fetch that never
+    // answers fails the test instead of hanging it.
+    std::string text = k_qv_reading;
+    for (int tries = 0; tries < 200 && text == k_qv_reading; tries++) {
+        SDL_Delay(25);
+        qv_reap(app);
+        text = qv_preview(app, p, member);
+    }
+    CHECK(text == "inner line\n");
+    CHECK(app->qv_fetches.empty());
+    CHECK(qv_cache_find(app, member_key) != nullptr);
+
+    // Two quick views open at once - F3 over each pane, or F3 and the Ctrl+Q
+    // panel - ask for two different rows in the same frame. Neither is stale, so
+    // neither may be told to stop. The rule this pins down used to cancel every
+    // other fetch in order to start one view's fetch, which cancelled the other
+    // view's: that one restarted next frame and cancelled the first back, so a
+    // preview over a site aborted before its bytes arrived and the server took a
+    // connect and an abort per frame.
+    int m_plain = idx_of(p, "plain.txt");
+    int m_bin   = idx_of(p, "bin.dat");
+    CHECK(m_plain >= 0 && m_bin >= 0);
+    CHECK(qv_preview(app, p, m_plain) == k_qv_reading);   // one view's cursor
+    CHECK(qv_preview(app, p, m_bin)   == k_qv_reading);   // the other view's
+    CHECK(app->qv_fetches.size() == 2);
+    const std::string plain_key = qv + "/pkg.zip/plain.txt";
+    const std::string bin_key   = qv + "/pkg.zip/bin.dat";
+    CHECK(qv_fetch_for(app, plain_key) != nullptr);
+    CHECK(qv_fetch_for(app, bin_key) != nullptr);
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches) CHECK(!f->cancel.load());
+    qv_stop_all(app);
+
+    // Which fetches a frame leaves running, decided without a worker so nothing
+    // here depends on how fast a thread happens to be. A record that has not
+    // answered is skipped by the reaping half of qv_reap() and never joined, so
+    // these observe the cancelling half on its own.
+    auto fake = [&](const char* key, bool wanted) {
+        std::unique_ptr<QvFetch> up = std::make_unique<QvFetch>();
+        up->key = key;
+        up->wanted = wanted;
+        QvFetch* raw = up.get();
+        app->qv_fetches.push_back(std::move(up));
+        return raw;
+    };
+    QvFetch* asked   = fake("asked", true);      // the frame that just drew asked
+    QvFetch* ignored = fake("ignored", false);   // and nobody asked for this one
+    qv_reap(app);
+    CHECK(!asked->cancel.load());
+    CHECK(ignored->cancel.load());
+    // The claim does not carry over: a fetch that stops being asked for is stopped
+    // by the frame after the one that stopped asking.
+    qv_reap(app);
+    CHECK(asked->cancel.load());
+    qv_stop_all(app);
+
+    // A quick view that finds a fetch already on its way claims it, so the next
+    // frame's reap leaves it alone instead of stopping it, and does not start a
+    // second one for the same name.
+    QvFetch* onitsway = fake(plain_key.c_str(), false);
+    CHECK(qv_preview(app, p, m_plain) == k_qv_reading);
+    CHECK(app->qv_fetches.size() == 1);
+    qv_reap(app);
+    CHECK(!onitsway->cancel.load());
+    // The cap is one fetch per quick view the app can show at once, so a fourth
+    // name waits rather than piling up threads.
+    fake("a", true); fake("b", true); fake("c", true);
+    CHECK(qv_preview(app, p, m_bin) == k_qv_reading);
+    CHECK(app->qv_fetches.size() == 4);   // the three fakes plus the one on its way
+    qv_stop_all(app);
+
+    // On a site: the row's path on the server, and a copy of the site, because a
+    // saved site can be edited while the thread that was given it is still running.
+    NetSite site;
+    site.name = "qv";
+    site.proto = NET_FTP;
+    site.host = "127.0.0.1";
+    site.port = 1;              // nothing listens here: the connect is refused at once
+    site.user = "someone";
+    site.password = "secret";
+    app->remote_sites.push_back(site);
+    net_bind(app);
+    const std::string site_url = net_site_root(site);
+    refresh_pane(&p, (site_url + "/pub").c_str());
+    CHECK(in_remote(p));
+    free_entries(p.entries, p.entry_count);
+    p.entries = (FileEntry**)malloc(sizeof(FileEntry*) * 2);
+    p.entries[0] = file_entry_new("..", S_IFDIR | 0755, 0, 0);
+    p.entries[1] = file_entry_new("far.txt", S_IFREG | 0644, 10, 0);
+    p.entry_count = 2;
+    int far = idx_of(p, "far.txt");
+    CHECK(far >= 0);
+    CHECK(qv_job_for(app, p, far, &job));
+    CHECK(job.kind == QV_REMOTE);
+    CHECK(job.rpath == "/pub/far.txt");
+    CHECK(job.site.host == site.host && job.site.password == site.password);
+    CHECK(pane_row_path(p, far) == site_url + "/pub/far.txt");
+    // A fetch that cannot be answered still answers: it fails, and a failure is
+    // not kept, so the name is asked again after the site comes back.
+    const std::string far_key = site_url + "/pub/far.txt";
+    CHECK(qv_preview(app, p, far) == k_qv_reading);
+    for (int tries = 0; tries < 200 && !app->qv_fetches.empty(); tries++) {
+        SDL_Delay(25);
+        qv_reap(app);
+    }
+    CHECK(app->qv_fetches.empty());
+    CHECK(qv_cache_find(app, far_key) == nullptr);
+
+    // The cache holds a bounded number of previews, oldest first.
+    for (size_t n = 0; n < k_qv_cache_max + 7; n++)
+        qv_cache_put(app, "k" + std::to_string(n), "v");
+    CHECK(app->qv_cache.size() == k_qv_cache_max);
+    CHECK(qv_cache_find(app, "k0") == nullptr);
+    CHECK(qv_cache_find(app, "k" + std::to_string(k_qv_cache_max + 6)) != nullptr);
+    qv_cache_put(app, "k7", "w");
+    CHECK(*qv_cache_find(app, "k7") == "w");
+    CHECK(app->qv_cache.size() == k_qv_cache_max);
+
+    // Quitting with a fetch still running: it is asked to stop and joined before
+    // the transport goes away underneath it.
+    CHECK(qv_preview(app, p, far) == k_qv_reading);
+    qv_stop_all(app);
+    CHECK(app->qv_fetches.empty());
+
+    app->qv_cache.clear();
+    app->remote_sites.clear();
+    free_entries(p.entries, p.entry_count);
+    p.entries = nullptr;
+    p.entry_count = 0;
+    p.selected = 0;
+    p.current_dir[0] = '\0';
+    p.remote_root[0] = '\0';
+    p.remote_path[0] = '\0';
+    p.list_mode = LIST_NORMAL;
+}
+
 // The dialog has to fit the window it is opened in, and a font path has to stay
 // inside it: the list is a column of long absolute paths, which is exactly what
 // pushes a frame wider than the screen.
@@ -2935,6 +3163,7 @@ int main() {
     test_remote_keys(&app);
     test_bg_transfers(&app);
     test_failed_list_has_no_rows(&app, root);
+    test_quick_view(&app, root);
     test_options_dialog_layout(&app);
     test_menu_bar(&app);
     test_filter_focus(&app, root);

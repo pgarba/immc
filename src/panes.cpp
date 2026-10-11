@@ -3880,43 +3880,258 @@ static const std::map<std::string, off_t>* compare_map(AppPanes* app, const Pane
     return &cmp_sizes[slot];
 }
 
-// Ctrl+Q: the inactive pane turns into a quick view of the file under the
-// cursor in the active pane (TC's quick view panel).
-static char qv_buf[128 * 1024];
-static char qv_path[4100];
+// ---------------------------------------------------------------------------
+// Quick view text
+//
+// Both quick views - the F3 window over a pane and the Ctrl+Q panel - show the
+// beginning of the file under the cursor, and until now both could only read a
+// file that exists on this disk: handed a site's path or an archive member's,
+// fopen() fails and the preview says "unreadable" about a text file the pane is
+// looking straight at. A local file is still read in the frame, because it costs
+// microseconds. Anything else has to be fetched, and a fetch over a network is
+// slower than the frame that asked for it, so it runs on a thread and the answer
+// lands in a later frame. The cursor moves with the arrow keys, so an answer is
+// usually late: a fetch carries the path it was asked for, and is used for that
+// path and no other.
 
+// Enough to read a screenful and then some, and small enough that previewing a
+// 4 GB log costs the same as previewing a 4 KB one.
+static const size_t k_qv_max_bytes = 64 * 1024;
+// Previews kept, oldest first. Arrowing back and forth through one directory is
+// the common movement, and a site should be asked once per name, not once per
+// keypress.
+static const size_t k_qv_cache_max = 32;
+// Fetches allowed to run at once, which is one per quick view the app can show
+// at a time: the F3 window over each pane and the Ctrl+Q panel. A fourth view
+// would have to queue, and a queued view says "reading" forever, so the cap is
+// not a queue depth. The fetches that stay alive after the cursor moved are the
+// ones a frame is still waiting on; they are left running because joining one
+// here would block the frame, which is the whole thing being avoided.
+static const size_t k_qv_inflight_max = 3;
+
+enum QvKind { QV_LOCAL, QV_ARCHIVE, QV_REMOTE };
+
+// What has to be read, copied out of the pane before the thread starts: the pane
+// navigates and a saved site gets edited while the thread is still running, so
+// the thread reads none of the app.
+struct QvJob {
+    QvKind kind = QV_LOCAL;
+    std::string key;      // the path the pane shows: what the answer is filed under
+    std::string path;     // a local file, or the archive to unpack from
+    std::string member;   // the member inside that archive, as the tool names it
+    NetSite site;         // a copy of the site, password and all
+    std::string rpath;    // the file on the server
+};
+
+// The answers a preview can only give in words.
+static const char* k_qv_reading = "(reading ...)";
+static const char* k_qv_binary  = "(binary: no text to show)";
+
+// The path a pane shows for a row: a real path, or the virtual one for a row on
+// a site or inside an archive.
+static std::string pane_row_path(const Pane& pane, int idx) {
+    char full[4100];
+    snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, idx));
+    return full;
+}
+
+// Text or nothing: a NUL in what arrived is the tell. A CR that starts a newline
+// is dropped and a lone CR becomes a newline, because ImGui advances over a
+// carriage return without breaking the line, and a text file that came off a
+// server is likely to have them.
+static bool qv_to_text(std::string* body) {
+    if (body->find('\0') != std::string::npos) return false;
+    for (size_t i = body->find('\r'); i != std::string::npos; i = body->find('\r', i)) {
+        if (i + 1 < body->size() && (*body)[i + 1] == '\n') body->erase(i, 1);
+        else (*body)[i] = '\n';
+    }
+    return true;
+}
+
+static std::string* qv_cache_find(AppPanes* app, const std::string& key) {
+    for (std::pair<std::string, std::string>& e : app->qv_cache)
+        if (e.first == key) return &e.second;
+    return nullptr;
+}
+
+static void qv_cache_put(AppPanes* app, const std::string& key, const std::string& text) {
+    if (std::string* hit = qv_cache_find(app, key)) { *hit = text; return; }
+    app->qv_cache.emplace_back(key, text);
+    while (app->qv_cache.size() > k_qv_cache_max)
+        app->qv_cache.erase(app->qv_cache.begin());
+}
+
+// The beginning of a file that is already on this disk.
+static void qv_read_file(const std::string& path, std::string* body, std::string* err) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { *err = "cannot read " + path; return; }
+    char buf[8192];
+    size_t n;
+    while (body->size() < k_qv_max_bytes && (n = fread(buf, 1, sizeof buf, f)) > 0)
+        body->append(buf, n);
+    fclose(f);
+}
+
+// Asked between chunks of a fetch: the cursor moved on, so stop pulling bytes
+// that nobody is going to look at.
+static bool qv_still_wanted_cb(long long, long long, int, int, void* user) {
+    return !((QvFetch*)user)->cancel.load();
+}
+
+// The worker. It writes text and err and only then raises done, so a frame that
+// sees done can read both. Nothing here touches the app, the panes, or ImGui.
+static void qv_run_fetch(QvFetch* f, QvJob job) {
+    std::string body, err, file = job.path;
+    char tmpdir[4096];
+    tmpdir[0] = '\0';
+
+    if (job.kind == QV_REMOTE) {
+        net_download_prefix(job.site, job.rpath, &body, k_qv_max_bytes,
+                            qv_still_wanted_cb, f, &err);
+    } else {
+        if (job.kind == QV_ARCHIVE) {
+            char tmp[4300];
+            if (arch_extract_temp(job.path.c_str(), job.member.c_str(),
+                                  tmp, sizeof tmp, tmpdir, sizeof tmpdir, &err))
+                file = tmp;
+        }
+        if (err.empty()) qv_read_file(file, &body, &err);
+    }
+    if (tmpdir[0]) {
+        char cmd[4200];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
+        int rc = system(cmd);
+        (void)rc;
+    }
+
+    if (err.empty() && !qv_to_text(&body)) body = k_qv_binary;
+    f->text = err.empty() ? body : "";
+    f->err = err;
+    f->done = true;
+}
+
+static void qv_start(AppPanes* app, const QvJob& job) {
+    std::unique_ptr<QvFetch> up = std::make_unique<QvFetch>();
+    QvFetch* f = up.get();
+    f->key = job.key;
+    f->wanted = true;   // the frame that is drawing right now asked for it
+    app->qv_fetches.push_back(std::move(up));
+    f->worker = std::thread(qv_run_fetch, f, job);
+}
+
+// Between frames. A fetch that has answered is filed under the path it was asked
+// for and dropped; the join is only ever of a thread that has finished, so this
+// cannot stall a frame, and one still running is left alone until it answers.
+// A fetch that failed is not cached, so the next look at that name asks again.
+//
+// A fetch that no quick view asked for in the frame that just drew is stale: the
+// cursor moved on, its window closed, or its pane navigated away. Those are told
+// to stop pulling bytes nobody will read. That question is asked here rather than
+// where a new fetch starts, because two quick views can be open at once - F3 on
+// each pane, or F3 and the Ctrl+Q panel - and a rule that cancelled everything
+// else in order to start one view's fetch cancelled the other view's fetch, which
+// restarted next frame and cancelled the first again: neither preview ever
+// arrived, and the server took a connect and an abort per frame.
+static void qv_reap(AppPanes* app) {
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches) {
+        if (!f->wanted) f->cancel = true;
+        f->wanted = false;   // this frame's previews mark it again
+    }
+    for (size_t i = 0; i < app->qv_fetches.size();) {
+        QvFetch* f = app->qv_fetches[i].get();
+        if (!f->done.load()) { i++; continue; }
+        if (f->err.empty()) qv_cache_put(app, f->key, f->text);
+        f->worker.join();
+        app->qv_fetches.erase(app->qv_fetches.begin() + i);
+    }
+}
+
+// On the way out: every fetch stops and is joined before the transport is torn
+// down under it.
+static void qv_stop_all(AppPanes* app) {
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches) f->cancel = true;
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
+        if (f->worker.joinable()) f->worker.join();
+    app->qv_fetches.clear();
+}
+
+// What reading this row would take. False for a directory and for the rows that
+// are not files, which have no text to show.
+static bool qv_job_for(AppPanes* app, const Pane& pane, int idx, QvJob* job) {
+    if (idx < 0 || idx >= pane.entry_count) return false;
+    FileEntry* e = pane.entries[idx];
+    if (is_directory(e->name, e->mode)) return false;
+    if (in_remote(pane) && !remote_site_of(app, pane)) return false;
+
+    job->key = pane_row_path(pane, idx);
+    if (in_remote(pane)) {
+        job->kind  = QV_REMOTE;
+        job->site  = *remote_site_of(app, pane);
+        job->rpath = remote_row_path(pane, entry_rel(pane, idx));
+    } else if (in_archive(pane)) {
+        job->kind   = QV_ARCHIVE;
+        job->path   = pane.archive_path;
+        job->member = member_raw(pane, entry_rel(pane, idx));
+    } else {
+        job->kind = QV_LOCAL;
+        job->path = job->key;
+    }
+    return true;
+}
+
+// The text a quick view shows for a row: "" when the row has nothing to show,
+// k_qv_reading while a fetch is on its way, and the words a file that is not
+// text deserves. Everything is keyed by path, so a row that has been read once
+// answers the next frame as fast as the last.
+static std::string qv_preview(AppPanes* app, const Pane& pane, int idx) {
+    QvJob job;
+    if (!qv_job_for(app, pane, idx, &job)) return "";
+    if (std::string* hit = qv_cache_find(app, job.key)) return *hit;
+
+    if (job.kind == QV_LOCAL) {
+        std::string body, err;
+        qv_read_file(job.path, &body, &err);
+        if (!err.empty()) return "(" + err + ")";
+        if (!qv_to_text(&body)) body = k_qv_binary;
+        qv_cache_put(app, job.key, body);
+        return body;
+    }
+
+    for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
+        if (f->key == job.key) {
+            // Already on its way. Say so to qv_reap(), and take back a stop that
+            // was asked while the cursor was somewhere else: the worker may have
+            // obeyed already, in which case it answers with a failure, nothing is
+            // cached, and the next look at this name asks again.
+            f->wanted = true;
+            f->cancel = false;
+            return k_qv_reading;
+        }
+    if (app->qv_fetches.size() < k_qv_inflight_max) qv_start(app, job);
+    return k_qv_reading;
+}
+
+// Ctrl+Q: the inactive pane turns into a quick view of the file under the
+// cursor in the active pane (TC's quick view panel). An archive member previews
+// like any other file now; it is unpacked on a thread, one member at a time.
 static void render_quick_view_panel(AppPanes* app, float w, float h, const char* id) {
     Pane& src = app->left_focus ? app->left : app->right;
     ImGui::BeginChild(id, ImVec2(w, h));
-    if (in_archive(src)) {
-        // The preview reads real files; a member has to be unpacked first, which
-        // is what Enter does.
-        qv_path[0] = '\0';
-        ImGui::TextDisabled("(archive member: Enter opens it, Alt+F9 extracts the archive)");
-        ImGui::EndChild();
-        return;
-    }
     if (src.selected < 0 || src.selected >= src.entry_count) {
         ImGui::TextDisabled("(nothing under the cursor)");
         ImGui::EndChild();
         return;
     }
     FileEntry* e = src.entries[src.selected];
-    char full[4100];
-    snprintf(full, sizeof(full), "%s/%s", src.current_dir, entry_rel(src, src.selected));
     if (is_directory(e->name, e->mode)) {
-        qv_path[0] = '\0';
         ImGui::TextDisabled("(directory: %s)", e->name);
-    } else {
-        if (strcmp(full, qv_path) != 0) {
-            snprintf(qv_path, sizeof(qv_path), "%s", full);
-            long n = fs_read_preview(full, qv_buf, sizeof(qv_buf) - 1);
-            if (n < 0) snprintf(qv_buf, sizeof(qv_buf), "(binary or unreadable)");
-        }
-        ImGui::TextDisabled("%s", e->name);
-        ImGui::Separator();
-        ImGui::TextUnformatted(qv_buf);
+        ImGui::EndChild();
+        return;
     }
+    std::string text = qv_preview(app, src, src.selected);
+    ImGui::TextDisabled("%s", e->name);
+    ImGui::Separator();
+    ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
     ImGui::EndChild();
 }
 
@@ -4327,20 +4542,21 @@ static void render_quick_view(AppPanes* app, Pane& pane) {
     ImGui::Separator();
 
     if (!is_directory(e->name, e->mode)) {
-        char full[4100];
-        snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, pane.selected));
-        static char preview[8192];
-        long n = fs_read_preview(full, preview, sizeof(preview) - 1);
-        if (n < 0) {
+        std::string text = qv_preview(app, pane, pane.selected);
+        // A binary file on this disk still gets its hex dump. A member of an
+        // archive and a file on a site are not on this disk to dump, and pulling
+        // one down to find out is not what a preview is for.
+        if (text == k_qv_binary && !in_archive(pane) && !in_remote(pane)) {
             static char hexbuf[16384];
-            long dumped = fs_hex_dump(full, hexbuf, sizeof(hexbuf), 2048);
+            long dumped = fs_hex_dump(pane_row_path(pane, pane.selected).c_str(),
+                                      hexbuf, sizeof(hexbuf), 2048);
             if (dumped < 0) ImGui::TextUnformatted("(unreadable)");
             else {
                 ImGui::TextUnformatted("(binary - hex dump)");
                 ImGui::TextUnformatted(hexbuf);
             }
         } else {
-            ImGui::TextUnformatted(preview);
+            ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
         }
     }
     ImGui::End();
@@ -5512,6 +5728,11 @@ void app_panes_render(AppPanes* app) {
     // do inside one - and because the status line it writes is read just below.
     bg_reap(app);
 
+    // Same for the quick view: a preview that arrived from a site or an archive
+    // is filed under the path it was asked for here, and its thread is joined
+    // here, where waiting for a finished thread costs nothing.
+    qv_reap(app);
+
     // ImGui answers one keyboard-focus request per frame, and the last one
     // submitted wins. The command line at the bottom asks on every frame, so any
     // field that wants the caret has to claim it here and be left alone after.
@@ -5897,6 +6118,8 @@ void app_panes_free(AppPanes* app) {
     // stop, wait for it to finish the file it is on, and only then release the
     // connections and the library, which is what net_shutdown() does.
     bg_stop_all(app);
+    // Quick view fetches are inside the same transport, so they go the same way.
+    qv_stop_all(app);
     free_entries(app->left.entries, app->left.entry_count);
     free_entries(app->right.entries, app->right.entry_count);
     // The cached handles belong to this app's site list, and so do the pointers
