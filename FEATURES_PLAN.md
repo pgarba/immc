@@ -71,7 +71,7 @@ drawn, the quick filter taking the caret with the keys typed straight after
 it, the console's keyboard ownership, backlog, builtins, caps and config
 round-trip, and the buffer-ownership rule that a text field ImGui has the caret in
 must be asked to reload before the app's own write to its buffer is visible) run
-headless — 2042 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` and 51 in `test-sfv`:
+headless — 2075 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` and 51 in `test-sfv`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -1147,3 +1147,34 @@ The rule, for next time: a push and its pop must be conditioned on the same valu
 a widget the user can *change by clicking* is not that value. The two remaining
 conditional pops in the file — both list modes of `render_file_list` — already use a
 `pushed` counter set by the pushes themselves, which is the shape that cannot drift.
+
+## 11. A path spelling that never repaired itself
+
+A saved config reached a user as `left_tab0 = //home/adam/github/fugger_2_reloaded/build`
+and `left_tab1 = /home/adam//github/ida-llm-explainer`. Nothing writes a doubled slash on
+purpose. `cd ~/` joins to `HOME` plus `/`, and the next relative `cd` joins that trailing
+separator with its own: `/home/adam` + `/` + `/` + `github/…`. `navigate_to()` stored
+whatever string it was handed, so the result went into `current_dir`, into the tab record,
+into the directory history and out to the config file.
+
+It does not heal. glibc's `dirname()` keeps a leading `//` — `dirname("//home/adam//github")`
+is `//home/adam` — and adds a trailing one, so Backspace out of a corrupted directory writes
+the corruption one level up. And a doubled slash turns one directory into two different
+strings: `strcmp(path, current_dir)` says they are two places, so a self-refresh counts as a
+navigation and drops the quick filter, the history fills with near-duplicates, and a tab stops
+matching the pane standing on it.
+
+`normalize_pane_path()` collapses a run of separators to one and drops a trailing one, keeping
+`/` for a doubled root. It sits in `refresh_pane()`, which is the one door every path a pane
+holds goes through, and in `navigate_to()` before the path reaches the history, and in the tab
+restore, so a config written by an older build comes back clean instead of re-exporting the
+shape on the next save.
+
+Two cases are deliberately not collapsed. A site's virtual path keeps its bytes: its separators
+belong to a URL and to a path on a server, and rewriting them changes which file is meant. An
+archive's virtual path is collapsed like any local one, and the test checks that
+`arch_split_virtual()` still picks the archive file out of the collapsed string — the doubled
+slash always comes from the filesystem half, and a member name a listing can build never
+contains one.
+
+20 of the new checks fail with the normalizer reduced to a copy, 0 with it in place.

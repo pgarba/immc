@@ -4442,6 +4442,137 @@ static void test_tab_bar_click(AppPanes* app, const std::string& root) {
     sh("rm -rf '" + a + "' '" + b + "'");
 }
 
+// A doubled slash that gets in through a join never leaves on its own: glibc's
+// dirname() keeps a leading "//" and adds a trailing one, so it spreads into the tabs,
+// the directory history and the config file. refresh_pane() is the one door every path
+// a pane holds goes through, so the spelling is fixed there and at navigate_to(),
+// before the path reaches the history.
+static void test_path_normalization(AppPanes* app, Pane& p, const std::string& root) {
+    char out[4096];
+
+    normalize_pane_path("//home/adam//x/", out, sizeof out);
+    CHECK(strcmp(out, "/home/adam/x") == 0);
+    normalize_pane_path("/a///b//c", out, sizeof out);
+    CHECK(strcmp(out, "/a/b/c") == 0);
+    normalize_pane_path("/", out, sizeof out);
+    CHECK(strcmp(out, "/") == 0);
+    normalize_pane_path("//", out, sizeof out);
+    CHECK(strcmp(out, "/") == 0);                 // a doubled root is still the root
+    normalize_pane_path("/home/adam///", out, sizeof out);
+    CHECK(strcmp(out, "/home/adam") == 0);        // a trailing separator says nothing
+    normalize_pane_path("", out, sizeof out);
+    CHECK(strcmp(out, "/") == 0);
+    normalize_pane_path("sub//dir", out, sizeof out);
+    CHECK(strcmp(out, "sub/dir") == 0);           // relative stays relative
+
+    // A site's separators belong to a URL and to a path on a server: rewriting them
+    // changes which file is meant.
+    normalize_pane_path("ftp://tester@127.0.0.1:2121//pub//x", out, sizeof out);
+    CHECK(strcmp(out, "ftp://tester@127.0.0.1:2121//pub//x") == 0);
+
+    // An archive path collapses like any other local one, and the archive file is
+    // still the component picked out of it.
+    touch_file(root, "pkg.zip");
+    normalize_pane_path((root + "//pkg.zip//sub").c_str(), out, sizeof out);
+    CHECK(strcmp(out, (root + "/pkg.zip/sub").c_str()) == 0);
+    {
+        char arch[4096], prefix[1024];
+        CHECK(arch_split_virtual(out, arch, sizeof arch, prefix, sizeof prefix));
+        CHECK(strcmp(arch, (root + "/pkg.zip").c_str()) == 0);
+        CHECK(strcmp(prefix, "sub") == 0);
+    }
+    sh("rm -f '" + root + "/pkg.zip'");
+
+    // The pane keeps the clean spelling, not the one that was typed.
+    refresh_pane(&p, (root + "//sub").c_str());
+    CHECK(strcmp(p.current_dir, (root + "/sub").c_str()) == 0);
+
+    // Refreshing under a dirty spelling is the same directory, so it is not a
+    // navigation and the quick filter survives it.
+    snprintf(p.filter, sizeof(p.filter), "inner");
+    rebuild_view(p);
+    refresh_pane(&p, (root + "//sub//").c_str());
+    CHECK(strcmp(p.current_dir, (root + "/sub").c_str()) == 0);
+    CHECK(strcmp(p.filter, "inner") == 0);
+    p.filter[0] = '\0';
+    rebuild_view(p);
+
+    // The two places a dirty spelling used to survive a navigation: the history, and
+    // the tab the pane is standing on.
+    p.tab_count = 1;
+    p.tab_active = 0;
+    snprintf(p.tabs[0].dir, sizeof(p.tabs[0].dir), "%s//sub", root.c_str());
+    navigate_to(app, &p, (root + "//sub").c_str());
+    CHECK(strcmp(p.history[p.history_pos], (root + "/sub").c_str()) == 0);
+    CHECK(strcmp(p.tabs[0].dir, (root + "/sub").c_str()) == 0);
+    p.tab_count = 0;
+
+    // The chain that produced the corrupted config in the first place: `cd ~/` leaves
+    // a trailing separator, and the next relative cd joins it into a doubled one.
+    {
+        const char* real_home = getenv("HOME");
+        const std::string chome = root + "/home";
+        sh("mkdir -p '" + chome + "/sub'");
+        setenv("HOME", chome.c_str(), 1);
+        app->left_focus = true;
+        refresh_pane(&app->left, "/");
+        // The tab the pane stands on, so the chain can be watched where the corruption
+        // used to land rather than only in the path bar.
+        app->left.tab_count = 1;
+        app->left.tab_active = 0;
+        snprintf(app->left.tabs[0].dir, sizeof(app->left.tabs[0].dir), "%s", "/");
+        console_cd(app, "~/");
+        CHECK(strcmp(app->left.current_dir, chome.c_str()) == 0);
+        console_cd(app, "sub");
+        CHECK(strcmp(app->left.current_dir, (chome + "/sub").c_str()) == 0);
+        CHECK(strstr(app->left.current_dir, "//") == nullptr);
+        CHECK(strcmp(app->left.tabs[0].dir, app->left.current_dir) == 0);
+        app->left.tab_count = 0;
+        if (real_home) setenv("HOME", real_home, 1); else unsetenv("HOME");
+    }
+
+    // A config written by an older build comes back clean, so the tabs stop
+    // re-exporting the corruption on every save.
+    {
+        MCConfig cfg;
+        mc_config_default(&cfg);
+        cfg.left_tab_count = 2;
+        cfg.left_tab_active = 1;
+        snprintf(cfg.left_tabs[0], 4096, "%s//sub", root.c_str());
+        snprintf(cfg.left_tabs[1], 4096, "%s//home//sub", root.c_str());
+        AppPanes next;
+        next.left.entries = nullptr;
+        next.left.entry_count = 0;
+        next.left.current_dir[0] = '\0';
+        next.left.tab_count = 0;
+        next.right.entries = nullptr;
+        next.right.entry_count = 0;
+        next.right.current_dir[0] = '\0';
+        next.right.tab_count = 0;
+        app_panes_apply_state(&next, &cfg);
+        CHECK(next.left.tab_count == 2);
+        CHECK(next.left.tab_active == 1);
+        CHECK(strcmp(next.left.tabs[0].dir, (root + "/sub").c_str()) == 0);
+        CHECK(strcmp(next.left.tabs[1].dir, (root + "/home/sub").c_str()) == 0);
+        CHECK(strcmp(next.left.current_dir, (root + "/home/sub").c_str()) == 0);
+        // The tab bar and the pane now agree, which is the property the doubled slash
+        // broke: the same directory was two different strings.
+        CHECK(strcmp(next.left.tabs[next.left.tab_active].dir,
+                     next.left.current_dir) == 0);
+        // Not app_panes_free(): that one ends in `delete app`, and this AppPanes lives
+        // on the stack. The listings are what is worth handing back.
+        free_entries(next.left.entries, next.left.entry_count);
+        next.left.entries = nullptr;
+        next.left.entry_count = 0;
+        free_entries(next.right.entries, next.right.entry_count);
+        next.right.entries = nullptr;
+        next.right.entry_count = 0;
+    }
+
+    sh("rm -rf '" + root + "/home'");
+    refresh_pane(&p, root.c_str());
+}
+
 static void test_properties_permissions(AppPanes* app, const std::string& root) {
     // A mode is four octal digits. A leading zero is allowed because that is how a
     // mode is written everywhere else, and 0999 is not a mode at all.
@@ -4903,6 +5034,7 @@ int main() {
     test_sfv(&app, root);
     test_properties_permissions(&app, root);
     test_tab_bar_click(&app, root);
+    test_path_normalization(&app, p, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

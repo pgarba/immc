@@ -662,25 +662,65 @@ static void list_archive_dir(const char* archive, const char* prefix,
     *out_count = i;
 }
 
+// Collapse a local path to one spelling: "//home/adam//x/" becomes "/home/adam/x".
+// Worth doing rather than keeping the bytes the caller typed, for two reasons.
+//
+// A doubled slash turns one directory into two different strings. `strcmp(path,
+// current_dir)` then says they are two places, so a self-refresh counts as a
+// navigation and drops the filter; the directory history fills with near-duplicates;
+// and a tab stops matching the pane it belongs to.
+//
+// And it never repairs itself: glibc's dirname() keeps a leading "//" (`dirname
+//("//home/adam//github")` is `//home/adam`) and adds a trailing one, so a doubled
+// slash that gets in through a join spreads into the tabs, the history and the config
+// file. That is how a saved config ended up reading
+// `left_tab0 = //home/adam/github/fugger_2_reloaded/build`.
+//
+// A site's virtual path is left byte for byte: its separators belong to a URL and to
+// a path on a server, and rewriting them changes which file is meant. An archive's
+// virtual path is collapsed like any other local path - the doubled slash always comes
+// from the filesystem half, and a member name a listing can build never contains one.
+static void normalize_pane_path(const char* in, char* out, size_t n) {
+    if (!in || !*in) { snprintf(out, n, "/"); return; }
+    if (net_is_remote(in)) { snprintf(out, n, "%s", in); return; }
+
+    std::string s(in), r;
+    r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '/') { r += s[i]; continue; }
+        if (!r.empty() && r.back() == '/') continue;   // a run of slashes is one separator
+        r += '/';
+    }
+    while (r.size() > 1 && r.back() == '/') r.pop_back();   // a trailing one says nothing
+    if (r.empty()) r = "/";                                // "//" is still the root
+    snprintf(out, n, "%s", r.c_str());
+}
+
 void refresh_pane(Pane* pane, const char* path) {
-    bool dir_changed = strcmp(pane->current_dir, path) != 0;
+    // Every path a pane holds comes through this one door, which is the only place
+    // the spelling has to be fixed once. `path` is often `pane->current_dir` itself,
+    // so the result goes into its own buffer rather than being written back.
+    char norm[4096];
+    normalize_pane_path(path, norm, sizeof(norm));
+
+    bool dir_changed = strcmp(pane->current_dir, norm) != 0;
     char previous[4096];
     snprintf(previous, sizeof(previous), "%s", pane->current_dir);
     free_entries(pane->entries, pane->entry_count);
     // Nothing is a listing until one of the three branches below puts one there.
-    // A pane that walks onto a site with no saved login gets no listing at all,
-    // and rows that have been freed are only safe to leave behind with a count of
-    // zero to reach them.
+    // A pane that walks onto a site with no saved login gets no listing at all, and
+    // rows that have been freed are only safe to leave behind with a count of zero to
+    // reach them.
     pane->entries = nullptr;
     pane->entry_count = 0;
-    strncpy(pane->current_dir, path, sizeof(pane->current_dir) - 1);
+    strncpy(pane->current_dir, norm, sizeof(pane->current_dir) - 1);
     pane->current_dir[sizeof(pane->current_dir) - 1] = '\0';
     pane->selected = 0;
     pane->anchor = 0;
     pane->rel.clear();
     char arch[4096], prefix[1024];
     std::string nroot, nrpath;
-    if (net_split_virtual(path, &nroot, &nrpath)) {
+    if (net_split_virtual(norm, &nroot, &nrpath)) {
         const NetSite* site = net_site_for(nroot);
         std::string err;
         if (site) {
@@ -699,7 +739,7 @@ void refresh_pane(Pane* pane, const char* path) {
         pane->archive_path[0] = '\0';
         pane->archive_prefix[0] = '\0';
         pane->list_mode = LIST_REMOTE;
-    } else if (arch_split_virtual(path, arch, sizeof arch, prefix, sizeof prefix)) {
+    } else if (arch_split_virtual(norm, arch, sizeof arch, prefix, sizeof prefix)) {
         list_archive_dir(arch, prefix, &pane->entries, &pane->entry_count, &pane->rel);
         snprintf(pane->archive_path, sizeof pane->archive_path, "%s", arch);
         snprintf(pane->archive_prefix, sizeof pane->archive_prefix, "%s", prefix);
@@ -707,7 +747,7 @@ void refresh_pane(Pane* pane, const char* path) {
         pane->remote_path[0] = '\0';
         pane->list_mode = LIST_ARCHIVE;
     } else {
-        list_directory(path, &pane->entries, &pane->entry_count);
+        list_directory(norm, &pane->entries, &pane->entry_count);
         pane->archive_path[0] = '\0';
         pane->archive_prefix[0] = '\0';
         pane->remote_root[0] = '\0';
@@ -808,9 +848,13 @@ static void push_history(Pane* p, const char* new_dir) {
 
 // Navigate a pane to a path: records history and updates the active tab.
 static void navigate_to(AppPanes* app, Pane* pane, const char* path) {
-    if (strcmp(path, pane->current_dir) != 0) remember_selection(pane);
-    push_history(pane, path);
-    refresh_pane(pane, path);
+    // Normalized before it goes into the history as well as into the listing: a
+    // history full of `//home/adam` variants is the same bug one step later.
+    char norm[4096];
+    normalize_pane_path(path, norm, sizeof(norm));
+    if (strcmp(norm, pane->current_dir) != 0) remember_selection(pane);
+    push_history(pane, norm);
+    refresh_pane(pane, norm);
     restore_selection(pane);
     if (pane->tab_count > 0)
         snprintf(pane->tabs[pane->tab_active].dir, sizeof(pane->tabs[0].dir), "%s", pane->current_dir);
@@ -7782,9 +7826,15 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
         int n = 0, new_active = 0;
         for (int t = 0; t < count && n < MAX_TABS; t++) {
             if (!tabs[t][0]) continue;
-            if (!tab_dir_still_there(tabs[t])) continue;
+            // A saved tab can carry a doubled slash an older build wrote. Fixed here,
+            // on the way in, rather than only when the pane walks onto it: otherwise
+            // the tab's label and the next config write keep the old shape, and an
+            // inactive tab stays a different string from the same directory.
+            char clean[4096];
+            normalize_pane_path(tabs[t], clean, sizeof(clean));
+            if (!tab_dir_still_there(clean)) continue;
             if (t == active) new_active = n;
-            snprintf(dirs[n], 4096, "%s", tabs[t]);
+            snprintf(dirs[n], 4096, "%s", clean);
             n++;
         }
         if (n == 0) continue;
