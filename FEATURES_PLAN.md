@@ -35,7 +35,9 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | I keymap re-audit | done | every `MISS` row of §2 re-checked against `app_panes_handle_key`; two had never landed: `Ctrl+P` (path into the command line) and `Ctrl+I` (switch to the target pane, freed by moving invert to `Num*`) |
 | J app identity & shell | done | `src/version.h.in` → generated `version.h`; `--version`/`--help` before SDL starts; title bar `immc - <active dir>` with middle elision; menu bar `File`/`Commands`/`Options`/`Help`; Options dialog with a theme picker and a font picker over the system and user font directories; theme, font and size persist |
 | K text rendering | done | the glyph atlas goes through FreeType when `freetype2` is installed (`find_package(Freetype)` → `MC_HAVE_FREETYPE`, `imgui_freetype.cpp` linked in), and stays on stb_truetype when it is not; a named hinting mode (`default`/`none`/`light`/`mono`/`mono (no smoothing)`) in the Options dialog and as `font_hinting` in the config; the window is created high-pixel-density and the atlas is rebuilt when the display scale changes; the size rides on `style.FontScaleMain` for every font, because the size passed to `AddFont()` is read once, on the first frame, and never again |
-| L remote sites | done except L3 | `src/remote.{h,cpp}` — libcurl transport, `0600` sites file, MLSD and LIST parsers — and the remote pane mode in `panes.cpp`, compiling **and linking** with and without libcurl. `Ctrl+F` manager, `Ctrl+N` quick connect, `cd ftp://…`, and upload/download/mkdir/rename/delete/chmod are wired. `test-remote` runs 295 checks with 0 failures (188 without libcurl), `ctest` is 4/4 in both configurations, and the offscreen smoke run stays up in both. A remote copy runs on a worker thread with a transfer list under the panes, and quick view previews a row on a site or inside an archive — both are in §8.1, along with what libcurl forced into the design and what is still open. |
+| L remote sites | done except L3 | `src/remote.{h,cpp}` — libcurl transport, `0600` sites file, MLSD and LIST parsers — and the remote pane mode in `panes.cpp`, compiling **and linking** with and without libcurl. `Ctrl+F` manager, `Ctrl+N` quick connect, `cd ftp://…`, and upload/download/mkdir/rename/delete/chmod are wired. `Ctrl+D` leaves a site: the pane goes back to the local directory it walked in from and the cached connection for that site root is dropped through `net_forget_root`. `test-remote` runs 344 checks with 0 failures (190 without libcurl), `ctest` is 5/5 in both configurations, and the offscreen smoke run stays up in both. A remote copy runs on a worker thread with a transfer list under the panes, and quick view previews a row on a site or inside an archive — both are in §8.1, along with what libcurl forced into the design and what is still open. |
+| N console | done | the bottom command line is gone. `Ctrl+Enter` opens a console window over either pane, `Enter` runs the line through `/bin/sh` **on a worker thread** in the focused pane's directory, output arrives as it is produced, `Esc` cancels a running command and then hides the window. The backlog - every command and its output, oldest first, with the directory each ran in - outlives the window, the pane, the directory and the process: it is written to the config and read back. `cd`/`pwd`/`clear`/`history`/`exit` are builtins, `cd` moves a pane. `Ctrl+P`, `Alt+C`, `Alt+F8` and `Alt+PgUp/PgDn` retargeted onto it, `Ctrl+Enter` on an executable file runs it into the same transcript. `src/proc.{h,cpp}` is the child-process runner the archives and the console now share. `CONSOLE_PLAN.md` is the record of the decisions. |
+| O transfer resume, the exists choice, `.sfv` | done | `TRANSFER_RESUME_PLAN.md`. A remote download writes to `<name>.part` and renames only on success, so an aborted transfer keeps its bytes; a stopped row gets **Resume**, and the answer is Resume / Start over / Skip (`R / S / Esc`). Resume is byte-level: `REST` for a download, `APPE` for an upload, and a finished length that does not match the server throws the partial away instead of accepting it. `test-remote` exercises it against three servers — one that honours `REST`, one that refuses it, one that will not answer `SIZE`. The exists prompt now has three answers, **Overwrite / Skip / Rename** (`Y / N / R`, `Esc` cancels the operation), carried through the plan record so the local copy, the extractor and the network worker all honour the same choice. `src/sfv.{h,cpp}` is CRC-32 (reflected `0xEDB88320`, table built in the source, no zlib dependency) and a parser for the shapes real `.sfv` writers produce; verification runs on a thread, counts up in the transfer strip, reports mismatch and missing in a window, and `Commands → Verify SFV` runs it on the focused pane. `sfv_verify = ask \| always \| never` in the config. The Properties window (`Alt+Enter`) now edits mode, owner and group on a local entry: nine `rwx` boxes and an octal field kept in step with each other, owner and group accepted as a name or a number, an empty field meaning unchanged, `lchown` so the link is chowned and not its target, a recursive apply that counts what it changed, and a refusal reported as `not permitted (ownership changes need root)` instead of as a change that happened. On a site it is `SITE CHMOD` only, and the window says that FTP has no owner or group to set. |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`,
 `font_hinting` and the size of the F3 quick view window (`quickview_w`/`quickview_h`). The hinting value
@@ -43,7 +45,10 @@ is a name and not a number, so a hand-edited config says what the dialog shows a
 not recognise is dropped back to `default` rather than guessed at. The quick view's size lives in the
 config because `io.IniFilename` is null — ImGui keeps a floating window's shape for a session and writes
 nothing down — and its position is deliberately not carried: coordinates from a monitor that has gone
-leave a window whose title bar cannot be reached.
+leave a window whose title bar cannot be reached. The console adds `console_w`, `console_h`,
+`console_save` and the backlog itself as `console<N>_cwd/_cmd/_out/_code/_builtin`, with a command's
+output escaped so one entry stays one config line: 50 entries and 2 KB of each one's output, because
+the file is meant to stay readable by the person it belongs to.
 
 **Archives (§6) closed the last missing binding**, and inside an archive `F5` copies the marked
 members out into the other pane, as TC's does. Four rows stay partial, each a deliberate shape
@@ -62,8 +67,11 @@ name round-trip and its translation to the loader's flags, the font size reachin
 actually draws at for either font, the framebuffer scale derived from a
 window's logical and pixel sizes, the identity strings, the title
 bar's elision, the Options dialog's keys and layout, the menu bar actually being
-drawn, and the quick filter taking the caret with the keys typed straight after
-it) run headless — 1692 checks in `test-panes` plus 220 in `test-archive`:
+drawn, the quick filter taking the caret with the keys typed straight after
+it, the console's keyboard ownership, backlog, builtins, caps and config
+round-trip, and the buffer-ownership rule that a text field ImGui has the caret in
+must be asked to reload before the app's own write to its buffer is visible) run
+headless — 2042 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` and 51 in `test-sfv`:
 `cmake --build build -j4 && (cd build && ctest)`.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -82,6 +90,14 @@ against whichever window holds focus a frame later, so a window appearing in bet
 - the F3 preview, a dialog - swallows it, and the filter's request is repeated until
 the field really has the keyboard. Both are tested with a virtual mouse: press and
 release on a menu title, then on its first item, and check the item fired.
+The command line that paragraph is about is gone (Phase N): the console asks for the
+keyboard only on the frame it is opened, so the every-frame request, the
+`cmd[0] == '\0'` conditions it forced on `Space` `Backspace` `Del` `/` `+` `-` `*`
+and `Ctrl+C/X/V`, and the click-to-claim rule that made them readable, are all out
+of the file. Those keys belong to the panes unconditionally now, and while the
+console's own field holds the keyboard every key but `Esc`, `Enter` and a bare
+`Up`/`Down` goes to ImGui instead - which is what makes `Ctrl+C`, `Ctrl+V`, `Ctrl+A`
+and `Ctrl+Z` copy, paste, select and undo inside the console's line.
 The identity is checked from the terminal too: `ctest` runs `mc-clone --version` and matches the name
 and the version in its output, the one path that has to work with no display at all.
 It caught real bugs: `?` was never handled in the glob matcher; `tree_toggle()` kept a `vector`
@@ -846,7 +862,7 @@ dump; a row that is not on this disk does not, because pulling one down to find 
 is for.
 
 **Verified.** `test-remote`: 295 checks, 0 failures — 188 in a build without libcurl, where the
-transport half is skipped and the parsers, the URL layer and the sites file still run. `ctest`: 4/4 in
+transport half is skipped and the parsers, the URL layer and the sites file still run. `ctest`: 5/5 in
 both configurations. `SDL_VIDEODRIVER=offscreen timeout 3 ./build/mc-clone` stays up in both. `--version`
 prints `remote sites: libcurl 8.22.0 (OpenSSL/3.6.5)`, or `remote sites: no FTP support in this build
 (install libcurl and rebuild to browse FTP)`.
@@ -1108,3 +1124,26 @@ directory never reach the total because directories contribute nothing, which is
 case needed no special handling. The ID sweep here is a coarse pass over the bottom 90 px of the
 window rather than the full-window sweep `test_ui_id_uniqueness` already runs, which covers the
 same strip.
+
+## 10. A crash worth recording: a style stack that read its own condition twice
+
+`render_tab_bar()` highlighted the active tab by pushing two button colours before the
+button and popping them after it, with the same `t == pane.tab_active` test on both
+sides. Clicking a tab *changes* which tab is active, so for the tab being clicked the
+push was skipped and the pop ran: `PopStyleColor(2)` with nothing behind it, which Dear
+ImGui answers with `IM_ASSERT_USER_ERROR`. Clicking any tab that was not the active one
+ended the process. It reached a user as "the first tab is not the active one, and
+clicking it crashes", which is the only case the bug needs.
+
+The fix is to decide the highlight once, into a local, before the button is drawn.
+`test-panes` now drives the real widget in a headless ImGui frame — hover sweep to find
+the tab's position, mouse down, mouse up — and measures `ColorStack.Size` on both sides
+of the tab bar with four colours of the test's own pushed underneath, so an unbalanced
+pop shows up as a changed count instead of an assert that would take the whole suite
+down with it. Drawing without a click was already balanced; only the frame the click
+lands in was not, which is why this survived every previous run.
+
+The rule, for next time: a push and its pop must be conditioned on the same value, and
+a widget the user can *change by clicking* is not that value. The two remaining
+conditional pops in the file — both list modes of `render_file_list` — already use a
+`pushed` counter set by the pushes themselves, which is the shape that cannot drift.

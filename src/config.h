@@ -2,10 +2,28 @@
 #define CONFIG_H
 
 #include <stddef.h>   // size_t, for mc_config_path
+#include <string>
+#include <vector>
 
 // User configuration, stored as key = value lines in
 // ~/.config/mc-clone/config (written back on exit).
 static const int MC_MAX_TABS = 8;   // keep in sync with MAX_TABS in panes.h
+// How much of the backlog the file carries. The panes keep more in memory; this
+// is the part that survives a restart, and it is what a person reading the file
+// has to skip past.
+static const int MC_MAX_CONSOLE_ENTRIES = 50;   // keep in sync with panes.h
+
+// One console command carried across a restart: the line, the directory it ran
+// in, what it printed, and how it ended. Its own type rather than AppPanes'
+// ConsoleEntry so reading the config does not require knowing what the panes
+// look like.
+struct MCConsoleEntry {
+    std::string cwd;
+    std::string cmd;
+    std::string out;
+    int  code = -1;
+    bool builtin = false;
+};
 
 struct MCConfig {
     int   win_x, win_y;   // window position; -1 = let the window manager place it
@@ -45,6 +63,24 @@ struct MCConfig {
     char right_tabs[MC_MAX_TABS][4096];
     int  right_tab_count;
     int  right_tab_active;
+
+    // Console window size in pixels, restored at startup and written back on
+    // exit, exactly like the quick view's.
+    int  console_w, console_h;
+    // 1 = the console backlog is written to this file on exit and read back at
+    // startup. The transcript is plain text in a file this app writes with the
+    // default mode, so a command that carried a password lands in it; the switch
+    // exists so that can be turned off. It is a line in this file, not a dialog
+    // setting: what it protects has to be switchable without opening a window.
+    int  console_save;
+    // The backlog itself, oldest first, capped by the panes module.
+    std::vector<MCConsoleEntry> console_entries;
+
+    // "ask" (default), "always" or "never": what happens after a download when the
+    // folder it landed in holds a .sfv. A value this file does not carry, or carries
+    // misspelled, is read as "ask": the default that asks is safer than the one that
+    // stays quiet, and a typo in a config line should not silently turn off a check.
+    char sfv_verify[16];
 };
 
 // Absolute path of the config file, for the About window to name. Does not

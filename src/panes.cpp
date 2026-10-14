@@ -1,6 +1,8 @@
 #include "panes.h"
 #include "filesystem.h"
 #include "archive.h"
+#include "proc.h"   // the shared child-process runner: pipe, /dev/null stdin, cancel
+#include "sfv.h"    // .sfv verification: CRC-32 and the parser
 #include "theme.h"
 #include "config.h"
 #include "version.h"   // generated: MC_APP_NAME, MC_VERSION
@@ -21,12 +23,15 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <pwd.h>
+#include <grp.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <cstdio>
+#include <set>
 #include <cerrno>
 #include <libgen.h>
 #include <float.h>
+#include <poll.h>
 #include <time.h>
 #include <algorithm>
 #include <map>
@@ -94,18 +99,18 @@ AppPanes::AppPanes() {
     op_focus_request = false;
     op_focus = OF_FIELD;
     status_msg[0] = '\0';
-    cmd[0] = '\0';
-    cmd_hist_count = 0;
-    cmd_hist_pos = 0;
-    cmd_field_active = false;
-    cmd_field_claimed = false;
-    output_open = false;
-    output_text[0] = '\0';
+    console_open = false;
+    console_field_active = false;
+    console_focus_request = false;
+    console_input[0] = '\0';
+    console_input_reload = false;
+    console_hist_pos = 0;
+    console_scroll_lock = false;
     confirm = CONF_NONE;
     confirm_text[0] = '\0';
     hotlist_open = false;
     dirhist_open = false;
-    cmdhist_open = false;
+    console_hist_open = false;
     volumes_open = false;
     volumes_target = 0;
     remote_mgr_open = false;
@@ -178,7 +183,7 @@ AppPanes::AppPanes() {
     prog_handoff = false;
     op_run_bg = false;
     pending_op = DEFER_NONE;
-    pending_confirm_yes = false;
+    pending_confirm_answer = CONF_ANS_NONE;
     sdl_window = nullptr;
     view_mode = VIEW_MID;
     show_hidden = false;
@@ -1083,80 +1088,322 @@ static void fmt_date(time_t t, char* out, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// Command line: builtins + popen, output shown in a window
+// Console: the Ctrl+Enter window, its builtins, and the shell it runs
 // ---------------------------------------------------------------------------
 
-static void run_shell_and_show(AppPanes* app, const char* shell_cmd) {
-    FILE* p = popen(shell_cmd, "r");
-    if (!p) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Failed to run: %s", strerror(errno));
-        return;
-    }
-    size_t total = 0;
-    size_t cap = sizeof(app->output_text) - 1;
-    while (total < cap) {
-        size_t n = fread(app->output_text + total, 1, cap - total, p);
-        if (!n) break;
-        total += n;
-    }
-    app->output_text[total] = '\0';
-    pclose(p);
-    app->output_open = true;
-}
-
-// Defined with the remote dialogs. "cd ftp://..." on the command line and the
-// Ctrl+N field both end up there, so a typed address means one thing however it
-// was entered.
+// Defined with the remote dialogs. "cd ftp://..." in the console and the Ctrl+N
+// field both end up there, so a typed address means one thing however it was
+// entered.
 static void remote_open_url(AppPanes* app, const char* url);
 
-static void exec_command(AppPanes* app) {
-    char* c = app->cmd;
-    while (*c == ' ') c++;
-    if (!*c) return;
+// Defined with the transfer rows, but the progress dialog needs it too: an ETA in
+// seconds is a number the user has to do arithmetic on. See `fmt_secs`.
+static void fmt_secs(double s, char* out, size_t n);
 
-    if (app->cmd_hist_count < (int)(sizeof(app->cmd_history) / sizeof(app->cmd_history[0])))
-        snprintf(app->cmd_history[app->cmd_hist_count++], sizeof(app->cmd_history[0]), "%s", c);
-    app->cmd_hist_pos = app->cmd_hist_count;
+// Drop a multi-byte character a cut left half-written. A trailing run of
+// continuation bytes is only a character if the lead byte in front of it promises
+// exactly that many of them; if it promises more, the whole run is dropped rather
+// than left for ImGui's decoder to guess at.
+static void trim_partial_utf8(std::string& s) {
+    size_t i = s.size();
+    while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0 || i == s.size()) return;              // nothing half-written
+    unsigned char lead = (unsigned char)s[i - 1];
+    if (lead < 0xC0) return;                          // plain ASCII before the run
+    int total = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : 2);
+    if ((int)(s.size() - i + 1) == total) return;     // complete: keep it
+    s.resize(i - 1);
+}
+
+// A command's output is drawn as one block of text, so it has to be text by the
+// time it lands. A progress bar that redraws one line with '\r' is otherwise a
+// wall of control characters, `cat` of a binary file is not text at all, and
+// ImGui's vertex builder is the wrong place to discover either. Cleaned on append
+// rather than on draw, so nothing downstream has to remember to do it.
+static void console_append(ConsoleJob* job, const char* s, size_t n) {
+    std::lock_guard<std::mutex> lk(job->mu);
+    if (job->out.size() >= MC_CONSOLE_MAX_OUTPUT) return;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\n' || c == '\t') { job->out.push_back((char)c); continue; }
+        if (c == '\r') continue;                      // a line redraw, not a line break
+        if (c >= 0x20 && c != 0x7F) { job->out.push_back((char)c); continue; }
+        job->out += "\xC2\xB7";                       // the rest becomes a middot
+    }
+    // >= and not >: a chunk that lands exactly on the cap would otherwise stop the
+    // command's output short without ever saying that it did.
+    if (job->out.size() >= MC_CONSOLE_MAX_OUTPUT) {
+        job->out.resize(MC_CONSOLE_MAX_OUTPUT);
+        trim_partial_utf8(job->out);
+        job->out += "\n... output truncated ...";
+    }
+}
+
+// The backlog is oldest first and bounded: dropping the oldest command is what
+// makes a long session's transcript the same size as a short one.
+static void console_push(AppPanes* app, const std::string& cwd, const std::string& cmd,
+                         const std::string& out, int code, bool builtin) {
+    ConsoleEntry e;
+    e.cwd = cwd; e.cmd = cmd; e.out = out; e.code = code; e.builtin = builtin;
+    app->console_log.push_back(e);
+    if ((int)app->console_log.size() > MC_CONSOLE_MAX_ENTRIES)
+        app->console_log.erase(app->console_log.begin(),
+                               app->console_log.end() - MC_CONSOLE_MAX_ENTRIES);
+}
+
+// Commands for Up/Down recall, separate from the transcript because the transcript
+// is a record of what happened and this is a list of things to type again. Two of
+// the same command in a row is one entry.
+static void console_hist_push(AppPanes* app, const std::string& line) {
+    if (!app->console_hist.empty() && app->console_hist.back() == line) {
+        app->console_hist_pos = (int)app->console_hist.size();
+        return;
+    }
+    app->console_hist.push_back(line);
+    if ((int)app->console_hist.size() > MC_CONSOLE_MAX_HIST)
+        app->console_hist.erase(app->console_hist.begin(),
+                                app->console_hist.end() - MC_CONSOLE_MAX_HIST);
+    app->console_hist_pos = (int)app->console_hist.size();
+}
+
+// Write the console's line from outside the text field. From the moment a field has
+// the keyboard ImGui edits its own copy of the buffer and displays that, so clearing
+// or prefilling the buffer from the app is not enough: the field still shows the old
+// text and writes it back over the app's change on the next frame. The reload request
+// is what tells the field to take the buffer again, with the caret at the end.
+static void console_set_input(AppPanes* app, const char* text) {
+    snprintf(app->console_input, sizeof(app->console_input), "%s", text ? text : "");
+    app->console_input_reload = true;
+}
+
+// Up/Down inside the console field walk the commands, which is what Up/Down mean
+// in every shell. Walking past the newest one lands on a fresh empty line, so the
+// gesture round-trips: Up Up Up Down Down Down leaves the field as it was.
+static void console_history_step(AppPanes* app, bool up) {
+    int n = (int)app->console_hist.size();
+    if (n == 0) return;
+    if (app->console_hist_pos > n) app->console_hist_pos = n;
+    if (up) { if (app->console_hist_pos > 0) app->console_hist_pos--; }
+    else    { if (app->console_hist_pos < n) app->console_hist_pos++; }
+    if (app->console_hist_pos >= n) console_set_input(app, "");
+    else console_set_input(app, app->console_hist[app->console_hist_pos].c_str());
+}
+
+// Settle a command that has finished: move the worker's output into the backlog
+// entry and join the thread. Only a job that has published `done` is ever joined,
+// and the join happens before anything can drop the record - the rule BgTransfer
+// and QvFetch follow, for the same reason: a std::thread that is still joinable
+// when it is destroyed ends the process.
+static void console_reap(AppPanes* app) {
+    ConsoleJob* job = app->console_job.get();
+    if (!job || !job->done.load()) return;
+    std::string out;
+    { std::lock_guard<std::mutex> lk(job->mu); out = job->out; }
+    int code = job->code;
+    bool cancelled = job->cancel.load();
+    if (job->worker.joinable()) job->worker.join();
+    app->console_job.reset();
+    if (app->console_log.empty()) return;
+    ConsoleEntry& e = app->console_log.back();   // the running command is always the last
+    e.out = out;
+    e.code = code;
+    e.cancelled = cancelled;
+    // Silence on success. A transcript that says "exit 0" after every command is
+    // noise, and the exit code is only interesting when it is not zero.
+    if (cancelled) {
+        if (!e.out.empty()) e.out += "\n";
+        e.out += "interrupted";
+    } else if (code != 0) {
+        if (!e.out.empty()) e.out += "\n";
+        e.out += "exit " + std::to_string(code);
+    }
+    app->console_scroll_lock = false;
+}
+
+// The worker: run the line through the shell in the directory the focused pane is
+// showing, and feed the output to the window as it arrives, which is what lets a
+// `find` that takes a minute show its results while it is still running. poll()
+// with a timeout rather than a blocking read, because a cancel has to land while
+// the tool is silent, not only when it next writes something.
+static void console_worker(ConsoleJob* job, std::string line, std::string cwd) {
+    Proc p;
+    std::string err;
+    // The shell, not execvp on the first word: pipes, redirection and globbing are
+    // what make a console worth typing into.
+    std::vector<std::string> argv = { "/bin/sh", "-c", line };
+    if (!proc_start(argv, cwd.c_str(), kNoEnv, &p, &err)) {
+        // No pipe or no fork. There is no child to report it, so the job does.
+        console_append(job, err.c_str(), err.size());
+        job->code = 127;
+        job->done.store(true);
+        return;
+    }
+    char buf[4096];
+    for (;;) {
+        struct pollfd pf;
+        pf.fd = p.fd; pf.events = POLLIN; pf.revents = 0;
+        int r = poll(&pf, 1, 100);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) { if (job->cancel.load()) break; continue; }   // silent: check for a cancel
+        ssize_t n = read(p.fd, buf, sizeof buf);
+        if (n > 0) { console_append(job, buf, (size_t)n); continue; }
+        if (n == 0) break;                        // EOF: the command is done
+        if (errno == EINTR || errno == EAGAIN) continue;
+        break;
+    }
+    close(p.fd);
+    // code is written before done publishes it, which is the order the frame that
+    // reads `done` relies on.
+    job->code = proc_finish(&p, job->cancel.load());
+    job->done.store(true);
+}
+
+// The console's `cd` moves a pane, not the process. The app's own working
+// directory is not where the user is looking, and a console that changed it would
+// move the ground under the next command without moving anything on screen. The
+// path rules are the ones the command line had, unchanged: `~`, an absolute path,
+// a path relative to the pane, and a URL, which is a directory too.
+static void console_cd(AppPanes* app, const char* arg) {
+    while (*arg == ' ') arg++;
+    Pane& active = app->left_focus ? app->left : app->right;
+    char target[4096];
+    const char* home = getenv("HOME");
+    if (!*arg) {
+        snprintf(target, sizeof(target), "%s", home ? home : "/");
+    } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\0')) {
+        snprintf(target, sizeof(target), "%s%s", home ? home : "", arg + 1);
+    } else if (net_is_remote(arg)) {
+        snprintf(target, sizeof(target), "%s", arg);
+    } else if (arg[0] == '/') {
+        snprintf(target, sizeof(target), "%s", arg);
+    } else {
+        snprintf(target, sizeof(target), "%s/%s", active.current_dir, arg);
+    }
+    if (net_is_remote(target)) { remote_open_url(app, target); return; }
+    DIR* probe = opendir(target);
+    if (probe) {
+        closedir(probe);
+        navigate_to(app, &active, target);
+    } else {
+        snprintf(app->status_msg, sizeof(app->status_msg), "cd: no such directory: %s", target);
+    }
+}
+
+// Start a shell command in the focused pane's directory and record it in the
+// backlog. Defined below console_run, which is the half that decides a line is a
+// command at all; the other caller is Enter on an executable file, where the
+// command is already decided.
+static void console_start(AppPanes* app, const std::string& line);
+
+// Run one console line. Builtins are answered here, on this thread; everything
+// else is a shell command in the directory the focused pane is showing, on a
+// worker, so a command that takes a minute does not take the UI with it.
+static void console_run(AppPanes* app) {
+    console_reap(app);
+    if (app->console_job) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "A command is still running. Esc cancels it.");
+        return;
+    }
+
+    char line[512];
+    snprintf(line, sizeof(line), "%s", app->console_input);
+    char* c = line;
+    while (*c == ' ') c++;
+    size_t len = strlen(c);
+    while (len && c[len - 1] == ' ') c[--len] = '\0';   // trailing spaces are never meant
+    if (!len) return;
+
+    console_set_input(app, "");   // the line ran; the box is for the next one
+    app->console_hist_open = false;
+    console_hist_push(app, c);
 
     Pane& active = app->left_focus ? app->left : app->right;
+    const std::string cwd = active.current_dir;
 
-    if (strcmp(c, "cd") == 0 || strncmp(c, "cd ", 3) == 0) {
-        const char* arg = c + 2;
-        while (*arg == ' ') arg++;
-        char target[4096];
-        const char* home = getenv("HOME");
-        if (!*arg) {
-            snprintf(target, sizeof(target), "%s", home ? home : "/");
-        } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\0')) {
-            snprintf(target, sizeof(target), "%s%s", home ? home : "", arg + 1);
-        } else if (net_is_remote(arg)) {
-            // A URL is a directory too, just not one the relative-path rules can
-            // join onto the folder the pane is in.
-            snprintf(target, sizeof(target), "%s", arg);
-        } else if (arg[0] == '/') {
-            snprintf(target, sizeof(target), "%s", arg);
-        } else {
-            snprintf(target, sizeof(target), "%s/%s", active.current_dir, arg);
-        }
-        if (net_is_remote(target)) {
-            remote_open_url(app, target);
-        } else {
-            DIR* probe = opendir(target);
-            if (probe) {
-                closedir(probe);
-                navigate_to(app, &active, target);
-            } else {
-                snprintf(app->status_msg, sizeof(app->status_msg), "cd: no such directory: %s", target);
-            }
-        }
-    } else if (strcmp(c, "exit") == 0 || strcmp(c, "quit") == 0) {
+    if (strcmp(c, "exit") == 0 || strcmp(c, "quit") == 0) {
+        console_push(app, cwd, c, "", -1, true);
         app->quit_request = true;
-    } else {
-        char shell_cmd[600];
-        snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1", c);
-        run_shell_and_show(app, shell_cmd);
+        return;
     }
-    app->cmd[0] = '\0';
+    if (strcmp(c, "clear") == 0) {
+        // Not an entry of its own: this is the command that removes entries, and
+        // recording it would leave the transcript one line shorter than it looks.
+        app->console_log.clear();
+        app->console_scroll_lock = false;
+        return;
+    }
+    if (strcmp(c, "pwd") == 0) { console_push(app, cwd, c, cwd, 0, true); return; }
+    if (strcmp(c, "history") == 0) {
+        std::string dump;
+        for (size_t i = 0; i < app->console_hist.size(); i++) {
+            dump += std::to_string(i + 1);
+            dump += "  ";
+            dump += app->console_hist[i];
+            dump += '\n';
+        }
+        while (!dump.empty() && dump.back() == '\n') dump.pop_back();
+        if (dump.empty()) dump = "(empty)";
+        console_push(app, cwd, c, dump, 0, true);
+        return;
+    }
+    if (strcmp(c, "cd") == 0 || strncmp(c, "cd ", 3) == 0) {
+        console_cd(app, c + 2);
+        Pane& after = app->left_focus ? app->left : app->right;
+        // The transcript says where the console is now sitting, because that is the
+        // thing `cd` changed. If the pane did not move, the reason is what belongs
+        // there instead.
+        std::string out = after.current_dir;
+        if (out == cwd && app->status_msg[0]) out = app->status_msg;
+        console_push(app, cwd, c, out, -1, true);
+        return;
+    }
+
+    // A shell command needs a directory the operating system understands. Inside
+    // an archive or on a site the pane's directory is a name only this program
+    // understands, and running the command in the directory the pane walked in
+    // from would be a guess about what the user meant.
+    if (in_archive(active) || in_remote(active)) {
+        console_push(app, cwd, c,
+                     in_archive(active)
+                         ? "This pane is inside an archive: there is no directory here to run a "
+                           "command in. Extract it, or cd to a real directory."
+                         : "This pane is on a site. The console runs commands on this machine; cd "
+                           "to a real directory first.",
+                     127, true);
+        return;
+    }
+
+    console_start(app, c);
+}
+
+// Start a shell command in the focused pane's directory and record it in the
+// backlog. Split out of console_run because Enter on an executable file is the
+// same thing with the command already decided: the answer belongs in the console
+// either way, and it belongs on a thread either way.
+static void console_start(AppPanes* app, const std::string& line) {
+    console_reap(app);
+    if (app->console_job) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "A command is still running. Esc cancels it.");
+        return;
+    }
+    Pane& active = app->left_focus ? app->left : app->right;
+    console_push(app, active.current_dir, line, "", -1, false);
+    app->console_scroll_lock = false;
+    app->console_job = std::make_unique<ConsoleJob>();
+    app->console_job->worker = std::thread(console_worker, app->console_job.get(),
+                                           line, std::string(active.current_dir));
+}
+
+// Open the console and, when asked, take the keyboard for its field. Focus is
+// requested for the next frame rather than this one: a request lands on the frame
+// after the ask, and asking while a press is in flight takes ActiveId away from
+// whatever is being clicked, so the release finds a different item and the click
+// is dropped.
+static void console_show(AppPanes* app, bool focus) {
+    app->console_open = true;
+    if (focus) app->console_focus_request = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,10 +1989,16 @@ static void render_progress_dialog(AppPanes* app) {
     snprintf(overlay, sizeof(overlay), "%.1f%%", frac * 100.0f);
     ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
 
-    char done_s[32], total_s[32], rem_s[32], rate_s[32];
+    char done_s[32], total_s[32], rem_s[32], rate_s[32], el_s[24], eta_s[24];
     human_size((off_t)app->prog_done, done_s, sizeof(done_s));
     human_size((off_t)app->prog_total, total_s, sizeof(total_s));
-    human_size((off_t)(app->prog_total - app->prog_done), rem_s, sizeof(rem_s));
+    // A transfer whose total is not known yet - a tree whose listing has not been
+    // counted - has no remaining byte count, and `total - done` would print one as
+    // a negative number of bytes. Unknown is the truth.
+    if (app->prog_total > 0)
+        human_size((off_t)(app->prog_total - app->prog_done), rem_s, sizeof(rem_s));
+    else
+        snprintf(rem_s, sizeof(rem_s), "unknown");
 
     double now = SDL_GetTicks() / 1000.0;
     double elapsed = now - app->prog_t0;
@@ -1755,10 +2008,14 @@ static void render_progress_dialog(AppPanes* app) {
     ImGui::Text("Files:      %d / %d", app->prog_files_done, app->prog_files_total);
     ImGui::Text("%-10s %s of %s   Remaining: %s",
                 app->prog_is_delete ? "Deleted:" : "Copied:", done_s, total_s, rem_s);
-    ImGui::Text("Throughput: %s/s   Elapsed: %.1fs", rate_s, elapsed);
+    // Minutes and hours, the way the transfer rows already spell them out. "ETA:
+    // 3720s" is a number the user has to do arithmetic on; "1h02m" is not.
+    fmt_secs(elapsed, el_s, sizeof(el_s));
+    ImGui::Text("Throughput: %s/s   Elapsed: %s", rate_s, el_s);
     if (rate > 1.0 && app->prog_total > app->prog_done) {
         double eta = (double)(app->prog_total - app->prog_done) / rate;
-        ImGui::Text("ETA:        %.0fs", eta);
+        fmt_secs(eta, eta_s, sizeof(eta_s));
+        ImGui::Text("ETA:        %s", eta_s);
     }
 
     // Abort is a request, not a stop: the copy and the transport both poll the
@@ -2097,9 +2354,10 @@ static void elide_split(int keep, int* head, int* tail) {
     *tail = keep - *head;
 }
 
-// Ask for the caret to land on the item submitted next. Claiming it keeps the
-// command line's every-frame request from overwriting it later in the frame.
-static void claim_focus(AppPanes* app) {
+    // Ask for the caret to land on the item submitted next. Claiming it keeps a
+    // field that wants the keyboard on every frame from taking it back later in the
+    // same frame.
+    static void claim_focus(AppPanes* app) {
     ImGui::SetKeyboardFocusHere();
     app->focus_claimed = true;
 }
@@ -2651,14 +2909,53 @@ static int plan_existing(const OpPlan& plan) {
     return n;
 }
 
+// The name beside an existing one: "report.pdf" -> "report (2).pdf", then (3),
+// until the name is free. The dot that counts is the last one after the last
+// slash, so a directory - or a name with no dot at all - takes the number at the
+// end, which is what a user expects from a folder called `src`.
+//
+// `taken` is what the destination directory already holds. When it is null the
+// destination is a local directory and each candidate is asked directly: a stat
+// per candidate is cheaper than listing the directory, and it cannot be stale.
+// When it is not null it is a listing of a directory on a server, where asking
+// per candidate is not something the protocol offers.
+static std::string rename_beside(const std::string& dst, const std::set<std::string>* taken) {
+    size_t slash = dst.find_last_of('/');
+    std::string dir  = (slash == std::string::npos) ? std::string() : dst.substr(0, slash + 1);
+    std::string leaf = (slash == std::string::npos) ? dst : dst.substr(slash + 1);
+    std::string stem = leaf, ext;
+    size_t dot = leaf.find_last_of('.');
+    if (dot != std::string::npos && dot != 0) { stem = leaf.substr(0, dot); ext = leaf.substr(dot); }
+    for (int n = 2; n < 1000; n++) {
+        std::string cand = stem + " (" + std::to_string(n) + ")" + ext;
+        if (taken) { if (!taken->count(cand)) return dir + cand; }
+        else if (!fs_exists((dir + cand).c_str())) return dir + cand;
+    }
+    return dst;   // nothing free in a thousand tries: overwriting is what is left
+}
+
 // Run one copy or move over the plan's names. The names, not the pane's marks,
 // decide what gets touched: the dialog showed a list, and a click while the
 // overwrite confirm is up must not change what the operation acts on.
-static int run_names_prog(AppPanes* app, const OpPlan& plan, fs_progress_fn cb, void* user) {
+//
+// The same confirm also decided what to do with the names that collided, and this
+// is where that decision is honoured: skip leaves the target alone and counts
+// itself, rename writes beside it. A skipped name is not a failure and is not a
+// success either, so it is counted separately.
+static int run_names_prog(AppPanes* app, const OpPlan& plan, fs_progress_fn cb, void* user,
+                          int* skipped) {
     int ok = 0;
+    if (skipped) *skipped = 0;
     for (size_t i = 0; i < plan.names.size(); i++) {
         std::string src = plan.src_dir + "/" + plan.names[i];
         std::string dst = plan_target(plan, i);
+        if (fs_exists(dst.c_str())) {
+            if (plan.overwrite == OpPlan::OW_SKIP) {
+                if (skipped) (*skipped)++;
+                continue;
+            }
+            if (plan.overwrite == OpPlan::OW_RENAME) dst = rename_beside(dst, nullptr);
+        }
         bool r = plan.is_move ? fs_move_entry_progress(src.c_str(), dst.c_str(), cb, user)
                               : fs_copy_entry_progress(src.c_str(), dst.c_str(), cb, user);
         if (r) ok++;
@@ -2793,7 +3090,12 @@ static void bg_line(const BgTransfer* t, char* out, size_t n) {
 // may not touch AppPanes. The site arrives by value for the same reason: the user
 // can edit or remove the saved site mid-transfer, and the transfer keeps the login
 // it started with.
-static void bg_run_remote(BgTransfer* t, const NetSite& site, const OpPlan& plan) {
+static void bg_run_remote(BgTransfer* t) {
+    // The login and the plan travel inside the record now, because a stopped row
+    // has to be able to say what it was doing. Both are written before the thread
+    // starts and never touched again, so the worker only ever reads them.
+    const NetSite& site = t->site;
+    const OpPlan& plan = t->plan;
     // Pure string work, no globals, so it is safe to do here rather than hand the
     // result over with the plan.
     std::string droot, drpath;
@@ -2801,25 +3103,60 @@ static void bg_run_remote(BgTransfer* t, const NetSite& site, const OpPlan& plan
 
     std::string err;
     int ok = 0;
+    int skipped = 0;
+    std::set<std::string> remote_names;   // the upload's destination, as the server lists it
+    bool have_listing = false;
     for (size_t i = 0; i < plan.names.size(); i++) {
         std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
         bool r;
-        if (t->download) {
-            std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
-            std::string local = plan.dst_dir + "/" + base;
-            r = net_download_tree(site, src, local.c_str(), bg_progress_cb, t, &err);
-            if (r && plan.is_move) net_remove_tree(site, src, bg_progress_cb, t, &err);
-        } else {
-            std::string local = plan.src_dir + "/" + plan.names[i];
-            std::string dst = drpath.empty() ? base : drpath + "/" + base;
-            r = net_upload_tree(site, local.c_str(), dst, bg_progress_cb, t, &err);
-            if (r && plan.is_move) fs_delete_entry_progress(local.c_str(), bg_progress_cb, t);
-        }
+            if (t->download) {
+                std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
+                std::string local = plan.dst_dir + "/" + base;
+                // The destination of a download is a directory on this disk, so the
+                // collision is asked of this disk.
+                if (fs_exists(local.c_str())) {
+                    if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
+                    if (plan.overwrite == OpPlan::OW_RENAME)
+                        local = rename_beside(local, nullptr);
+                }
+                // A resume is per entry: the file with a `.part` continues from it and
+                // the ones without are fetched whole. A restart clears the sidecars.
+                r = net_download_tree(site, src, local.c_str(), bg_progress_cb, t, &err, t->resume);
+                if (r && plan.is_move) net_remove_tree(site, src, bg_progress_cb, t, &err);
+            } else {
+                std::string local = plan.src_dir + "/" + plan.names[i];
+                std::string dst = drpath.empty() ? base : drpath + "/" + base;
+                // The destination of an upload is on the server, and the server is the
+                // only thing that knows what is already there. One listing covers every
+                // name in the plan, which is what a per-name lookup cannot do.
+                if (plan.overwrite != OpPlan::OW_OVERWRITE && !have_listing) {
+                    have_listing = true;
+                    std::vector<FileEntry> rows;
+                    std::string lerr;
+                    if (net_list(site, drpath, &rows, &lerr))
+                        for (const FileEntry& fe : rows) remote_names.insert(fe.name);
+                }
+                if (have_listing && remote_names.count(base)) {
+                    if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
+                    if (plan.overwrite == OpPlan::OW_RENAME) {
+                        std::string beside = rename_beside(dst, &remote_names);
+                        remote_names.insert(beside.substr(beside.find_last_of('/') + 1));
+                        dst = beside;
+                    }
+                }
+                std::string rdst = dst;
+                std::string lsrc = local;
+                // Here the offset is the size the server already holds, which is what a
+                // stopped upload left behind on the far side.
+                r = net_upload_tree(site, lsrc.c_str(), rdst, bg_progress_cb, t, &err, t->resume);
+                if (r && plan.is_move) fs_delete_entry_progress(lsrc.c_str(), bg_progress_cb, t);
+            }
         if (r) ok++;
         if (t->abort) break;
     }
     t->ok_names = ok;
-    if (!ok)
+    t->skipped_names = skipped;
+    if (!ok && !skipped)
         t->error = t->abort.load() ? "stopped before anything transferred"
                                    : (err.empty() ? std::string("transfer failed") : err);
     // The clock stops here. The row outlives the thread and stays on screen, so a
@@ -2841,6 +3178,7 @@ static void bg_retire_oldest_finished(AppPanes* app) {
     for (size_t i = 0; i < app->transfers.size(); i++) {
         BgTransfer* old = app->transfers[i].get();
         if (old->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) continue;
+        if (old == app->choice_transfer) continue;   // a question about it is open
         if (old->worker.joinable()) old->worker.join();
         app->transfers.erase(app->transfers.begin() + (long)i);
         return;
@@ -2889,11 +3227,49 @@ static BgTransfer* bg_start_remote_plan(AppPanes* app, const OpPlan& plan) {
                       ? plan.src_dir
                       : net_virtual_path(plan.remote, plan.remote_prefix);
     t->dst      = plan.dst_dir;
+    // The record keeps its own plan and its own login: a row that stopped is only
+    // worth a Resume button if it still knows what it was doing and where.
+    t->plan     = plan;
+    t->site     = site;
+    t->resumable = true;
+    t->resume   = false;
     // Everything above is fixed before the thread starts, so the worker never
     // sees a half-built record.
-    t->worker = std::thread(bg_run_remote, t, site, plan);
+    t->worker = std::thread(bg_run_remote, t);
     app->transfers.push_back(std::move(up));
     return t;
+}
+
+// Start a stopped row again, which is the whole reason the record keeps its plan.
+// `restart` is the difference between continuing and starting over: a resume hands
+// the transport the offsets it can pick up - the size of each `.part` for a
+// download, the size the server reports for an upload - and a restart clears them
+// so the transfer runs from nothing.
+//
+// The worker being replaced has run to completion: a state that is not BG_RUNNING
+// is what its last store publishes, and the rule the struct carries is that only a
+// finished worker is ever joined.
+static void bg_resume_remote(AppPanes* app, BgTransfer* t, bool restart) {
+    if (!t) return;
+    if (t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) return;
+    if (t->worker.joinable()) t->worker.join();
+
+    t->done = 0;
+    t->total = 0;
+    t->files_done = 0;
+    t->files_total = 0;
+    t->error.clear();
+    t->ok_names = 0;
+    t->t_end_ms = 0;
+    t->settled = false;              // the finish has to be reported again
+    t->dismiss = false;
+    t->abort = false;
+    t->resume = !restart;
+    t->t0 = SDL_GetTicks() / 1000.0;
+    t->state.store(BgTransfer::BG_RUNNING, std::memory_order_release);
+    t->worker = std::thread(bg_run_remote, t);
+    snprintf(app->status_msg, sizeof(app->status_msg), "%s the transfer to %s",
+             restart ? "Restarting" : "Resuming", t->dst.c_str());
 }
 
 // Between frames, before anything is drawn. A transfer that has finished gets its
@@ -2901,22 +3277,359 @@ static BgTransfer* bg_start_remote_plan(AppPanes* app, const OpPlan& plan) {
 // user dismissed is joined and removed. The join happens here rather than in the
 // widget so that no button press can wait on a thread inside an ImGui frame - the
 // thread is already finished by then, but the ordering is the part that matters.
+// ---------------------------------------------------------------------------
+// .sfv verification: the worker, its row in the transfer strip, and its report.
+// ---------------------------------------------------------------------------
+
+enum { SFV_MODE_ASK = 0, SFV_MODE_ALWAYS, SFV_MODE_NEVER };
+
+// What should happen when a download lands in a folder that holds a .sfv. The
+// config's word, with the session's "Always" on top of it: a user who clicked
+// Always once in a dialog is not stuck with it the next time the app starts.
+static int sfv_mode(AppPanes* app) {
+    if (app->sfv_always_session) return SFV_MODE_ALWAYS;
+    const char* m = app->sfv_verify[0] ? app->sfv_verify : "ask";
+    if (!strcmp(m, "always")) return SFV_MODE_ALWAYS;
+    if (!strcmp(m, "never")) return SFV_MODE_NEVER;
+    return SFV_MODE_ASK;
+}
+
+static std::string sfv_base(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
+// Which .sfv a folder means when it holds more than one. A set is usually named
+// after itself - `pack.part1.rar` beside `pack.sfv` - so the one whose name shares
+// the longest prefix with what was transferred wins; with no match, a single file is
+// that file, and several are the shortest name, which is what a set ships.
+static bool sfv_pick(const std::string& dir, const std::vector<std::string>& names,
+                     std::string* out) {
+    std::vector<std::string> list;
+    if (!sfv_list(dir.c_str(), &list)) return false;
+
+    std::string best = list[0];
+    size_t best_score = 0;
+    for (const std::string& n : names) {
+        std::string stem = sfv_base(n);
+        size_t dot = stem.find('.');
+        if (dot != std::string::npos) stem = stem.substr(0, dot);
+        if (stem.empty()) continue;
+        for (const std::string& s : list) {
+            std::string sbase = sfv_base(s);
+            size_t sdot = sbase.find('.');
+            if (sdot != std::string::npos) sbase = sbase.substr(0, sdot);
+            if (sbase.empty()) continue;
+            size_t score = 0;
+            while (score < stem.size() && score < sbase.size() &&
+                   tolower((unsigned char)stem[score]) == tolower((unsigned char)sbase[score]))
+                score++;
+            if (score > best_score) { best_score = score; best = s; }
+        }
+    }
+    if (!best_score && list.size() > 1) {
+        best = list[0];
+        for (const std::string& s : list)
+            if (s.size() < best.size()) best = s;
+    }
+    if (out) *out = dir + "/" + best;
+    return true;
+}
+
+// The hashing runs here, one file at a time, with the row published as it goes so
+// the strip can count up. A file the .sfv lists and the folder does not have is
+// MISSING, which is a different answer from a checksum that does not match, and a
+// file the folder has and the .sfv does not list is not reported at all: the .sfv
+// says what it expects, and a folder with extra files is not its problem.
+static void sfv_worker(AppPanes* app, SfvJob* job) {
+    (void)app;
+    SfvParse p;
+    std::string err;
+    if (!sfv_parse(job->sfv_path.c_str(), job->sfv_path.c_str(), &p, &err)) {
+        std::lock_guard<std::mutex> lk(job->mu);
+        job->err = err;
+        job->state.store(2, std::memory_order_release);
+        return;
+    }
+    job->total.store((long long)p.entries.size(), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(job->mu);
+        job->malformed = p.malformed;
+    }
+    for (size_t i = 0; i < p.entries.size() && !job->cancel.load(); i++) {
+        const SfvEntry& e = p.entries[i];
+        SfvRow row;
+        row.name = e.name;
+        row.want = e.crc;
+        unsigned long got = 0;
+        std::string ferr;
+        std::string path = job->dir + "/" + e.name;
+        if (!sfv_crc32_file(path.c_str(), &got, &ferr)) {
+            row.status = SFV_MISSING;
+        } else {
+            row.got = got;
+            row.status = (got == e.crc) ? SFV_OK : SFV_MISMATCH;
+        }
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->rows.push_back(row);
+        }
+        job->done.fetch_add(1);
+    }
+    job->state.store(job->cancel.load() ? 2 : 1, std::memory_order_release);
+}
+
+static void sfv_job_start(AppPanes* app, const std::string& dir, const std::string& sfv_path,
+                          const OpPlan* plan, const NetSite* site) {
+    auto held = std::make_unique<SfvJob>();
+    SfvJob* job = held.get();
+    job->dir = dir;
+    job->sfv_path = sfv_path;
+    if (plan) { job->plan = *plan; job->has_plan = true; }
+    if (site) job->site = *site;
+    app->sfv_jobs.push_back(std::move(held));
+    job->worker = std::thread(sfv_worker, app, job);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Verifying against %s",
+             sfv_base(sfv_path).c_str());
+}
+
+// The summary of a finished run, once. A run with nothing wrong says so in the
+// status line and opens no window: a report that is always correct is a report
+// people learn to click past.
+static void sfv_reap(AppPanes* app) {
+    for (size_t i = 0; i < app->sfv_jobs.size();) {
+        SfvJob* job = app->sfv_jobs[i].get();
+        bool running = job->state.load(std::memory_order_acquire) == 0;
+        if (running) { i++; continue; }
+        if (job->worker.joinable()) job->worker.join();
+
+        if (!job->settled) {
+            job->settled = true;
+            int ok = 0, bad = 0, missing = 0;
+            {
+                std::lock_guard<std::mutex> lk(job->mu);
+                for (const SfvRow& r : job->rows) {
+                    if (r.status == SFV_OK) ok++;
+                    else if (r.status == SFV_MISSING) missing++;
+                    else bad++;
+                }
+            }
+            if (job->state.load() == 2 && !job->err.empty()) {
+                snprintf(app->status_msg, sizeof(app->status_msg), "SFV: %s", job->err.c_str());
+            } else if (job->cancel.load()) {
+                snprintf(app->status_msg, sizeof(app->status_msg),
+                         "SFV stopped after %lld of %lld files",
+                         job->done.load(), job->total.load());
+            } else {
+                snprintf(app->status_msg, sizeof(app->status_msg), "%s  %d listed  %d ok  %d bad",
+                         sfv_base(job->sfv_path).c_str(), (int)job->rows.size(), ok, bad + missing);
+            }
+            job->report_open = (bad + missing > 0) || job->malformed > 0 ||
+                               job->state.load() == 2;
+        }
+
+        if (!job->report_open || job->dismiss.load()) {
+            app->sfv_jobs.erase(app->sfv_jobs.begin() + (long)i);
+            continue;
+        }
+        i++;
+    }
+}
+
+// The row in the strip while the hashing runs. It is a row rather than a window
+// because the strip is where a user already looks for work the app is doing, and a
+// 4 GB file takes long enough to be worth watching.
+static void render_sfv_jobs(AppPanes* app) {
+    for (auto& held : app->sfv_jobs) {
+        SfvJob* job = held.get();
+        if (job->state.load(std::memory_order_acquire) != 0) continue;
+        long long total = job->total.load(), done = job->done.load();
+        ImGui::PushID(job);
+        ImGui::Text("verify %lld of %lld  %s", done, total, sfv_base(job->sfv_path).c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##sfv")) job->cancel.store(true);
+        ImGui::PopID();
+    }
+}
+
+// The plan "re-fetch the bad ones" runs: the names that failed, out of the transfer
+// that fetched them, overwriting the copies that failed. Split out of the report
+// window so the rule is testable without a display, and so the button cannot invent a
+// fetch from a verification that had no source to fetch from.
+static bool sfv_retry_plan(const SfvJob* job, const std::vector<SfvRow>& rows, OpPlan* out) {
+    if (!job->has_plan || job->plan.remote.empty()) return false;
+    out->remote = job->plan.remote;
+    out->dst_dir = job->plan.dst_dir;
+    // The bad copy is the thing being replaced, and asking again would ask about
+    // files the user has already been shown failing.
+    out->overwrite = OpPlan::OW_OVERWRITE;
+    out->names.clear();
+    for (const SfvRow& r : rows) {
+        if (r.status == SFV_OK) continue;
+        for (const std::string& n : job->plan.names)
+            if (n == r.name || sfv_base(n) == sfv_base(r.name)) out->names.push_back(n);
+    }
+    return !out->names.empty();
+}
+
+// The report. Names, what the .sfv expected, what the file has, and the one button
+// that can do something about it when the verification came out of a transfer that
+// is still in this session.
+static void render_sfv_reports(AppPanes* app) {
+    static const int SFV_MAX_ROWS = 100;
+    for (auto& held : app->sfv_jobs) {
+        SfvJob* job = held.get();
+        if (!job->report_open) continue;
+        int ok = 0, bad = 0, missing = 0;
+        std::vector<SfvRow> rows;
+        int malformed = 0;
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            rows = job->rows;
+            malformed = job->malformed;
+        }
+        for (const SfvRow& r : rows) {
+            if (r.status == SFV_OK) ok++;
+            else if (r.status == SFV_MISSING) missing++;
+            else bad++;
+        }
+
+        char title[128];
+        snprintf(title, sizeof(title), "SFV report - %s", sfv_base(job->sfv_path).c_str());
+        ImGui::Begin(title);
+        ImGui::Text("%s   %d listed   %d ok   %d mismatch   %d missing",
+                    sfv_base(job->sfv_path).c_str(), (int)rows.size(), ok, bad, missing);
+        if (malformed > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                               "%d line%s in the .sfv were not a name and a checksum",
+                               malformed, malformed == 1 ? "" : "s");
+        if (!job->err.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", job->err.c_str());
+        ImGui::Separator();
+
+        int shown = 0;
+        for (const SfvRow& r : rows) {
+            if (r.status == SFV_OK) continue;
+            if (shown >= SFV_MAX_ROWS) break;
+            char want[16], got[16];
+            sfv_format_crc(r.want, want, sizeof(want));
+            sfv_format_crc(r.got, got, sizeof(got));
+            if (r.status == SFV_MISSING)
+                ImGui::Text("%-40s  MISSING    want %s", r.name.c_str(), want);
+            else
+                ImGui::Text("%-40s  MISMATCH   want %s  got %s", r.name.c_str(), want, got);
+            shown++;
+        }
+        if ((int)rows.size() > shown)
+            ImGui::Text("(%d more row%s not shown)", (int)rows.size() - shown,
+                        (rows.size() - (size_t)shown) == 1 ? "" : "s");
+        if (rows.empty() && job->err.empty())
+            ImGui::Text("The .sfv lists nothing.");
+
+        ImGui::Separator();
+        bool bad_files = (bad + missing) > 0;
+        OpPlan retry;
+        bool can_retry = bad_files && sfv_retry_plan(job, rows, &retry);
+        if (can_retry) {
+            ImGui::Text("Re-fetch pulls the %d file%s that failed from %s again.",
+                        (int)retry.names.size(), retry.names.size() == 1 ? "" : "s",
+                        job->plan.remote.c_str());
+            if (ImGui::Button("Re-fetch the bad ones")) {
+                bg_start_remote_plan(app, retry);
+                job->dismiss.store(true);
+            }
+        } else if (bad_files) {
+            ImGui::Text("No transfer in this session fetched these files, so there is "
+                        "nothing here to re-fetch them from.");
+        }
+        if (ImGui::Button("Close")) job->dismiss.store(true);
+        ImGui::End();
+    }
+}
+
+// A download that landed something, was not aborted, and has a local destination is
+// where the offer belongs: the files are already here and the .sfv arrived with
+// them, which is the only moment the check is on the user's mind.
+static void sfv_offer_after_download(AppPanes* app, BgTransfer* t) {
+    if (!t->download || !t->ok_names || t->abort.load()) return;
+    if (sfv_mode(app) == SFV_MODE_NEVER) return;
+    std::string sfv;
+    if (!sfv_pick(t->plan.dst_dir, t->plan.names, &sfv)) return;
+    if (sfv_mode(app) == SFV_MODE_ALWAYS) {
+        sfv_job_start(app, t->plan.dst_dir, sfv, &t->plan, nullptr);
+        return;
+    }
+    app->sfv_pending_path = sfv;
+    app->sfv_pending_dir = t->plan.dst_dir;
+    app->sfv_pending_transfer = t;
+    snprintf(app->confirm_text, sizeof(app->confirm_text),
+             "%s is in %s.\nVerify the %d transferred file%s against it?\n\n"
+             "[Verify]  [Not now]  [Always]      (press V / N / A)",
+             sfv_base(sfv).c_str(), t->plan.dst_dir.c_str(), t->ok_names,
+             t->ok_names == 1 ? "" : "s");
+    app->confirm = CONF_SFV_VERIFY;
+    app->pending_confirm_answer = CONF_ANS_NONE;
+}
+
+// Commands → Verify SFV: the same job on the focused pane's directory, with no
+// fetching involved. A pane inside an archive or on a site is refused with a reason,
+// because "the directory the pane shows" is not a directory there, and a check that
+// quietly hashed nothing would be worse than one that says it did not run.
+static void sfv_run_for_pane(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (active.list_mode == LIST_ARCHIVE) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "This pane is inside an archive: verify a .sfv from a real directory");
+        return;
+    }
+    if (in_remote(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "This pane is on a site: Ctrl+D leaves it, then a .sfv can be verified");
+        return;
+    }
+    std::string sfv;
+    std::vector<std::string> none;
+    if (!sfv_pick(active.current_dir, none, &sfv)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "No .sfv in %s", active.current_dir);
+        return;
+    }
+    sfv_job_start(app, active.current_dir, sfv, nullptr, nullptr);
+}
+
 static void bg_reap(AppPanes* app) {
     for (size_t i = 0; i < app->transfers.size();) {
         BgTransfer* t = app->transfers[i].get();
         bool running = t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
         if (!running && !t->settled.exchange(true)) {
+            char skip_note[32] = "";
+            if (t->skipped_names)
+                snprintf(skip_note, sizeof(skip_note), "  %d left alone", t->skipped_names);
             if (t->ok_names)
                 snprintf(app->status_msg, sizeof(app->status_msg),
-                         "%s %d item%s to %s%s", t->is_move ? "Moved" : "Copied", t->ok_names,
+                         "%s %d item%s to %s%s%s", t->is_move ? "Moved" : "Copied", t->ok_names,
                          t->ok_names == 1 ? "" : "s", t->dst.c_str(),
-                         t->abort.load() ? " (aborted)" : "");
+                         t->abort.load() ? " (aborted)" : "", skip_note);
+            else if (t->skipped_names)
+                snprintf(app->status_msg, sizeof(app->status_msg),
+                         "Nothing transferred to %s  %d target%s left alone",
+                         t->dst.c_str(), t->skipped_names,
+                         t->skipped_names == 1 ? "" : "s");
             else
                 snprintf(app->status_msg, sizeof(app->status_msg), "%s failed: %s",
                          t->is_move ? "Move" : "Copy", t->error.c_str());
             refresh_for_destination(app, t->dst);
+            // The files are here and the .sfv arrived with them: this is the only
+            // moment the check is on the user's mind. A transfer that was aborted
+            // deliberately does not get asked, because the answer would be about a
+            // half-finished folder.
+            sfv_offer_after_download(app, t);
         }
         if (!running && t->dismiss.load()) {
+            // A row the choice dialog is asking about stays put: the answer arrives
+            // in a later frame, and a record that has been erased is not something
+            // that answer can be applied to.
+            if (t == app->choice_transfer) { i++; continue; }
             if (t->worker.joinable()) t->worker.join();
             app->transfers.erase(app->transfers.begin() + (long)i);
             continue;
@@ -2930,6 +3643,12 @@ static void bg_reap(AppPanes* app) {
 // stop lands between files, never in the middle of one, because a half-written
 // file is worse than no file.
 static void bg_stop_all(AppPanes* app) {
+    // The rows are about to go away, and a question about one of them goes with
+    // them rather than pointing at memory that has been freed.
+    app->choice = CHOICE_NONE;
+    app->choice_transfer = nullptr;
+    app->choice_pick = -1;
+    app->choice_text[0] = '\0';
     for (std::unique_ptr<BgTransfer>& t : app->transfers) t->abort = true;
     for (std::unique_ptr<BgTransfer>& t : app->transfers) {
         if (t->worker.joinable()) t->worker.join();
@@ -2950,7 +3669,7 @@ static float bg_strip_height(const AppPanes* app, float frame) {
 // The transfer list, between the panes and the command line. It claims no space
 // while it is empty, so a session that never touches the network never sees it.
 static void render_transfers(AppPanes* app, float h) {
-    if (app->transfers.empty()) return;
+    if (app->transfers.empty() && app->sfv_jobs.empty()) return;
     ImGui::Spacing();
     ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
     if (app->transfers.size() > 6) flags |= ImGuiTableFlags_ScrollY;
@@ -2960,7 +3679,7 @@ static void render_transfers(AppPanes* app, float h) {
     ImGui::TableSetupColumn("Transfer", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 150.0f);  // the bar
     ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 330.0f);  // the numbers
-    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 80.0f);   // the button
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 140.0f);  // the buttons
 
     // Header: how many, and one place to clear the finished rows, which
     // otherwise sit there until the session ends.
@@ -3026,11 +3745,31 @@ static void render_transfers(AppPanes* app, float h) {
         if (running) {
             if (ImGui::SmallButton(t->abort.load() ? "stopping" : "Abort")) t->abort = true;
         } else {
+            // A row that stopped with work left is the one worth starting again,
+            // and only a row that still holds its plan and its login can be. A
+            // finished one has nothing left to do.
+            bool stopped = st == BgTransfer::BG_ABORTED || st == BgTransfer::BG_FAILED;
+            if (stopped && t->resumable && ImGui::SmallButton("Resume")) {
+                char got[32], owed[32];
+                human_size((off_t)t->done.load(), got, sizeof(got));
+                human_size((off_t)t->total.load(), owed, sizeof(owed));
+                app->choice = CHOICE_RESUME;
+                app->choice_transfer = t;
+                snprintf(app->choice_text, sizeof(app->choice_text),
+                         "%s to %s stopped with %s of %s done. Continue from what is already "
+                         "there, throw it away and run again, or leave it?",
+                         t->download ? "Download" : "Upload", t->dst.c_str(), got, owed);
+                app->choice_pick = -1;
+            }
             if (ImGui::SmallButton("clear")) t->dismiss = true;
         }
         ImGui::PopID();
     }
     ImGui::EndTable();
+    // A .sfv that is still hashing gets a line under the transfer rows rather than a
+    // row inside the table: it has no bytes, no bar and no source, and inventing
+    // columns for it would make the table describe two different kinds of work.
+    render_sfv_jobs(app);
 }
 
 // The one runner for copy, move and copying out of an archive. The dialog, the
@@ -3053,16 +3792,38 @@ static void run_op_plan(AppPanes* app) {
             if (active.marked[i]) { slot = i; break; }
 
     if (!plan.archive.empty()) {
+        // A skip is decided here rather than inside the extractor: the tool is told
+        // which members to write, and not asking for the one whose target is already
+        // there is the same answer without needing a "do not overwrite" flag per
+        // tool - which zip, tar and 7z each spell differently. Rename is not offered
+        // for an archive at all: the names inside it are the extractor's to write.
+        std::vector<std::string> raws = plan.raw_names;
+        int skipped = 0;
+        if (plan.overwrite == OpPlan::OW_SKIP) {
+            raws.clear();
+            for (size_t i = 0; i < plan.raw_names.size(); i++) {
+                if (fs_exists(plan_target(plan, i).c_str())) { skipped++; continue; }
+                raws.push_back(plan.raw_names[i]);
+            }
+        }
+        if (raws.empty()) {
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Nothing extracted from %s  %d target%s left alone", plan.archive.c_str(),
+                     skipped, skipped == 1 ? "" : "s");
+            refresh_for_destination(app, plan.dst_dir);
+            return;
+        }
         arch_prog_begin(app, plan.archive.c_str(), plan.dst_dir.c_str());
         std::string err;
-        bool ok = arch_extract_members(plan.archive.c_str(), plan.dst_dir.c_str(), plan.raw_names,
+        bool ok = arch_extract_members(plan.archive.c_str(), plan.dst_dir.c_str(), raws,
                                        copy_progress_cb, app, &err);
         app->prog_active = false;
         if (ok)
-            snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d member%s into %s%s%s",
-                     (int)plan.names.size(), plan.names.size() == 1 ? "" : "s", plan.dst_dir.c_str(),
+            snprintf(app->status_msg, sizeof(app->status_msg), "Copied %d member%s into %s%s%s%s",
+                     (int)raws.size(), raws.size() == 1 ? "" : "s", plan.dst_dir.c_str(),
                      plan.archive_prefix.empty() ? "" : " (archive paths preserved)",
-                     app->prog_abort ? " (aborted)" : "");
+                     app->prog_abort ? " (aborted)" : "",
+                     skipped ? "  (left alone)" : "");
         else if (app->prog_abort)
             snprintf(app->status_msg, sizeof(app->status_msg), "Extract stopped before anything copied");
         else
@@ -3090,15 +3851,23 @@ static void run_op_plan(AppPanes* app) {
     }
 
     prog_begin(app, plan.src_dir.c_str(), plan.dst_dir.c_str(), plan.is_move);
-    int ok = run_names_prog(app, plan, copy_progress_cb, app);
+    int skipped = 0;
+    int ok = run_names_prog(app, plan, copy_progress_cb, app, &skipped);
     app->prog_active = false;
-    // An abort is not a failure, and saying so matters: the entries that made it
-    // across are really there, and the rest were never attempted.
+    // A skip is an answer, not a failure: the target the user chose to leave alone
+    // is still there, and what ran is what they asked for. A plan where every name
+    // was skipped says so rather than saying "failed".
+    char skip_note[32] = "";
+    if (skipped) snprintf(skip_note, sizeof(skip_note), "  %d skipped", skipped);
     if (ok)
         snprintf(app->status_msg, sizeof(app->status_msg),
-                 "%s %d item%s to %s%s", plan.is_move ? "Moved" : "Copied",
+                 "%s %d item%s to %s%s%s", plan.is_move ? "Moved" : "Copied",
                  ok, ok == 1 ? "" : "s", plan.dst_dir.c_str(),
-                 app->prog_abort ? " (aborted)" : "");
+                 app->prog_abort ? " (aborted)" : "", skip_note);
+    else if (skipped)
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Nothing copied to %s  %d target%s left alone",
+                 plan.dst_dir.c_str(), skipped, skipped == 1 ? "" : "s");
     else if (app->prog_abort)
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "%s stopped before anything transferred", plan.is_move ? "Move" : "Copy");
@@ -3245,20 +4014,24 @@ static void clipboard_set(AppPanes* app, Pane& pane, bool cut) {
              paths.size() == 1 ? "y" : "ies", cut ? "cut" : "copy");
 }
 
-// TC Ctrl+P: put the pane's path in the command line. Text that is already
-// there is kept and the path appended, so "rm " + path works; the command
-// buffer is shorter than a path can be, so a deep directory truncates.
-static void cmd_put_path(AppPanes* app, Pane& pane) {
-    size_t used = strlen(app->cmd);
-    if (used && app->cmd[used - 1] != ' ') {
-        if (used + 1 < sizeof(app->cmd)) app->cmd[used++] = ' ';
+// TC Ctrl+P: put the pane's path in the console. Text that is already there is
+// kept and the path appended, so "rm " + path works; the field is shorter than a
+// path can be, so a deep directory truncates inside it instead of overflowing it.
+static void console_put_path(AppPanes* app, Pane& pane) {
+    console_show(app, true);
+    char line[512];
+    snprintf(line, sizeof(line), "%s", app->console_input);
+    size_t used = strlen(line);
+    if (used && line[used - 1] != ' ') {
+        if (used + 1 < sizeof(line)) line[used++] = ' ';
     }
-    app->cmd[used] = '\0';
+    line[used] = '\0';
     // Inside an archive the pane's path is virtual and no shell would accept it,
     // so the archive file itself is what is useful to put on the line.
-    snprintf(app->cmd + used, sizeof(app->cmd) - used, "%s",
+    snprintf(line + used, sizeof(line) - used, "%s",
              in_archive(pane) ? pane.archive_path : pane.current_dir);
-    snprintf(app->status_msg, sizeof(app->status_msg), "Path into the command line");
+    console_set_input(app, line);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Path into the console");
 }
 
 static int count_existing_paths(const char* dst_dir, const StringList& paths) {
@@ -3271,8 +4044,56 @@ static int count_existing_paths(const char* dst_dir, const StringList& paths) {
     return n;
 }
 
-static void do_paste_now(AppPanes* app) {
-    if (app->clipboard.archive[0]) { do_paste_archive_now(app); return; }
+static void do_paste_archive_now(AppPanes* app, OpPlan::Overwrite ow) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    Pane& other = app->left_focus ? app->right : app->left;
+    const char* arch = app->clipboard.archive;
+    std::vector<ArchEntry> members;
+    std::string lerr;
+    arch_list(arch, &members, &lerr);   // best effort: fall back to the display path
+    std::vector<std::string> raws;
+    int skipped = 0;
+    for (const std::string& m : app->clipboard.paths) {
+        const ArchEntry* e = arch_find(members, m.c_str());
+        const std::string& raw = e ? e->raw : m;
+        // A skip is decided here rather than inside the extractor: the top-level
+        // name the pane showed is the thing that collides, and not asking the tool
+        // for that subtree is the same answer without needing a flag per tool.
+        if (ow == OpPlan::OW_SKIP) {
+            // The same rule the plan-based extract uses: the member's own path under
+            // the destination is the thing that collides.
+            std::string there = std::string(active.current_dir) + "/" + m;
+            if (fs_exists(there.c_str())) { skipped++; continue; }
+        }
+        raws.push_back(raw);
+    }
+    if (raws.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Nothing extracted from %s  %d target%s left alone", arch, skipped,
+                 skipped == 1 ? "" : "s");
+        refresh_pane(&active, active.current_dir);
+        refresh_pane(&other, other.current_dir);
+        return;
+    }
+    arch_prog_begin(app, arch, active.current_dir);
+    std::string err;
+    bool ok = arch_extract_members(arch, active.current_dir, raws, copy_progress_cb, app, &err);
+    app->prog_active = false;
+    if (ok) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Extracted %d member%s into %s%s", raws.size(), raws.size() == 1 ? "" : "s",
+                 active.current_dir, skipped ? "  (extracted over what was there)" : "");
+        app->clipboard.paths.clear();
+        app->clipboard.archive[0] = '\0';
+    } else {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Extract failed: %s", err.c_str());
+    }
+    refresh_pane(&active, active.current_dir);
+    refresh_pane(&other, other.current_dir);
+}
+
+static void do_paste_now(AppPanes* app, OpPlan::Overwrite ow) {
+    if (app->clipboard.archive[0]) { do_paste_archive_now(app, ow); return; }
     Pane& active = app->left_focus ? app->left : app->right;
     Pane& other  = app->left_focus ? app->right : app->left;
     if (app->clipboard.paths.empty()) return;
@@ -3282,11 +4103,19 @@ static void do_paste_now(AppPanes* app) {
     snprintf(app->prog_dst, sizeof(app->prog_dst), "%s", active.current_dir);
 
     int ok = 0;
+    int skipped = 0;
     StringList failed;   // a cut keeps whatever did not move so it can be retried
     for (size_t i = 0; i < app->clipboard.paths.size(); i++) {
         const std::string& src = app->clipboard.paths[i];
         char dst[4100];
         snprintf(dst, sizeof(dst), "%s/%s", active.current_dir, path_basename(src));
+        if (fs_exists(dst)) {
+            if (ow == OpPlan::OW_SKIP) { skipped++; continue; }
+            if (ow == OpPlan::OW_RENAME) {
+                std::string beside = rename_beside(dst, nullptr);
+                snprintf(dst, sizeof(dst), "%s", beside.c_str());
+            }
+        }
         bool r = app->clipboard.cut
                      ? fs_move_entry_progress(src.c_str(), dst, copy_progress_cb, app)
                      : fs_copy_entry_progress(src.c_str(), dst, copy_progress_cb, app);
@@ -3304,8 +4133,9 @@ static void do_paste_now(AppPanes* app) {
     if (app->clipboard.cut) app->clipboard.paths = failed;
 
     snprintf(app->status_msg, sizeof(app->status_msg),
-             "%s %d entr%s into %s", app->clipboard.cut ? "Moved" : "Copied",
-             ok, ok == 1 ? "y" : "ies", active.current_dir);
+             "%s %d entr%s into %s%s", app->clipboard.cut ? "Moved" : "Copied",
+             ok, ok == 1 ? "y" : "ies", active.current_dir,
+             skipped ? "  (target left alone)" : "");
     refresh_pane(&active, active.current_dir);
     refresh_pane(&other, other.current_dir);
 }
@@ -3321,33 +4151,86 @@ static void do_paste(AppPanes* app) {
     if (existing > 0) {
         app->confirm = CONF_OVERWRITE_PASTE;
         snprintf(app->confirm_text, sizeof(app->confirm_text),
-                 "%d target%s already exist in %s. Overwrite?", existing,
-                 existing == 1 ? "" : "s", active.current_dir);
+                 "%d target%s already exist%s in %s. Overwrite them, leave them alone, "
+                 "or paste beside them?", existing, existing == 1 ? "" : "s",
+                 existing == 1 ? "s" : "", active.current_dir);
         return;
     }
-    do_paste_now(app);
+    do_paste_now(app, OpPlan::OW_OVERWRITE);
 }
 
-static void confirm_yes(AppPanes* app) {
-    switch (app->confirm) {
-    case CONF_DELETE:         do_delete(app); break;
-    case CONF_OVERWRITE:
-    case CONF_OVERWRITE_MOVE:
-    case CONF_OVERWRITE_EXTRACT: run_op_plan(app); break;
-    case CONF_OVERWRITE_PASTE: do_paste_now(app); break;
-    default: break;
-    }
+static void confirm_answer(AppPanes* app, int answer) {
+    int confirm = app->confirm;
     app->confirm = CONF_NONE;
     app->confirm_text[0] = '\0';
+
+    switch (confirm) {
+    case CONF_DELETE:
+        if (answer == CONF_ANS_YES) do_delete(app);
+        break;
+    case CONF_OVERWRITE:
+    case CONF_OVERWRITE_MOVE:
+    case CONF_OVERWRITE_EXTRACT:
+        // The choice goes into the plan, because the plan is what every runner
+        // downstream already reads: the local copy, the extractor, and the network
+        // worker all take the same record, and a choice only one of them honoured
+        // would be a choice that changes shape on the way.
+        if (answer == CONF_ANS_OVERWRITE) app->op_plan.overwrite = OpPlan::OW_OVERWRITE;
+        else if (answer == CONF_ANS_SKIP) app->op_plan.overwrite = OpPlan::OW_SKIP;
+        else if (answer == CONF_ANS_RENAME) app->op_plan.overwrite = OpPlan::OW_RENAME;
+        else return;                       // Esc: the operation is cancelled outright
+        run_op_plan(app);
+        break;
+    case CONF_OVERWRITE_PASTE:
+        if (answer == CONF_ANS_OVERWRITE) do_paste_now(app, OpPlan::OW_OVERWRITE);
+        else if (answer == CONF_ANS_SKIP) do_paste_now(app, OpPlan::OW_SKIP);
+        else if (answer == CONF_ANS_RENAME) do_paste_now(app, OpPlan::OW_RENAME);
+        break;
+    case CONF_SFV_VERIFY:
+        // "Always" is a session setting and not a config write: a user who clicked
+        // it once in a dialog is not stuck with it the next time the app starts, and
+        // the config line is the place for a decision that is meant to last.
+        if (answer == CONF_ANS_ALWAYS) {
+            app->sfv_always_session = true;
+            snprintf(app->status_msg, sizeof(app->status_msg),
+                     "Verifying after every download for this session "
+                     "(sfv_verify in the config file makes it permanent)");
+        }
+        if ((answer == CONF_ANS_VERIFY || answer == CONF_ANS_ALWAYS) && !app->sfv_pending_path.empty()) {
+            BgTransfer* src = app->sfv_pending_transfer;
+            if (src) sfv_job_start(app, src->plan.dst_dir, app->sfv_pending_path, &src->plan, nullptr);
+            else sfv_job_start(app, app->sfv_pending_dir, app->sfv_pending_path, nullptr, nullptr);
+        }
+        app->sfv_pending_path.clear();
+        app->sfv_pending_dir.clear();
+        app->sfv_pending_transfer = nullptr;
+        break;
+    default: break;
+    }
 }
 
 // Deferred actions from menu/context-menu/dialog widgets: these fire inside
 // the ImGui frame, but the operations below block and pump their own progress
 // frames, so they must run between frames.
 void app_panes_run_pending(AppPanes* app) {
-    if (app->pending_confirm_yes) {
-        app->pending_confirm_yes = false;
-        confirm_yes(app);
+    // The answer to a three-answer dialog. It is taken here rather than where it
+    // was set because the answer starts a thread, and a thread is not started
+    // inside a draw call - the same reason a confirm's Yes is consumed here.
+    if (app->choice != CHOICE_NONE && app->choice_pick >= 0) {
+        int pick = app->choice_pick;
+        BgTransfer* t = app->choice_transfer;
+        app->choice = CHOICE_NONE;
+        app->choice_transfer = nullptr;
+        app->choice_pick = -1;
+        app->choice_text[0] = '\0';
+        if (pick == 0) bg_resume_remote(app, t, false);
+        else if (pick == 1) bg_resume_remote(app, t, true);
+        // Skip leaves the row exactly as it is, which is an answer too.
+    }
+    if (app->pending_confirm_answer != CONF_ANS_NONE) {
+        int answer = app->pending_confirm_answer;
+        app->pending_confirm_answer = CONF_ANS_NONE;
+        confirm_answer(app, answer);
     }
     if (!app->pending_op) return;
     int op = app->pending_op;
@@ -3613,8 +4496,14 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
         // A server's mode bits can say "executable" about a file this machine
         // cannot run, and would not be allowed to.
         char full[4300];
-        snprintf(full, sizeof(full), "\"%s/%s\" 2>&1", pane.current_dir, rel);
-        run_shell_and_show(app, full);
+        snprintf(full, sizeof(full), "\"%s/%s\"", pane.current_dir, rel);
+        // Enter on an executable runs it in the pane's directory and the answer
+        // goes to the console, which is where a command's output lives now. The
+        // window opens so the output is visible, but the keyboard stays with the
+        // pane: a program that takes a minute should not take the file manager
+        // with it, and it no longer does - it runs on the console's worker.
+        console_show(app, false);
+        console_start(app, full);
     } else {
         view_entry(app, pane, idx);
     }
@@ -3970,12 +4859,17 @@ static void render_tab_bar(AppPanes* app, Pane& pane, const char* id) {
         char lbl[256];
         tab_label(pane.tabs[t].dir, lbl, sizeof(lbl));
         ImGui::PushID(t);
-        if (t == pane.tab_active) {
+        // Decided once, before the button. Clicking a tab changes which tab is
+        // active, and a second `t == pane.tab_active` after the button would be true
+        // for the tab that was just activated and false for the one that was styled -
+        // a pop with nothing behind it, which ImGui answers by asserting.
+        const bool is_active = (t == pane.tab_active);
+        if (is_active) {
             ImGui::PushStyleColor(ImGuiCol_Button, mc_theme_colors()->title_focused);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, mc_theme_colors()->title_focused_hov);
         }
         if (ImGui::SmallButton(lbl)) tab_switch(&pane, t);
-        if (t == pane.tab_active) ImGui::PopStyleColor(2);
+        if (is_active) ImGui::PopStyleColor(2);
         ImGui::PopID();
     }
     if (pane.tab_count < MAX_TABS) {
@@ -4724,15 +5618,118 @@ static void render_viewer(AppPanes* app) {
     ImGui::End();
 }
 
-static void render_output(AppPanes* app) {
-    if (!app->output_open) return;
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.6f, io.DisplaySize.y * 0.6f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.2f, io.DisplaySize.y * 0.2f), ImGuiCond_FirstUseEver);
+// Alt+F8: the commands again, newest first, inside the console window. Picking one
+// puts it in the field rather than running it: a list of commands that runs what
+// you clicked is a list you have to read carefully before touching.
+static void render_console_hist(AppPanes* app) {
+    if (app->console_hist.empty()) {
+        ImGui::TextDisabled("(no commands yet)");
+        return;
+    }
+    for (int i = (int)app->console_hist.size() - 1; i >= 0; i--) {
+        ImGui::PushID(i);
+        if (ImGui::Selectable(app->console_hist[i].c_str(), false)) {
+            console_set_input(app, app->console_hist[i].c_str());
+            app->console_hist_pos = (int)app->console_hist.size();
+            app->console_hist_open = false;
+            app->console_focus_request = true;
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopID();
+    }
+}
+
+// The console window: the backlog above, the line being typed below, and the
+// directory the next command will run in. It is a window over the panes, not a
+// modal - it holds the keyboard only while its field holds it, and Esc hides it
+// without touching the backlog, which is the whole point of the feature: the
+// transcript is still there when it comes back, in another directory or after a
+// restart.
+static void render_console(AppPanes* app) {
+    if (!app->console_open) return;
+    Pane& active = app->left_focus ? app->left : app->right;
+
+    ImGui::SetNextWindowSize(ImVec2(app->console_w, app->console_h), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f - 380.0f,
+                                   ImGui::GetIO().DisplaySize.y * 0.5f - 210.0f),
+                            ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("Command output", &open, ImGuiWindowFlags_NoCollapse);
-    ImGui::TextUnformatted(app->output_text);
-    if (!open) app->output_open = false;
+    ImGui::Begin("Console (Ctrl+Enter)", &open, ImGuiWindowFlags_NoCollapse);
+    // Remember the shape to open at next session, as the quick view does.
+    const ImVec2 csz = ImGui::GetWindowSize();
+    app->console_w = csz.x;
+    app->console_h = csz.y;
+
+    // Where the next command runs, said out loud, because it is the one thing about
+    // a console in a file manager that is not obvious: commands run in the directory
+    // the focused pane is showing, not the one the app was started in.
+    ImGui::TextDisabled("in %s", active.current_dir);
+    if (app->console_job) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("- running, Esc cancels");
+    }
+    ImGui::Separator();
+
+    // The transcript, with the input line left a row of space at the bottom of the
+    // window by asking the child for everything except that row.
+    const float line_h = ImGui::GetTextLineHeightWithSpacing() +
+                         ImGui::GetStyle().FramePadding.y * 2.0f;
+    ImGui::BeginChild("##console_log", ImVec2(0.0f, -line_h), true);
+    if (app->console_hist_open) {
+        render_console_hist(app);
+    } else {
+        if (app->console_log.empty())
+            ImGui::TextDisabled("(nothing yet - type a command and press Enter)");
+        for (size_t i = 0; i < app->console_log.size(); i++) {
+            const ConsoleEntry& e = app->console_log[i];
+            ImGui::PushID((int)i);
+            // The directory, but only where it changes. A backlog that spans three
+            // directories has to say which command ran where, and repeating the same
+            // path above every command says it so often it stops being read.
+            if (i == 0 || app->console_log[i - 1].cwd != e.cwd)
+                ImGui::TextDisabled("# %s", e.cwd.c_str());
+            ImGui::TextDisabled("$ %s", e.cmd.c_str());
+            if (!e.out.empty()) ImGui::TextUnformatted(e.out.c_str());
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        // The command still running, whose output arrives while it goes. That is
+        // what the worker thread is for: a `find` that takes a minute shows its
+        // results during the minute, and the panes keep answering in the meantime.
+        if (app->console_job) {
+            std::string live;
+            { std::lock_guard<std::mutex> lk(app->console_job->mu); live = app->console_job->out; }
+            if (!live.empty()) ImGui::TextUnformatted(live.c_str());
+        }
+    }
+    // Follow the tail of a running command unless the user scrolled up to read
+    // something older: without the lock the line being typed gets pushed off screen
+    // by every chunk of output.
+    const float max_scroll = ImGui::GetScrollMaxY();
+    app->console_scroll_lock = (max_scroll > 2.0f && ImGui::GetScrollY() < max_scroll - 2.0f);
+    if (!app->console_scroll_lock) ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+
+    if (app->console_focus_request) {
+        ImGui::SetKeyboardFocusHere();
+        app->console_focus_request = false;
+    }
+    // A line the app wrote (Enter cleared it, Up recalled one, Ctrl+P appended a
+    // path) has to be handed to the field explicitly while the field owns the
+    // buffer, or the user keeps seeing the text that was there before.
+    if (app->console_input_reload) {
+        app->console_input_reload = false;
+        if (ImGuiInputTextState* st = ImGui::GetInputTextState(ImGui::GetID("##console")))
+            st->ReloadUserBufAndMoveToEnd();
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##console", app->console_input, sizeof(app->console_input));
+    // The claim is what decides who owns the keyboard: a click onto a pane row hands
+    // it back to the panes and the window stays as a transcript that is still readable.
+    app->console_field_active = ImGui::IsItemActive();
+
+    if (!open) app->console_open = false;
     ImGui::End();
 }
 
@@ -4800,27 +5797,8 @@ static void render_dirhist(AppPanes* app) {
     ImGui::End();
 }
 
-// Alt+F8: the command line history as a list (TC pops it up above the prompt).
-static void render_cmdhist(AppPanes* app) {
-    if (!app->cmdhist_open) return;
-    ImGui::SetNextWindowSize(ImVec2(680, 300), ImGuiCond_FirstUseEver);
-    bool open = true;
-    ImGui::Begin("Command history (Alt+F8)", &open, ImGuiWindowFlags_NoCollapse);
-    if (app->cmd_hist_count == 0) ImGui::TextUnformatted("(empty)");
-    for (int i = app->cmd_hist_count - 1; i >= 0; i--) {
-        ImGui::PushID(i);
-        if (ImGui::Selectable(app->cmd_history[i], false)) {
-            snprintf(app->cmd, sizeof(app->cmd), "%s", app->cmd_history[i]);
-            app->cmd_hist_pos = app->cmd_hist_count;
-            app->cmdhist_open = false;
-            ImGui::PopID();
-            break;
-        }
-        ImGui::PopID();
-    }
-    if (!open) app->cmdhist_open = false;
-    ImGui::End();
-}
+// Alt+F8 lives inside the console window now (render_console_hist), so there is no
+// history window of its own to draw.
 
 // Mounted drives for the Alt+F1/F2 picker. /proc/mounts holds
 // "device mountpoint fstype options dump pass"; pseudo filesystems are skipped.
@@ -4935,6 +5913,32 @@ static void render_search(AppPanes* app) {
     ImGui::End();
 }
 
+// A question with three answers, for the ones Y/N cannot hold. Continuing a
+// stopped transfer, throwing away what it already earned, and leaving the row
+// alone are three different intentions, and the middle one never gets noticed
+// unless it is spelled out next to the other two.
+static void render_choice(AppPanes* app) {
+    if (app->choice == CHOICE_NONE) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(560, 140), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 280, io.DisplaySize.y * 0.5f - 70), ImGuiCond_Always);
+    ImGui::Begin("Resume transfer", nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+    ImGui::TextWrapped("%s", app->choice_text);
+    ImGui::Spacing();
+    // The partial is the useful default and the one that needs no explanation, so
+    // it is first and it is what Enter answers.
+    if (ImGui::Button("Resume")) app->choice_pick = 0;
+    ImGui::SameLine();
+    if (ImGui::Button("Start over")) app->choice_pick = 1;
+    ImGui::SameLine();
+    if (ImGui::Button("Skip")) app->choice_pick = 2;
+    ImGui::SameLine();
+    ImGui::TextUnformatted("(press R / S / Esc)");
+    ImGui::End();
+}
+
 static void render_confirm(AppPanes* app) {
     if (app->confirm == CONF_NONE) return;
     ImGuiIO& io = ImGui::GetIO();
@@ -4945,11 +5949,41 @@ static void render_confirm(AppPanes* app) {
                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
     ImGui::TextWrapped("%s", app->confirm_text);
     ImGui::Spacing();
-    if (ImGui::Button("Yes")) app->pending_confirm_yes = true;
-    ImGui::SameLine();
-    if (ImGui::Button("No")) { app->confirm = CONF_NONE; app->confirm_text[0] = '\0'; }
-    ImGui::SameLine();
-    ImGui::TextUnformatted("(press Y / N)");
+    const bool overwrite_confirm = app->confirm != CONF_DELETE;
+    if (app->confirm == CONF_SFV_VERIFY) {
+        if (ImGui::Button("Verify")) app->pending_confirm_answer = CONF_ANS_VERIFY;
+        ImGui::SameLine();
+        if (ImGui::Button("Not now")) app->pending_confirm_answer = CONF_ANS_NOT_NOW;
+        ImGui::SameLine();
+        if (ImGui::Button("Always")) app->pending_confirm_answer = CONF_ANS_ALWAYS;
+        ImGui::SameLine();
+        ImGui::TextUnformatted("(press V / N / A)");
+        ImGui::End();
+        return;
+    }
+    // An archive extraction gets two answers and not three. The names inside an
+    // archive are the extractor's to write, and it writes them where the archive
+    // says they go: "write beside" is not something it can be asked for a subtree,
+    // so the dialog does not offer a promise the tool cannot keep.
+    const bool rename_too = overwrite_confirm && app->confirm != CONF_OVERWRITE_EXTRACT;
+    if (overwrite_confirm) {
+        if (ImGui::Button("Overwrite")) app->pending_confirm_answer = CONF_ANS_OVERWRITE;
+        ImGui::SameLine();
+        if (ImGui::Button("Skip")) app->pending_confirm_answer = CONF_ANS_SKIP;
+        if (rename_too) {
+            ImGui::SameLine();
+            if (ImGui::Button("Rename")) app->pending_confirm_answer = CONF_ANS_RENAME;
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(rename_too ? "(press Y / N / R - Esc cancels the operation)"
+                                          : "(press Y / N - Esc cancels the operation)");
+    } else {
+        if (ImGui::Button("Yes")) app->pending_confirm_answer = CONF_ANS_YES;
+        ImGui::SameLine();
+        if (ImGui::Button("No")) app->pending_confirm_answer = CONF_ANS_NO;
+        ImGui::SameLine();
+        ImGui::TextUnformatted("(press Y / N)");
+    }
     ImGui::End();
 }
 
@@ -5001,7 +6035,8 @@ static void render_about(AppPanes* app) {
         "Ctrl+Up / Ctrl+Shift+Down open the cursor dir in a new tab\n"
         "Ctrl+Left/Right show the cursor dir in the other pane\n"
         "Ctrl+U swap the pane directories   Ctrl+, go to the root\n"
-        "Ctrl+C copy        Ctrl+X cut       Ctrl+V paste   Ctrl+P path into cmd line\n"
+        "Ctrl+D leave the site this pane is on, and close its connection\n"
+        "Ctrl+C copy        Ctrl+X cut       Ctrl+V paste   Ctrl+P path into the console\n"
         "Alt+Down dir history   Alt+F8 command history   Alt+F1/F2 choose drive\n"
         "Alt+F11/F12 keyboard-focus the left / right path bar\n"
         "Alt+Enter properties               Ctrl+R refresh     Ctrl+O view mode\n"
@@ -5024,8 +6059,10 @@ static void render_about(AppPanes* app) {
         "The pack dialog picks format, level, password and 7z volumes; RAR and\n"
         "tar cannot be written with a password, and only 7z splits into volumes\n"
         "An archive's contents are read-only: extract, change, pack again\n\n"
-        "$ command line     type a command, Enter runs it (cd, exit builtins)\n"
-        "Alt+C prefill 'cd '   Alt+PgUp/PgDn command history   Esc clear\n\n"
+        "Ctrl+Enter console   type a command, Enter runs it (cd, pwd, clear, history, exit)\n"
+        "The console runs in the focused pane's directory and keeps its backlog: Esc\n"
+        "hides the window, the transcript stays for the next directory and session\n"
+        "Alt+C prefill 'cd '   Alt+F8 / Alt+PgUp/PgDn command history\n\n"
         "MENUS\n"
         "F10 opens the Commands menu   Shift+F9 hotlist   Shift+F10 pane menu\n"
         "File, Commands, Options and Help sit on the menu bar\n"
@@ -5034,16 +6071,220 @@ static void render_about(AppPanes* app) {
     ImGui::End();
 }
 
-// Properties dialog (Alt+Enter): recursive count + size of the selected entry.
+// ---------------------------------------------------------------------------
+// The permission and ownership half of the Properties window.
+// ---------------------------------------------------------------------------
+
+// "adam (1000)", or just "1000" when the id has no entry. A file owned by a uid the
+// passwd database does not know is still owned by that uid - an LDAP or container
+// system is full of them - and a blank would read as nobody owning it.
+static void props_id_names(uid_t uid, gid_t gid, char* owner, size_t owner_n,
+                           char* group_name, size_t group_n) {
+    struct passwd* pw = getpwuid(uid);
+    if (pw && pw->pw_name && *pw->pw_name)
+        snprintf(owner, owner_n, "%s (%lu)", pw->pw_name, (unsigned long)uid);
+    else
+        snprintf(owner, owner_n, "%lu", (unsigned long)uid);
+    struct group* gr = getgrgid(gid);
+    if (gr && gr->gr_name && *gr->gr_name)
+        snprintf(group_name, group_n, "%s (%lu)", gr->gr_name, (unsigned long)gid);
+    else
+        snprintf(group_name, group_n, "%lu", (unsigned long)gid);
+}
+
+// A user or group by name or by number. The number is accepted because it is what
+// chown actually takes, and because the window just showed the id in parentheses -
+// copying it back should work.
+static bool props_parse_id(const char* text, bool group, unsigned long* out, std::string* why) {
+    while (*text == ' ' || *text == '\t') text++;
+    if (!*text) { *why = "empty"; return false; }
+    bool numeric = true;
+    for (const char* p = text; *p; p++)
+        if (!isdigit((unsigned char)*p)) { numeric = false; break; }
+    if (numeric) { *out = strtoul(text, nullptr, 10); return true; }
+    if (group) {
+        struct group* gr = getgrnam(text);
+        if (!gr) { *why = "no such group"; return false; }
+        *out = (unsigned long)gr->gr_gid;
+        return true;
+    }
+    struct passwd* pw = getpwnam(text);
+    if (!pw) { *why = "no such user"; return false; }
+    *out = (unsigned long)pw->pw_uid;
+    return true;
+}
+
+// Four octal digits, which is what the boxes show and what a person used to chmod
+// will type. A leading 0 is allowed because that is how mode is written everywhere
+// else; anything that is not octal is refused rather than read as something else.
+static bool parse_octal_mode(const char* text, mode_t* out) {
+    while (*text == ' ' || *text == '\t') text++;
+    if (!*text) return false;
+    if (text[0] == '0' && (text[1] == 'o' || text[1] == 'O')) text += 2;
+    size_t digits = 0;
+    for (const char* p = text; *p; p++) {
+        if (*p < '0' || *p > '7') return false;
+        digits++;
+    }
+    if (!digits || digits > 4) return false;
+    unsigned long v = strtoul(text, nullptr, 8);
+    if (v > 07777UL) return false;
+    *out = (mode_t)v;
+    return true;
+}
+
+// Everything below an entry, for "apply to everything below". Symlinked directories
+// are not walked into: a tree with a link back up it would otherwise be walked for as
+// long as the app was left running.
+static void props_collect_below(const std::string& dir, std::vector<std::string>* out, int cap) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* de;
+    while ((de = readdir(d)) != nullptr && (int)out->size() < cap) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        std::string p = dir + "/" + de->d_name;
+        struct stat st;
+        if (lstat(p.c_str(), &st) != 0) continue;
+        out->push_back(p);
+        if (S_ISDIR(st.st_mode)) props_collect_below(p, out, cap);
+    }
+    closedir(d);
+}
+
+static void props_collect_tree(const std::string& root, std::vector<std::string>* out, int cap) {
+    out->push_back(root);
+    if (cap <= 0) return;
+    props_collect_below(root, out, cap);
+}
+
+static void props_apply_local(AppPanes* app) {
+    const std::string path = app->props_path;
+    // The digits the field holds win over the boxes' last state, and a mode that
+    // does not parse stops here rather than applying whatever the boxes happened to
+    // be showing when the typing started.
+    mode_t want = 0;
+    if (!parse_octal_mode(app->props_edit_mode, &want)) {
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Mode \"%s\" is not four octal digits", app->props_edit_mode);
+        return;
+    }
+    app->props_edit_bits = want;
+    bool have_owner = app->props_edit_owner[0] != '\0';
+    bool have_group = app->props_edit_group[0] != '\0';
+
+    unsigned long uid = 0, gid = 0;
+    std::string why;
+    if (have_owner && !props_parse_id(app->props_edit_owner, false, &uid, &why)) {
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Owner: %s - %s", app->props_edit_owner, why.c_str());
+        return;
+    }
+    if (have_group && !props_parse_id(app->props_edit_group, true, &gid, &why)) {
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Group: %s - %s", app->props_edit_group, why.c_str());
+        return;
+    }
+
+    std::vector<std::string> targets;
+    if (app->props_recursive) props_collect_tree(path, &targets, 5000);
+    else targets.push_back(path);
+
+    int changed = 0, failed = 0;
+    std::string first_err;
+    for (const std::string& t : targets) {
+        struct stat st;
+        if (lstat(t.c_str(), &st) != 0) { failed++; continue; }
+        bool ok = true;
+        if (have_owner || have_group) {
+            // lchown, not chown: on the link itself, not on whatever it points at.
+            // Changing the target's owner from a window about the link would be a
+            // change to a file the user was not looking at.
+            if (lchown(t.c_str(), (uid_t)uid, (gid_t)gid) != 0) {
+                ok = false;
+                if (first_err.empty())
+                    first_err = (errno == EPERM) ? "not permitted (ownership changes need root)"
+                                                 : strerror(errno);
+            }
+        }
+        if (ok && S_ISREG(st.st_mode) && chmod(t.c_str(), app->props_edit_bits) != 0) {
+            ok = false;
+            if (first_err.empty()) first_err = strerror(errno);
+        }
+        // A directory's mode is set too, but its executable bit is what makes it
+        // traversable, so the boxes are applied as written.
+        if (ok && S_ISDIR(st.st_mode) && chmod(t.c_str(), app->props_edit_bits) != 0) {
+            ok = false;
+            if (first_err.empty()) first_err = strerror(errno);
+        }
+        // A symlink has no mode of its own on Linux: chmod follows the link, and
+        // there is no lchmod to ask. Saying so is the honest half of that.
+        if (ok && S_ISLNK(st.st_mode)) { /* nothing to set; ownership only */ }
+        if (ok) changed++;
+    }
+
+    if (changed && !failed)
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Applied to %d entr%s%s", changed, changed == 1 ? "y" : "ies",
+                 app->props_recursive ? " (this one and everything below)" : "");
+    else if (!changed)
+        snprintf(app->props_note, sizeof(app->props_note), "Nothing changed: %s",
+                 first_err.empty() ? "the entry is gone" : first_err.c_str());
+    else
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Applied to %d, %d not changed: %s", changed, failed, first_err.c_str());
+
+    struct stat st;
+    if (lstat(path.c_str(), &st) == 0) {
+        app->props_mode = st.st_mode;
+        app->props_uid = (unsigned long)st.st_uid;
+        app->props_gid = (unsigned long)st.st_gid;
+        props_id_names((uid_t)st.st_uid, (gid_t)st.st_gid,
+                       app->props_owner, sizeof(app->props_owner),
+                       app->props_group, sizeof(app->props_group));
+        app->props_edit_bits = st.st_mode & 07777;
+        snprintf(app->props_edit_mode, sizeof(app->props_edit_mode), "%04o",
+                 (unsigned)(app->props_edit_bits & 07777));
+        app->props_edit_owner[0] = '\0';
+        app->props_edit_group[0] = '\0';
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%s", app->props_note);
+}
+
+static void props_apply_remote(AppPanes* app) {
+    mode_t want = 0;
+    if (!parse_octal_mode(app->props_edit_mode, &want)) {
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "Mode \"%s\" is not four octal digits", app->props_edit_mode);
+        return;
+    }
+    app->props_edit_bits = want;
+    const NetSite* site = net_site_for(app->props_remote_root);
+    if (!site) {
+        snprintf(app->props_note, sizeof(app->props_note),
+                 "No login for %s: Ctrl+F edits the saved sites", app->props_remote_root);
+        return;
+    }
+    std::string err;
+    if (!net_chmod(*site, app->props_remote_path, (int)(app->props_edit_bits & 07777), &err)) {
+        snprintf(app->props_note, sizeof(app->props_note), "%s", err.c_str());
+    } else {
+        snprintf(app->props_note, sizeof(app->props_note), "Mode set to %04o",
+                 (unsigned)(app->props_edit_bits & 07777));
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%s", app->props_note);
+}
+
+// Properties dialog (Alt+Enter): recursive count + size of the selected entry, and
+// the permissions, owner and group it carries.
 static void open_properties(AppPanes* app, Pane& pane) {
     if (in_remote(pane)) {
         // Counting a remote tree would mean downloading it. What the listing
         // already brought back - this row's mode, size and time - is what shows.
         if (pane.selected < 0 || pane.selected >= pane.entry_count) return;
         FileEntry* e = pane.entries[pane.selected];
-        std::string vroot, vrpath;
+        std::string vroot, vrpath, rpath;
         if (net_split_virtual(pane.current_dir, &vroot, &vrpath)) {
-            std::string rpath = remote_row_path(pane, e->name);
+            rpath = remote_row_path(pane, e->name);
             snprintf(app->props_path, sizeof(app->props_path), "%s", net_virtual_path(vroot, rpath).c_str());
         } else {
             snprintf(app->props_path, sizeof(app->props_path), "%s", pane.current_dir);
@@ -5051,6 +6292,22 @@ static void open_properties(AppPanes* app, Pane& pane) {
         app->props_size = e->size;
         app->props_files = S_ISDIR(e->mode) ? 0 : 1;
         app->props_dirs = S_ISDIR(e->mode) ? 1 : 0;
+        // A site's listing carries the mode - MLSD's unix.mode, or what the LIST
+        // dialect showed - and carries no owner at all. FTP has no way to set one,
+        // so the window says that instead of hiding the two fields.
+        app->props_remote = true;
+        app->props_mode = e->mode & 07777;
+        app->props_edit_bits = app->props_mode;
+        snprintf(app->props_edit_mode, sizeof(app->props_edit_mode), "%04o",
+                 (unsigned)(app->props_edit_bits & 07777));
+        snprintf(app->props_remote_root, sizeof(app->props_remote_root), "%s", vroot.c_str());
+        snprintf(app->props_remote_path, sizeof(app->props_remote_path), "%s", rpath.c_str());
+        app->props_owner[0] = '\0';
+        snprintf(app->props_group, sizeof(app->props_group), "FTP has no owner or group");
+        app->props_edit_owner[0] = '\0';
+        app->props_edit_group[0] = '\0';
+        app->props_recursive = false;
+        app->props_note[0] = '\0';
         app->props_open = true;
         return;
     }
@@ -5065,12 +6322,37 @@ static void open_properties(AppPanes* app, Pane& pane) {
     snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, pane.selected));
     snprintf(app->props_path, sizeof(app->props_path), "%s", full);
     fs_count_tree(full, &app->props_size, &app->props_files, &app->props_dirs);
+    app->props_remote = false;
+    app->props_remote_root[0] = '\0';
+    app->props_remote_path[0] = '\0';
+    struct stat st;
+    if (lstat(full, &st) == 0) {
+        app->props_mode = st.st_mode;
+        app->props_uid = (unsigned long)st.st_uid;
+        app->props_gid = (unsigned long)st.st_gid;
+        props_id_names((uid_t)st.st_uid, (gid_t)st.st_gid,
+                       app->props_owner, sizeof(app->props_owner),
+                       app->props_group, sizeof(app->props_group));
+        app->props_edit_bits = st.st_mode & 07777;
+    } else {
+        app->props_mode = 0;
+        app->props_edit_bits = 0;
+        app->props_owner[0] = '\0';
+        app->props_group[0] = '\0';
+    }
+    snprintf(app->props_edit_mode, sizeof(app->props_edit_mode), "%04o",
+             (unsigned)(app->props_edit_bits & 07777));
+    app->props_edit_owner[0] = '\0';
+    app->props_edit_group[0] = '\0';
+    app->props_recursive = false;
+    app->props_note[0] = '\0';
     app->props_open = true;
 }
 
 static void render_properties(AppPanes* app) {
     if (!app->props_open) return;
-    ImGui::SetNextWindowSize(ImVec2(460, 200), ImGuiCond_FirstUseEver);
+    app->props_field_active = false;   // re-claimed below if a field has the keyboard
+    ImGui::SetNextWindowSize(ImVec2(460, 320), ImGuiCond_FirstUseEver);
     ImGui::Begin("Properties", &app->props_open);
     char sz[64];
     human_size((off_t)app->props_size, sz, sizeof(sz));
@@ -5080,6 +6362,93 @@ static void render_properties(AppPanes* app) {
     ImGui::Text("Files:       %ld", app->props_files);
     if (app->props_dirs > 0)
         ImGui::Text("Directories: %ld", app->props_dirs);
+    ImGui::Spacing();
+
+    // ---- permissions, owner and group ----
+    // The boxes and the octal field are two views of one value. Ticking a box
+    // rewrites the digits; typing digits rewrites the boxes. Two fields that could
+    // disagree with each other would leave the user guessing which one Apply read.
+    ImGui::Separator();
+    char octal[16];
+    snprintf(octal, sizeof(octal), "%04o", (unsigned)(app->props_edit_bits & 07777));
+    if (strcmp(app->props_edit_mode, octal) != 0) {
+        mode_t parsed = 0;
+        if (parse_octal_mode(app->props_edit_mode, &parsed)) {
+            app->props_edit_bits = parsed;
+            snprintf(app->props_edit_mode, sizeof(app->props_edit_mode), "%04o",
+                     (unsigned)(parsed & 07777));
+        }
+    }
+
+    static const char* kWho[3] = { "Owner", "Group", "Other" };
+    static const mode_t kBits[3][3] = { { S_IRUSR, S_IWUSR, S_IXUSR },
+                                        { S_IRGRP, S_IWGRP, S_IXGRP },
+                                        { S_IROTH, S_IWOTH, S_IXOTH } };
+    ImGui::Text("Mode: %s", app->props_edit_mode);
+    for (int w = 0; w < 3; w++) {
+        ImGui::Text("%s", kWho[w]);
+        ImGui::SameLine();
+        for (int b = 0; b < 3; b++) {
+            bool on = (app->props_edit_bits & kBits[w][b]) != 0;
+            char label[32];
+            snprintf(label, sizeof(label), "%s##m%d%d",
+                     b == 0 ? "r" : (b == 1 ? "w" : "x"), w, b);
+            if (ImGui::Checkbox(label, &on))
+                app->props_edit_bits = on ? (app->props_edit_bits | kBits[w][b])
+                                          : (app->props_edit_bits & ~kBits[w][b]);
+            if (b < 2) ImGui::SameLine();
+        }
+    }
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputText("##propsmode", app->props_edit_mode, sizeof(app->props_edit_mode),
+                     ImGuiInputTextFlags_CharsDecimal);
+    if (ImGui::IsItemActive()) app->props_field_active = true;
+    ImGui::SameLine();
+    mode_t typed_mode = 0;
+    if (parse_octal_mode(app->props_edit_mode, &typed_mode))
+        ImGui::TextUnformatted("octal");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "not four octal digits");
+
+    ImGui::Spacing();
+    if (app->props_remote) {
+        // Not a limitation of this window. FTP has no command that sets an owner, and
+        // SITE CHMOD is not even in the protocol proper - it is a site extension, so
+        // a server can refuse it.
+        ImGui::TextUnformatted("FTP has no owner or group to set, and SITE CHMOD is a "
+                               "site extension: some servers refuse it.");
+    } else {
+        ImGui::Text("Owner: %s", app->props_owner[0] ? app->props_owner : "?");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140);
+        ImGui::InputText("##propsowner", app->props_edit_owner, sizeof(app->props_edit_owner));
+        if (ImGui::IsItemActive()) app->props_field_active = true;
+        ImGui::SameLine();
+        ImGui::TextUnformatted("name or number, empty = unchanged");
+
+        ImGui::Text("Group: %s", app->props_group[0] ? app->props_group : "?");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140);
+        ImGui::InputText("##propsgroup", app->props_edit_group, sizeof(app->props_edit_group));
+        if (ImGui::IsItemActive()) app->props_field_active = true;
+        ImGui::SameLine();
+        ImGui::TextUnformatted("name or number, empty = unchanged");
+    }
+
+    if (!app->props_remote && app->props_dirs > 0) {
+        ImGui::Checkbox("Apply to everything below", &app->props_recursive);
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button(app->props_remote ? "Set mode" : "Apply")) {
+        if (app->props_remote) props_apply_remote(app);
+        else props_apply_local(app);
+    }
+    if (app->props_note[0]) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(app->props_note);
+    }
+
     ImGui::Spacing();
     if (ImGui::Button("Close")) app->props_open = false;
     ImGui::End();
@@ -5451,6 +6820,37 @@ static void remote_open(AppPanes* app, const NetSite& site) {
 // Open a typed URL in the focused pane. Anything the URL leaves out comes from
 // the site already known for that host, so "cd ftp.example.com/pub" after a
 // logged-in visit does not ask the server for an anonymous session.
+// Leave the site the focused pane is on, and close the connection it was reached
+// through. ".." at the site root already leaves a site by navigation; this is the
+// deliberate version, and it does the half navigation cannot do. The reason a
+// remote pane links libcurl instead of shelling out is that a fresh login per
+// listing makes browsing unusable, so a pane that has walked off a site should not
+// keep a logged-in session to it open behind the local listing it is now showing.
+static void remote_disconnect(AppPanes* app) {
+    Pane& active = app->left_focus ? app->left : app->right;
+    if (!in_remote(active)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "This pane is not on a site: Ctrl+D leaves one");
+        return;
+    }
+    std::string root = active.remote_root;
+    // The connection is keyed by the site root, which is exactly what the pane
+    // still knows here - and what it is about to forget. A saved entry that was
+    // edited or deleted mid-session is not a reason to leave a session open.
+    net_forget_root(root.c_str());
+    char back[4096];
+    if (active.remote_came_from[0])
+        snprintf(back, sizeof(back), "%s", active.remote_came_from);
+    else {
+        // A pane opened straight onto a site has no local directory of its own to
+        // go back to, so it goes to the one a pane always has.
+        const char* home = getenv("HOME");
+        snprintf(back, sizeof(back), "%s", (home && *home) ? home : "/");
+    }
+    navigate_to(app, &active, back);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Disconnected from %s", root.c_str());
+}
+
 static void remote_open_url(AppPanes* app, const char* url) {
     NetSite site;
     std::string err;
@@ -5888,8 +7288,19 @@ static void render_commands_items(AppPanes* app) {
         app->remote_focus_request = true;
         app->remote_note[0] = '\0';
     }
+    // Greyed out when the focused pane is not on a site, so the entry says which
+    // pane it would act on instead of doing nothing when it is clicked.
+    if (ImGui::MenuItem("Disconnect from site", "Ctrl+D", in_remote(active)))
+        remote_disconnect(app);
+    // No key binding: every plausible one still needs the collision audit
+    // FEATURES_PLAN.md describes before it can be claimed.
+    if (ImGui::MenuItem("Verify SFV")) sfv_run_for_pane(app);
     if (ImGui::MenuItem("Visited directories", "Alt+Down")) app->dirhist_open = !app->dirhist_open;
-    if (ImGui::MenuItem("Command history", "Alt+F8")) app->cmdhist_open = !app->cmdhist_open;
+    if (ImGui::MenuItem("Console", "Ctrl+Enter")) console_show(app, true);
+    if (ImGui::MenuItem("Command history", "Alt+F8")) {
+        console_show(app, true);
+        app->console_hist_open = !app->console_hist_open;
+    }
     if (ImGui::MenuItem("Left drive", "Alt+F1")) { app->volumes_open = true; app->volumes_target = 0; }
     if (ImGui::MenuItem("Right drive", "Alt+F2")) { app->volumes_open = true; app->volumes_target = 1; }
     if (ImGui::MenuItem("Directory tree", "Alt+F10")) {
@@ -5912,7 +7323,7 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Clear marks", "Ctrl+Num-")) clear_marks(active);
     if (ImGui::MenuItem("Invert marks", "Num*")) invert_marks(active);
     if (ImGui::MenuItem("Switch to other pane", "Ctrl+I")) app->left_focus = !app->left_focus;
-    if (ImGui::MenuItem("Current path to command line", "Ctrl+P")) cmd_put_path(app, active);
+    if (ImGui::MenuItem("Current path to console", "Ctrl+P")) console_put_path(app, active);
     if (ImGui::MenuItem("Swap panes", "Ctrl+U")) swap_panes(app, false);
     if (ImGui::MenuItem("Branch view", "Ctrl+B")) branch_toggle(app, active, false);
     if (ImGui::MenuItem("Branch marked dirs", "Ctrl+Shift+B")) branch_toggle(app, active, true);
@@ -5948,6 +7359,7 @@ void app_panes_render(AppPanes* app) {
     // and dropped. Between frames, because joining a thread is not something to
     // do inside one - and because the status line it writes is read just below.
     bg_reap(app);
+    sfv_reap(app);
 
     // Same for the quick view: a preview that arrived from a site or an archive
     // is filed under the path it was asked for here, and its thread is joined
@@ -5955,8 +7367,8 @@ void app_panes_render(AppPanes* app) {
     qv_reap(app);
 
     // ImGui answers one keyboard-focus request per frame, and the last one
-    // submitted wins. The command line at the bottom asks on every frame, so any
-    // field that wants the caret has to claim it here and be left alone after.
+    // submitted wins. Any field that wants the caret has to claim it here and be
+    // left alone after.
     app->focus_claimed = false;
 
     // A listing that failed did so inside refresh_pane(), which has no status
@@ -6019,7 +7431,7 @@ void app_panes_render(AppPanes* app) {
     // (GetContentRegionAvail over-reports here); the command bar is then
     // pinned to the window bottom so it can never spill outside.
     const float frame    = ImGui::GetFrameHeightWithSpacing();
-    const float bar_h    = frame + 8.0f;  // separator + single-line command bar
+    const float bar_h    = frame + 8.0f;  // separator + status line
     // The transfer strip, when there are transfers. Its rows come out of the
     // panes' height, which is why the room is measured before the panes are laid
     // out and not after they have taken all of it.
@@ -6125,20 +7537,20 @@ void app_panes_render(AppPanes* app) {
     // The transfer list, between the panes and the command line. It draws
     // nothing at all while no transfer is running or remembered.
     render_transfers(app, xfer_h);
+    render_sfv_reports(app);
 
     // Bottom bar: pinned to the window bottom so it can never overflow. The op
-    // prompt used to live here as a one-line field; the operations are real
-    // dialogs now, so the bar is the command line again.
+    // prompt used to live here as a one-line field, then the command line, and now
+    // the console is a window of its own, so this row is the status line only - the
+    // information TC's status line carries.
     ImGui::SetCursorPosY(win_h - bar_h);
     ImGui::Separator();
     {
-        // Command line (MC-style: always focused). Status messages show as
-        // dimmed text after the input while the command is empty.
-        // With no status message the line reports marks and the clipboard,
-        // like the TC status line.
-        char info[128];
+        // With no status message the line reports marks and the clipboard, like the
+        // TC status line, and names the one key that used to be this row.
+        char info[160];
         info[0] = '\0';
-        if (app->cmd[0] == '\0' && app->status_msg[0] == '\0') {
+        if (app->status_msg[0] == '\0') {
             Pane& act = left_focus ? left : right;
             int marks = marked_count(act);
             // A site reached without checking its certificate has to be said out
@@ -6150,45 +7562,16 @@ void app_panes_render(AppPanes* app) {
             if (unsite && !unsite->verify_tls)
                 snprintf(info, sizeof(info), "certificate not verified for %s", act.remote_root);
             else if (!app->clipboard.paths.empty())
-                snprintf(info, sizeof(info), "Marked: %d   Clipboard: %d (%s)",
+                snprintf(info, sizeof(info), "Marked: %d   Clipboard: %d (%s)   Ctrl+Enter console",
                          marks, (int)app->clipboard.paths.size(),
                          app->clipboard.cut ? "cut" : "copy");
             else if (marks > 0)
-                snprintf(info, sizeof(info), "Marked: %d", marks);
+                snprintf(info, sizeof(info), "Marked: %d   Ctrl+Enter console", marks);
+            else
+                snprintf(info, sizeof(info), "Ctrl+Enter console");
         }
-        bool show_status = (app->cmd[0] == '\0' && app->status_msg[0] != '\0');
-        const char* shown = show_status ? app->status_msg : info;
-        float status_w = shown[0] ? ImGui::CalcTextSize(shown).x + 24.0f : 0.0f;
-        ImGui::TextUnformatted("$");
-        ImGui::SameLine();
-        bool allow_cmd_focus = (app->confirm == CONF_NONE) && (app->active_path_pane < 0) &&
-                               !app->search_input_active && (app->op == OP_NONE) &&
-                               !left.filter_field_active && !right.filter_field_active &&
-                               !app->options_field_active;
-        // Offset 0 means this field. With -1 the request resolved to whatever
-        // item came before it, which was nothing focusable, so the command line
-        // was never the active item and any earlier request got thrown away.
-        // It still has to ask politely: a request lands on the *next* frame, and
-        // if a press is in flight it takes ActiveId away from whatever is being
-        // clicked, so the release finds a different item and the click is
-        // dropped. That is what made the menu bar titles open but their items do
-        // nothing. So: only while the keyboard is genuinely free.
-        bool keyboard_free = !app->focus_claimed && (ImGui::GetActiveID() == 0) &&
-                             !ImGui::IsPopupOpen((ImGuiID)0, ImGuiPopupFlags_AnyPopup);
-        if (allow_cmd_focus && keyboard_free)
-            ImGui::SetKeyboardFocusHere();
-        ImGui::SetNextItemWidth(-status_w - 1.0f);
-        ImGui::InputText("##cmdline", app->cmd, sizeof(app->cmd));
-        // Being the active item is not enough to decide what the text keys mean,
-        // because this field is the active item almost always. The claim is what
-        // matters, and a click into the box is the only way to make one - which is
-        // also how it is given back: clicking a row, a path bar or a menu takes
-        // the keyboard away and the claim goes with it.
-        app->cmd_field_active = ImGui::IsItemActive();
-        if (ImGui::IsItemClicked(0)) app->cmd_field_claimed = true;
-        if (!app->cmd_field_active) app->cmd_field_claimed = false;
+        const char* shown = app->status_msg[0] ? app->status_msg : info;
         if (shown[0]) {
-            ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
             ImGui::TextUnformatted(shown);
             ImGui::PopStyleColor();
@@ -6201,16 +7584,16 @@ void app_panes_render(AppPanes* app) {
     if (left.quick_view)  render_quick_view(app, left);
     if (right.quick_view) render_quick_view(app, right);
     render_viewer(app);
-    render_output(app);
+    render_console(app);
     render_hotlist(app);
     render_dirhist(app);
-    render_cmdhist(app);
     render_volumes(app);
     render_columns_dialog(app);
     render_pack_dialog(app);
     render_op_dialog(app);
     render_tree(app);
     render_search(app);
+    render_choice(app);
     render_confirm(app);
     render_about(app);
     render_properties(app);
@@ -6272,6 +7655,30 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     // window that cannot be grabbed.
     cfg->qv_w = (int)app->qv_w;
     cfg->qv_h = (int)app->qv_h;
+    cfg->console_w = (int)app->console_w;
+    cfg->console_h = (int)app->console_h;
+    // The console backlog, oldest first, and only its tail: a session that ran a
+    // command printing a megabyte is not worth a megabyte of config file, but the
+    // first screenful of it is worth having tomorrow.
+    cfg->console_entries.clear();
+    size_t skip = 0;
+    if (app->console_log.size() > (size_t)MC_CONSOLE_SAVE_ENTRIES)
+        skip = app->console_log.size() - (size_t)MC_CONSOLE_SAVE_ENTRIES;
+    for (size_t i = skip; i < app->console_log.size(); i++) {
+        // A command that was still running when the app closed has no answer to
+        // save, and saving a half of one would read like a command that printed
+        // less than it did.
+        if (app->console_job && i + 1 == app->console_log.size()) continue;
+        const ConsoleEntry& e = app->console_log[i];
+        MCConsoleEntry m;
+        m.cwd = e.cwd; m.cmd = e.cmd; m.out = e.out; m.code = e.code; m.builtin = e.builtin;
+        if (m.out.size() > MC_CONSOLE_SAVE_OUTPUT) {
+            m.out.resize(MC_CONSOLE_SAVE_OUTPUT);
+            trim_partial_utf8(m.out);
+            m.out += "\n...";
+        }
+        cfg->console_entries.push_back(m);
+    }
     Pane* src[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         Pane& pane = *src[p];
@@ -6323,6 +7730,10 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
+    // "ask" | "always" | "never", already validated by mc_config_load: a value it did
+    // not recognise came back as "ask".
+    snprintf(app->sfv_verify, sizeof(app->sfv_verify), "%s",
+             cfg->sfv_verify[0] ? cfg->sfv_verify : "ask");
     if (cfg->columns[0]) snprintf(app->columns, sizeof(app->columns), "%s", cfg->columns);
     // A config that never carried these, or carries a 0 from a hand-edited file,
     // leaves the size the app was built with. mc_config_load has already clamped a
@@ -6331,6 +7742,32 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
         app->qv_w = (float)cfg->qv_w;
         app->qv_h = (float)cfg->qv_h;
     }
+    if (cfg->console_w > 0 && cfg->console_h > 0) {
+        app->console_w = (float)cfg->console_w;
+        app->console_h = (float)cfg->console_h;
+    }
+    // The backlog from the last session, oldest first. It is restored whether or
+    // not the window is opened: the transcript is the thing that outlives a
+    // directory, and a session that ends on a site or in a subdirectory still has
+    // to find yesterday's commands where it left them. The commands seed the
+    // history too, so Up still recalls what was run before this process started.
+    app->console_log.clear();
+    app->console_hist.clear();
+    for (const MCConsoleEntry& m : cfg->console_entries) {
+        if (m.cmd.empty()) continue;
+        ConsoleEntry e;
+        e.cwd = m.cwd; e.cmd = m.cmd; e.out = m.out; e.code = m.code; e.builtin = m.builtin;
+        app->console_log.push_back(e);
+        if (app->console_hist.empty() || app->console_hist.back() != m.cmd)
+            app->console_hist.push_back(m.cmd);
+    }
+    if ((int)app->console_log.size() > MC_CONSOLE_MAX_ENTRIES)
+        app->console_log.erase(app->console_log.begin(),
+                               app->console_log.end() - MC_CONSOLE_MAX_ENTRIES);
+    if ((int)app->console_hist.size() > MC_CONSOLE_MAX_HIST)
+        app->console_hist.erase(app->console_hist.begin(),
+                                app->console_hist.end() - MC_CONSOLE_MAX_HIST);
+    app->console_hist_pos = (int)app->console_hist.size();
     Pane* dst[2] = { &app->left, &app->right };
     for (int p = 0; p < 2; p++) {
         const char (*tabs)[4096] = (p == 0) ? cfg->left_tabs : cfg->right_tabs;
@@ -6382,6 +7819,22 @@ void app_panes_free(AppPanes* app) {
     bg_stop_all(app);
     // Quick view fetches are inside the same transport, so they go the same way.
     qv_stop_all(app);
+    // A .sfv still hashing when the app closes: a std::thread that is still joinable
+    // when AppPanes is destroyed ends the process, so the hash is stopped and waited
+    // for rather than abandoned.
+    for (auto& held : app->sfv_jobs) {
+        held->cancel.store(true);
+        if (held->worker.joinable()) held->worker.join();
+    }
+    app->sfv_jobs.clear();
+    // A console command that was still running when the app closed: ask the shell
+    // to stop and wait for the worker, because a std::thread that is still joinable
+    // when AppPanes is destroyed ends the process.
+    if (app->console_job) {
+        app->console_job->cancel.store(true);
+        if (app->console_job->worker.joinable()) app->console_job->worker.join();
+        app->console_job.reset();
+    }
     free_entries(app->left.entries, app->left.entry_count);
     free_entries(app->right.entries, app->right.entry_count);
     // The cached handles belong to this app's site list, and so do the pointers
@@ -6541,9 +7994,16 @@ void app_panes_commit_op(AppPanes* app) {
         if (existing > 0) {
             app->confirm = plan.is_move ? CONF_OVERWRITE_MOVE
                          : (!plan.archive.empty() ? CONF_OVERWRITE_EXTRACT : CONF_OVERWRITE);
-            snprintf(app->confirm_text, sizeof(app->confirm_text),
-                     "%d target%s in %s already exist%s. Overwrite?", existing,
-                     existing == 1 ? "" : "s", plan.dst_dir.c_str(), existing == 1 ? "s" : "");
+            if (plan.archive.empty())
+                snprintf(app->confirm_text, sizeof(app->confirm_text),
+                         "%d target%s in %s already exist%s. Overwrite them, leave them "
+                         "alone, or write beside them?", existing, existing == 1 ? "" : "s",
+                         plan.dst_dir.c_str(), existing == 1 ? "s" : "");
+            else
+                snprintf(app->confirm_text, sizeof(app->confirm_text),
+                         "%d target%s in %s already exist%s. Overwrite them, or leave "
+                         "them alone?", existing, existing == 1 ? "" : "s",
+                         plan.dst_dir.c_str(), existing == 1 ? "s" : "");
         }
         app->op = OP_NONE;
         app->op_name[0] = '\0';
@@ -6846,13 +8306,17 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
         default: break;
         }
     }
-    // While the command line box holds the keyboard *because the user took it*
-    // - by clicking into it - the text keys are typing. The box holds the
-    // keyboard by default on every frame, so plain activity is not the signal:
-    // treating it as one would take Space, Backspace, Del and the marking
-    // shortcuts away from the panes for good, and typing a space as the first
-    // character would mark a file instead.
-    auto cmd_claimed = [app]() { return app && app->cmd_field_active && app->cmd_field_claimed; };
+
+    // And for the Properties window's owner, group and mode fields: a group called
+    // "admin" is typed, and Delete inside it removes a letter, not a file.
+    if (app && app->props_open && app->props_field_active) {
+        switch (key) {
+        case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
+            return false;
+        default: break;
+        }
+    }
 
     switch (key) {
     case SDLK_UP: case SDLK_DOWN:
@@ -6865,24 +8329,24 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     case SDLK_MENU:
         return true;
     case SDLK_BACKSPACE:
-        // empty cmd: go to parent dir
-        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();
+        return !filter_focused();                 // go to parent dir
     case SDLK_DELETE:
         // Del edits the filter text, it does not delete files
-        return !filter_focused() && !cmd_claimed();
+        return !filter_focused();
     case SDLK_SPACE:
-        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();   // TC: Space marks on an empty cmd
+        return !filter_focused();                 // TC: Space marks
     case SDLK_SLASH: case SDLK_KP_DIVIDE:
-        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();   // TC Num/: restore the previous marks
+        return !filter_focused();                 // TC Num/: restore the previous marks
     case SDLK_PLUS: case SDLK_KP_PLUS:
     case SDLK_MINUS: case SDLK_KP_MINUS:
     case SDLK_ASTERISK: case SDLK_KP_MULTIPLY:
-        // select shortcuts need an empty cmd
-        return app->cmd[0] == '\0' && !filter_focused() && !cmd_claimed();
+        return !filter_focused();                 // the select shortcuts
     case SDLK_C: case SDLK_X: case SDLK_V:
-        // TC file clipboard keys. With text already in the command line they
-        // are text editing keys, so they fall through to ImGui.
-        return (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_ALT) && app->cmd[0] == '\0';
+        // TC file clipboard keys. They belong to the panes unless the console's
+        // field is holding the keyboard, and that case never gets here: main.cpp
+        // hands the whole keyboard to ImGui while the console owns it, which is what
+        // makes Ctrl+C and Ctrl+V copy and paste *inside* the console's own line.
+        return (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_ALT);
     default:
         break;
     }
@@ -6895,13 +8359,47 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     Pane& other = app->left_focus ? app->right : app->left;
     bool shift = (mod & SDL_KMOD_SHIFT) != 0;
 
+    // ---- three-answer dialog ----
+    // Enter is the recommended answer, Esc is the one that changes nothing, and
+    // every other key is swallowed: while this is up a stray letter is an answer,
+    // not a command to the panes behind it.
+    if (app->choice != CHOICE_NONE) {
+        if (key == SDLK_R || key == SDLK_RETURN || key == SDLK_KP_ENTER) app->choice_pick = 0;
+        else if (key == SDLK_S) app->choice_pick = 1;
+        else if (key == SDLK_ESCAPE || key == SDLK_N) app->choice_pick = 2;
+        return;
+    }
+
     // ---- modal confirm dialog ----
+    // Y is the first answer, N the second, R the third, and Esc is not an answer
+    // to an overwrite question at all: it cancels the operation, which is the
+    // promise people already have when a confirm turns out to be the wrong question.
     if (app->confirm != CONF_NONE) {
-        if (key == SDLK_Y || key == SDLK_RETURN || key == SDLK_KP_ENTER) confirm_yes(app);
-        else if (key == SDLK_N || key == SDLK_ESCAPE) {
-            app->confirm = CONF_NONE;
-            app->confirm_text[0] = '\0';
+        const bool overwrite_confirm = app->confirm != CONF_DELETE;
+        const bool sfv_confirm = app->confirm == CONF_SFV_VERIFY;
+        if (sfv_confirm) {
+            // V starts the check, N leaves the files exactly as they are, A changes
+            // the behaviour for the rest of this session. Esc is N: the question was
+            // never asked before, and a download that is already on disk is not
+            // something an accidental key should undo.
+            if (key == SDLK_V || key == SDLK_RETURN || key == SDLK_KP_ENTER)
+                app->pending_confirm_answer = CONF_ANS_VERIFY;
+            else if (key == SDLK_N || key == SDLK_ESCAPE)
+                app->pending_confirm_answer = CONF_ANS_NOT_NOW;
+            else if (key == SDLK_A)
+                app->pending_confirm_answer = CONF_ANS_ALWAYS;
+            else return;
+            return;
         }
+        if (key == SDLK_Y || key == SDLK_RETURN || key == SDLK_KP_ENTER)
+            app->pending_confirm_answer = overwrite_confirm ? CONF_ANS_OVERWRITE : CONF_ANS_YES;
+        else if (key == SDLK_N)
+            app->pending_confirm_answer = overwrite_confirm ? CONF_ANS_SKIP : CONF_ANS_NO;
+        else if (key == SDLK_R && overwrite_confirm)
+            app->pending_confirm_answer = CONF_ANS_RENAME;
+        else if (key == SDLK_ESCAPE)
+            app->pending_confirm_answer = overwrite_confirm ? CONF_ANS_CANCEL : CONF_ANS_NO;
+        else return;
         return;
     }
 
@@ -7014,15 +8512,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     // ---- other windows: Esc closes ----
-    if (app->output_open && (key == SDLK_ESCAPE || key == SDLK_RETURN || key == SDLK_KP_ENTER)) {
-        app->output_open = false; return;
-    }
     if (app->search_open && key == SDLK_ESCAPE) {
         app->search_open = false; app->search_input_active = false; return;
     }
     if (app->hotlist_open && key == SDLK_ESCAPE) { app->hotlist_open = false; return; }
     if (app->dirhist_open && key == SDLK_ESCAPE) { app->dirhist_open = false; return; }
-    if (app->cmdhist_open && key == SDLK_ESCAPE) { app->cmdhist_open = false; return; }
     if (app->tree_open && key == SDLK_ESCAPE) { app->tree_open = false; return; }
     if (app->about_open && key == SDLK_ESCAPE)   { app->about_open = false; return; }
     if (app->options_open && key == SDLK_ESCAPE) { app->options_open = false; return; }
@@ -7158,7 +8652,13 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     // ---- TC Alt+F8: the command line history list ----
-    if (key == SDLK_F8 && (mod & SDL_KMOD_ALT)) { app->cmdhist_open = !app->cmdhist_open; return; }
+    if (key == SDLK_F8 && (mod & SDL_KMOD_ALT)) {
+        // The history lives inside the console window, so Alt+F8 brings the window
+        // with it.
+        console_show(app, true);
+        app->console_hist_open = !app->console_hist_open;
+        return;
+    }
 
     // ---- TC Alt+F1/F2: choose the left/right drive ----
     if (key == SDLK_F1 && (mod & SDL_KMOD_ALT)) {
@@ -7226,21 +8726,16 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_RIGHT && (mod & SDL_KMOD_ALT)) { history_forward(app, &active); return; }
 
     // ---- command history (Alt+PgUp / Alt+PgDn) ----
+    // TC walks its command line with these; the console is the command line now, so
+    // they walk it and bring the window with them.
     if (key == SDLK_PAGEUP && (mod & SDL_KMOD_ALT)) {
-        if (app->cmd_hist_count > 0) {
-            if (app->cmd_hist_pos > 0) app->cmd_hist_pos--;
-            snprintf(app->cmd, sizeof(app->cmd), "%s", app->cmd_history[app->cmd_hist_pos]);
-        }
+        console_show(app, true);
+        console_history_step(app, true);
         return;
     }
     if (key == SDLK_PAGEDOWN && (mod & SDL_KMOD_ALT)) {
-        if (app->cmd_hist_pos < app->cmd_hist_count - 1) {
-            app->cmd_hist_pos++;
-            snprintf(app->cmd, sizeof(app->cmd), "%s", app->cmd_history[app->cmd_hist_pos]);
-        } else {
-            app->cmd_hist_pos = app->cmd_hist_count;
-            app->cmd[0] = '\0';
-        }
+        console_show(app, true);
+        console_history_step(app, false);
         return;
     }
 
@@ -7260,7 +8755,13 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // ---- search / quick cd / hidden / view / sort ----
     // TC Alt+F7 = search files (Shift+F7 kept as an alias)
     if (key == SDLK_F7 && (shift || (mod & SDL_KMOD_ALT))) { app->search_open = !app->search_open; return; }
-    if (key == SDLK_C && (mod & SDL_KMOD_ALT)) { snprintf(app->cmd, sizeof(app->cmd), "cd "); return; }
+    if (key == SDLK_C && (mod & SDL_KMOD_ALT)) {
+        // TC's quick cd: the console opens with `cd ` already typed, so the one key
+        // does both halves of the gesture.
+        console_show(app, true);
+        if (app->console_input[0] == '\0') console_set_input(app, "cd ");
+        return;
+    }
     if (key == SDLK_PERIOD && (mod & SDL_KMOD_ALT)) {
         app->show_hidden = !app->show_hidden;
         fs_set_show_hidden(app->show_hidden);
@@ -7310,6 +8811,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // ---- panes (TC Ctrl+U swaps the pane directories; Ctrl+Shift+U also
     //      swaps the tab strips). Clearing marks moved to Ctrl+Num-. ----
     if (key == SDLK_U && (mod & SDL_KMOD_CTRL)) { swap_panes(app, shift); return; }
+    // Ctrl+D leaves the site the focused pane is on and closes its connection.
+    // It is deliberately not Esc: Esc already has a queue of things it owns -
+    // stopping a transfer, hiding the console, closing a panel - and a pane that
+    // wants to leave a site should not have to get to the end of that queue.
+    if (key == SDLK_D && (mod & SDL_KMOD_CTRL)) { remote_disconnect(app); return; }
     // TC Ctrl+B: branch view of the whole subtree; Ctrl+Shift+B branches only
     // the marked directories. Pressing either again leaves branch view.
     if (key == SDLK_B && (mod & SDL_KMOD_CTRL)) { branch_toggle(app, active, shift); return; }
@@ -7355,7 +8861,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (key == SDLK_MINUS || key == SDLK_KP_MINUS) { clear_marks(active, shift ? SCOPE_FILES : SCOPE_ALL); return; }
         if (key == SDLK_PLUS || key == SDLK_KP_PLUS) { select_all_marks(active); return; }
         if (key == SDLK_ASTERISK || key == SDLK_KP_MULTIPLY) { invert_marks(active); return; }
-    } else if (app->cmd[0] == '\0') {
+    } else {
         // Num+ / Num- extend and shrink the selection row by row.
         if (key == SDLK_PLUS || key == SDLK_KP_PLUS) { step_marks(active, true); return; }
         if (key == SDLK_MINUS || key == SDLK_KP_MINUS) { step_marks(active, false, shift ? SCOPE_FILES : SCOPE_ALL); return; }
@@ -7374,7 +8880,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         if (key == SDLK_C) { clipboard_set(app, active, false); return; }
         if (key == SDLK_X) { clipboard_set(app, active, true); return; }
         if (key == SDLK_V) { do_paste(app); return; }
-        if (key == SDLK_P) { cmd_put_path(app, active); return; }
+        if (key == SDLK_P) { console_put_path(app, active); return; }
     }
 
     // ---- file operations ----
@@ -7455,6 +8961,16 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
     if (key == SDLK_F5 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { do_copy(app); return; }
     if (key == SDLK_F6 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL))) { do_move(app); return; }
+
+    // ---- console: Up / Down recall the commands, not the file list ----
+    // Only while the field holds the keyboard. The moment a click hands it back to
+    // the panes, Up and Down are the cursor again.
+    if (app->console_open && app->console_field_active &&
+        (key == SDLK_UP || key == SDLK_DOWN) &&
+        !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+        console_history_step(app, key == SDLK_UP);
+        return;
+    }
 
     // ---- navigation (all moves walk the visible rows, i.e. the filter) ----
     if (key == SDLK_UP) {
@@ -7537,6 +9053,17 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         open_properties(app, active);
         return;
     }
+    // ---- Ctrl+Enter: the console ----
+    // The binding was free all along: every other Enter rule above checks its own
+    // modifier, and the plain-Enter branch below ignores modifiers, so Ctrl+Enter
+    // has been arriving here and behaving as a plain Enter.
+    if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) && (mod & SDL_KMOD_CTRL) &&
+        !(mod & (SDL_KMOD_ALT | SDL_KMOD_MODE))) {
+        if (!app->console_open) console_show(app, true);
+        else if (app->console_field_active) console_run(app);   // Ctrl+Enter runs the line too
+        else app->console_focus_request = true;                 // hand the keyboard back
+        return;
+    }
     if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
         active.quick_active = false;   // the search word is spent
         // Enter in the quick filter commits it and leaves the field; the filter
@@ -7547,8 +9074,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             ImGui::ClearActiveID();
             return;
         }
-        // Non-empty command line: Enter runs the command, not the file entry.
-        if (app->cmd[0] != '\0') { exec_command(app); return; }
+        // Enter in the console runs the line, not the entry under the cursor.
+        if (app->console_open && app->console_field_active) { console_run(app); return; }
         if (active.selected >= 0 && active.selected < active.entry_count)
             activate_entry(app, active, active.selected);
         return;
@@ -7573,9 +9100,24 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             ImGui::ClearActiveID();
             return;
         }
-        app->cmd[0] = '\0';
+        // The console hides and keeps its backlog: that is the whole point of the
+        // window, and it is why hiding is not destroying. A running command is
+        // cancelled first, because the Esc that stops a `find` should not also close
+        // the window that shows what it found so far.
+        if (app->console_open) {
+            if (app->console_hist_open) { app->console_hist_open = false; return; }
+            if (app->console_job) {
+                app->console_job->cancel.store(true);
+                snprintf(app->status_msg, sizeof(app->status_msg), "Command cancelled");
+                return;
+            }
+            app->console_open = false;
+            app->console_field_active = false;
+            app->console_hist_open = false;
+            ImGui::ClearActiveID();   // the field loses the keyboard with the window
+            return;
+        }
         app->status_msg[0] = '\0';
-        app->cmd_hist_pos = app->cmd_hist_count;
         return;
     }
 }

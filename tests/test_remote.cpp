@@ -51,6 +51,10 @@ static const char* kPass = "hunter2";
 
 static bool exists(const std::string& p) { struct stat st; return lstat(p.c_str(), &st) == 0; }
 static bool is_dir(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
+static long long file_size(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 ? (long long)st.st_size : -1;
+}
 
 static void write_file(const std::string& path, const std::string& body) {
     FILE* f = fopen(path.c_str(), "wb");
@@ -495,11 +499,11 @@ struct FtpFixture {
     std::string root;
     std::string cert, key;
 
-    bool start(const std::string& dir, bool want_tls);
+    bool start(const std::string& dir, bool want_tls, const char* rest_mode = "");
     void stop();
 };
 
-bool FtpFixture::start(const std::string& dir, bool want_tls) {
+bool FtpFixture::start(const std::string& dir, bool want_tls, const char* rest_mode) {
     root = dir;
     if (want_tls) {
         // The certificate lives beside the root, never inside it: a key file
@@ -529,8 +533,11 @@ bool FtpFixture::start(const std::string& dir, bool want_tls) {
         const char* want_log = getenv("FTP_SERVER_LOG");
         // One log per fixture: the plain and the TLS server share a root, and a
         // single file would have the second one erase the first exactly where the
-        // TLS session is what needs reading.
-        std::string log_path = root + (want_tls ? "-tls-server.log" : "-server.log");
+        // TLS session is what needs reading. The REST-mode fixtures share the root
+        // for the same reason, so they get their own file too.
+        std::string log_path = root + "-server" +
+                               (want_tls ? "-tls" : (rest_mode && *rest_mode ? rest_mode : "")) +
+                               ".log";
         int logfd = (want_log && *want_log && strcmp(want_log, "0") != 0)
                         ? open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600)
                         : -1;
@@ -541,6 +548,7 @@ bool FtpFixture::start(const std::string& dir, bool want_tls) {
                                           "--port", "0", "--user", kUser, "--password", kPass };
         if (want_tls) { args.push_back("--cert"); args.push_back(cert);
                         args.push_back("--key"); args.push_back(key); }
+        if (rest_mode && *rest_mode) args.push_back(rest_mode);
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>("python3"));
         for (std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -889,6 +897,178 @@ static void test_ftp_prefix(FtpFixture& fx) {
 // download from one site at the same time, and a handle shared between them
 // answers one of them with another's bytes, or with nothing at all. Correct
 // answers out of all three is the check.
+// The sidecar a download writes before the transfer is known good. Two promises:
+// what sits under the real name is the complete file, and a transfer that stopped
+// part way leaves its partial where a resume can pick it up.
+static void test_ftp_partial(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    std::string err;
+    std::string out = fx.root + "-partial";
+    sh("mkdir -p " + q(out));
+
+    std::string huge = fx.root + "/huge.txt";
+    sh("head -c 2000000 /dev/zero | tr '\\0' 'q' > " + q(huge));
+
+    // A good transfer leaves the real name and nothing else.
+    std::string good = out + "/good.txt";
+    long long got = -1;
+    CHECK(net_download(site, "/huge.txt", good.c_str(), nullptr, nullptr, &err, 0, &got));
+    CHECK(got == 2000000);
+    CHECK(file_size(good) == 2000000);
+    CHECK(!exists(good + ".part"));
+
+    // An aborted transfer leaves nothing under the real name, and the sidecar holds
+    // exactly the bytes this call wrote - which may be none, because an abort that
+    // lands before the first chunk has nothing to keep. Asserting the equality
+    // rather than a size is the honest form: where the abort lands on a 2 MB file
+    // over a loopback socket is not something a test can pin down.
+    Prog stopper;
+    stopper.after = 2;
+    std::string half = out + "/half.txt";
+    got = -1;
+    CHECK(!net_download(site, "/huge.txt", half.c_str(), prog_cb, &stopper, &err, 0, &got));
+    CHECK(err == "aborted");
+    CHECK(!exists(half));
+    CHECK(net_part_size(half.c_str()) == (got > 0 ? got : 0));
+
+    // Bytes that arrived are kept even when the transfer did not finish. The
+    // failure here is the rename onto a directory, which is deterministic in a way
+    // an abort's timing is not: the body is real and the name could not be put in
+    // place, so the partial is what is left holding it.
+    std::string blocked = out + "/blocked";
+    sh("mkdir -p " + q(blocked));
+    got = -1;
+    CHECK(!net_download(site, "/hello.txt", blocked.c_str(), nullptr, nullptr, &err, 0, &got));
+    CHECK(got == 12);
+    CHECK(net_part_size(blocked.c_str()) == 12);
+    sh("rm -rf " + q(blocked));
+
+    // A transfer that never started keeps nothing: an empty sidecar under a name
+    // the user will see is worse than no file, and it is the promise the old
+    // remove(local) made.
+    std::string none = out + "/none.txt";
+    CHECK(!net_download(site, "/gone.txt", none.c_str(), nullptr, nullptr, &err));
+    CHECK(!exists(none));
+    CHECK(!exists(none + ".part"));
+    CHECK(net_part_size(none.c_str()) == 0);
+
+    // A restart clears the leftover before it starts, so "again" means from zero
+    // and not on top of a half file.
+    sh("printf 'stale' > " + q(half + ".part"));
+    CHECK(net_download(site, "/hello.txt", half.c_str(), nullptr, nullptr, &err));
+    CHECK(read_file(half) == "hello world\n");
+    CHECK(!exists(half + ".part"));
+
+    remove(huge.c_str());
+    sh("rm -rf " + q(out));
+}
+
+// Resume, against a server that answers REST. The point of the feature: a transfer
+// that stopped part way continues from the bytes it already moved, and the file
+// that comes out is byte for byte the one a clean transfer would have produced.
+static void test_ftp_resume(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    std::string err;
+    std::string out = fx.root + "-resume";
+    sh("mkdir -p " + q(out));
+
+    std::string big = fx.root + "/resume-src.bin";
+    sh("head -c 200000 /dev/zero | tr '\\0' 'q' > " + q(big));
+    std::string whole = read_file(big);
+    CHECK(whole.size() == 200000);
+
+    // 80 000 bytes are already on disk as a sidecar.
+    std::string dst = out + "/big.bin";
+    write_file(dst + ".part", whole.substr(0, 80000));
+    CHECK(net_part_size(dst.c_str()) == 80000);
+
+    long long got = -1;
+    CHECK(net_download(site, "/resume-src.bin", dst.c_str(), nullptr, nullptr, &err,
+                       net_part_size(dst.c_str()), &got));
+    CHECK(got == 120000);                 // only what was left came over the wire
+    CHECK(file_size(dst) == 200000);
+    CHECK(read_file(dst) == whole);       // the resumed file is the file
+    CHECK(!exists(dst + ".part"));
+
+    // A tree resumes per entry: the file with a sidecar continues from it and the
+    // ones without are fetched whole. The tree is built here because the transfer
+    // test above takes /tree back off the server when it finishes.
+    std::string up = out + "/src tree";
+    sh("mkdir -p " + q(up + "/deep dir") +
+       " && printf 'one\\n' > " + q(up + "/one two.txt") +
+       " && printf 'two\\n' > " + q(up + "/deep dir/two.txt"));
+    CHECK(net_upload_tree(site, up.c_str(), "/resume tree", nullptr, nullptr, &err));
+
+    std::string back = out + "/back";
+    sh("rm -rf " + q(back));
+    CHECK(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err));
+    std::string one = read_file(back + "/one two.txt");
+    sh("rm -f " + q(back + "/one two.txt"));
+    write_file(back + "/one two.txt.part", one.substr(0, 2));
+    CHECK(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err, true));
+    CHECK(read_file(back + "/one two.txt") == one);
+    CHECK(read_file(back + "/deep dir/two.txt") == "two\n");
+    CHECK(!exists(back + "/one two.txt.part"));
+    CHECK(net_remove_tree(site, "/resume tree", nullptr, nullptr, &err));
+
+    // An upload continues the file the server already has: curl reads the source
+    // from the offset and the server writes from the same place. The half the
+    // server has is written straight into its root, because that is where a
+    // stopped upload left it.
+    sh("head -c 100000 /dev/zero | tr '\\0' 'q' > " + q(fx.root + "/resumeme.bin"));
+    std::string src = out + "/full.bin";
+    write_file(src, whole);
+    CHECK(net_upload(site, "/resumeme.bin", src.c_str(), nullptr, nullptr, &err, 100000));
+    FileEntry e{};
+    CHECK(net_stat(site, "/resumeme.bin", &e, &err));
+    CHECK((long long)e.size == 200000);
+    CHECK(read_file(fx.root + "/resumeme.bin") == whole);
+
+    // A resume asked for past the end of the file on the server. There is nothing
+    // to fetch from there, and the server's own answer is the reason the user sees.
+    // The partial is kept - nothing is wrong with those bytes - and nothing lands at
+    // the real name.
+    write_file(fx.root + "/tiny.bin", "hello world\n");
+    std::string tdst = out + "/tiny.txt";
+    write_file(tdst + ".part", std::string(5000, 'x'));
+    long long tgot = -1;
+    CHECK(!net_download(site, "/tiny.bin", tdst.c_str(), nullptr, nullptr, &err, 5000, &tgot));
+    CHECK(err.find("beyond file size") != std::string::npos);
+    CHECK(tgot == 0);
+    CHECK(!exists(tdst));
+    CHECK(net_part_size(tdst.c_str()) == 5000);
+
+    remove(big.c_str());
+    sh("rm -rf " + q(out) + " " + q(fx.root + "/resumeme.bin") + " " + q(fx.root + "/tiny.bin"));
+}
+
+// The two ways a server stops a resume from the outside: one that says no to REST,
+// and one that cannot report a size, which is the number curl needs before it will
+// start at an offset. Both have to leave the partial exactly as it was and a reason
+// on screen - a resume that fails must not cost the bytes already earned.
+static void test_ftp_resume_refused(FtpFixture& fx, const char* mode) {
+    NetSite site = fixture_site(fx);
+    std::string err;
+    std::string out = fx.root + std::string(mode);
+    sh("mkdir -p " + q(out));
+    std::string big = fx.root + "/resume-src.bin";
+    sh("head -c 200000 /dev/zero | tr '\\0' 'q' > " + q(big));
+
+    std::string dst = out + "/big.bin";
+    write_file(dst + ".part", std::string(80000, 'q'));
+    long long got = -1;
+    CHECK(!net_download(site, "/resume-src.bin", dst.c_str(), nullptr, nullptr, &err,
+                        80000, &got));
+    CHECK(!err.empty());
+    CHECK(!exists(dst));   // nothing reached the real name either way
+    // A refused resume leaves the partial exactly as it was: there is nothing wrong
+    // with those bytes, the resume is what failed.
+    CHECK(net_part_size(dst.c_str()) == 80000);
+
+    remove(big.c_str());
+    sh("rm -rf " + q(out));
+}
+
 static void test_ftp_concurrent(FtpFixture& fx) {
     NetSite site = fixture_site(fx);
     const int kThreads = 3;
@@ -973,6 +1153,10 @@ static void test_without_curl(void) {
     CHECK(!net_stat(site, "/x", &e, &err));
     CHECK(!net_download(site, "/x", "/tmp/x", nullptr, nullptr, &err));
     CHECK(!net_upload(site, "/x", "/etc/hostname", nullptr, nullptr, &err));
+    // The sidecar plumbing is not transport: a name and a stat, so it answers the
+    // same way in a build that cannot fetch anything.
+    CHECK(net_part_path("/tmp/x") == "/tmp/x.part");
+    CHECK(net_part_size("/tmp/immc-no-such-file") == 0);
     CHECK(!net_mkdir(site, "/x", &err));
     CHECK(!net_remove(site, "/x", false, &err));
     CHECK(!net_rename(site, "/x", "y", &err));
@@ -1037,8 +1221,29 @@ int main(void) {
         test_ftp_bad_login(fx);
         test_ftp_transfer(fx);
         test_ftp_prefix(fx);
+        test_ftp_partial(fx);
+        test_ftp_resume(fx);
         test_ftp_concurrent(fx);
         fx.stop();
+    }
+
+    // A server that refuses REST, and one that cannot report a size, which is the
+    // number curl needs before it will start at an offset at all. Both are real
+    // servers, and neither may cost the bytes already earned.
+    FtpFixture fx_nores;
+    if (fx_nores.start(root, false, "--no-rest")) {
+        test_ftp_resume_refused(fx_nores, "-nores");
+        fx_nores.stop();
+    } else {
+        printf("the no-REST ftp server did not start: that check is skipped\n");
+    }
+
+    FtpFixture fx_nosize;
+    if (fx_nosize.start(root, false, "--no-size")) {
+        test_ftp_resume_refused(fx_nosize, "-nosize");
+        fx_nosize.stop();
+    } else {
+        printf("the no-SIZE ftp server did not start: that check is skipped\n");
     }
 
     // TLS needs a certificate, and generating one needs openssl. Without it the

@@ -728,6 +728,20 @@ bool net_parse_list_line(const char* line, FileEntry* out) {
 // Transport
 // ---------------------------------------------------------------------------
 
+// The name a download writes before the transfer is known good. An aborted or
+// failed transfer leaves it behind on purpose - it is what a resume continues
+// from - and the real name is only ever reached by a rename. A crash therefore
+// leaves a file that says it is a partial instead of a truncated file wearing the
+// real name, which is the case a user cannot tell from looking at the pane.
+std::string net_part_path(const char* local) { return std::string(local) + ".part"; }
+
+long long net_part_size(const char* local) {
+    struct stat st;
+    std::string p = net_part_path(local);
+    if (stat(p.c_str(), &st) != 0) return 0;
+    return (long long)st.st_size;
+}
+
 #ifdef MC_HAVE_CURL
 
 // curl_global_init is not thread safe and must happen once for the process. A
@@ -774,6 +788,19 @@ void net_forget(const NetSite* site) {
     HandleCache& c = handle_cache();
     for (size_t i = 0; i < c.entries.size();) {
         if (key.empty() || c.entries[i].key == key) {
+            curl_easy_cleanup(c.entries[i].h);
+            c.entries.erase(c.entries.begin() + (long)i);
+        } else {
+            i++;
+        }
+    }
+}
+
+void net_forget_root(const char* root) {
+    if (!root || !*root) return;   // an empty root is not a site, and "every site" is not what was asked
+    HandleCache& c = handle_cache();
+    for (size_t i = 0; i < c.entries.size();) {
+        if (c.entries[i].key == root) {
             curl_easy_cleanup(c.entries[i].h);
             c.entries.erase(c.entries.begin() + (long)i);
         } else {
@@ -1045,11 +1072,14 @@ bool net_stat(const NetSite& site, const std::string& rpath, FileEntry* out, std
 
 struct FileSink {
     FILE* f;
+    long long wrote;   // bytes this call actually stored, whatever else happened
 };
 
 static size_t write_file_cb(char* ptr, size_t size, size_t nmemb, void* user) {
     FileSink* s = (FileSink*)user;
-    return fwrite(ptr, size, nmemb, s->f);
+    size_t n = fwrite(ptr, size, nmemb, s->f);
+    s->wrote += (long long)(n * size);   // fwrite counts items, not bytes
+    return n;
 }
 
 static size_t read_file_cb(char* dest, size_t size, size_t nmemb, void* user) {
@@ -1058,10 +1088,16 @@ static size_t read_file_cb(char* dest, size_t size, size_t nmemb, void* user) {
 }
 
 bool net_download(const NetSite& site, const std::string& rpath, const char* local,
-                  fs_progress_fn cb, void* user, std::string* err) {
+                  fs_progress_fn cb, void* user, std::string* err,
+                  long long resume_from, long long* got) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
-    FILE* f = fopen(local, "wb");
-    if (!f) { if (err) *err = std::string("cannot write ") + local + ": " + strerror(errno); return false; }
+    std::string tmp = net_part_path(local);
+    // A restart starts the sidecar empty and a resume continues the one that is
+    // already there. Clearing it here is what makes "restart" mean starting over
+    // rather than downloading on top of a half file.
+    if (resume_from <= 0) remove(tmp.c_str());
+    FILE* f = fopen(tmp.c_str(), resume_from > 0 ? "ab" : "wb");
+    if (!f) { if (err) *err = std::string("cannot write ") + tmp + ": " + strerror(errno); return false; }
     std::string url = curl_url(site, rpath);
     char errbuf[CURL_ERROR_SIZE];
     PerformCtx pctx = { cb, user, false, false };
@@ -1069,19 +1105,52 @@ bool net_download(const NetSite& site, const std::string& rpath, const char* loc
     bool ok = false;
     if (!h) { fclose(f); if (err) *err = "out of memory"; return false; }
     setup_handle(h, site, url, errbuf, sizeof(errbuf));
-    FileSink sink = { f };
+    FileSink sink = { f, 0 };
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_file_cb);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
     curl_easy_setopt(h, CURLOPT_XFERINFODATA, &pctx);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    // The REST that a resume is: curl sends it before the RETR and the server
+    // answers with the starting point instead of the whole file.
+    if (resume_from > 0)
+        curl_easy_setopt(h, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)resume_from);
     CURLcode rc = curl_easy_perform(h);
     if (rc != CURLE_OK) net_forget(&site);
     ok = (rc == CURLE_OK);
-    if (!ok && err) *err = pctx.aborted ? std::string("aborted") : curl_error(rc, errbuf);
     fclose(f);
-    if (!ok) remove(local);   // a partial file is worse than no file
-    return ok;
+    if (got) *got = sink.wrote;
+
+    // What the sidecar actually ended up being: the only number that can tell a
+    // resumed transfer from a restarted one.
+    long long final_size = 0;
+    struct stat st;
+    if (stat(tmp.c_str(), &st) == 0) final_size = (long long)st.st_size;
+
+    // No length check here, which is a finding and not an omission. curl asks the
+    // server for the size, subtracts the offset it put in REST, and stops reading at
+    // that many bytes: an honest resume lands on the remote size by construction. A
+    // server that refuses REST, or that is asked to resume past its end, says so and
+    // curl hands the reason back ("Offset (5000) was beyond file size (12)"). The
+    // one shape a length check would catch is a remote file that changed size between
+    // the listing and the transfer - and there the file curl produced is complete, so
+    // throwing it away would be the wrong answer. Whether the bytes are the *right*
+    // bytes is a checksum question, which is what the SFV check is for.
+    if (!ok) {
+        // Nothing arrived, so there is nothing to keep. This is the same promise
+        // the old `remove(local)` made: a failed transfer does not leave a file
+        // where the user will open it.
+        if (final_size == 0) remove(tmp.c_str());
+        if (err) *err = pctx.aborted ? std::string("aborted") : curl_error(rc, errbuf);
+        return false;
+    }
+    // The real name is reached by rename, atomic on the same filesystem: what sits
+    // under it is either the complete file or it is not there.
+    if (rename(tmp.c_str(), local) != 0) {
+        if (err) *err = std::string("cannot put ") + local + " in place: " + strerror(errno);
+        return false;
+    }
+    return true;
 }
 
 struct PrefixSink {
@@ -1131,13 +1200,22 @@ bool net_download_prefix(const NetSite& site, const std::string& rpath, std::str
 }
 
 bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
-                fs_progress_fn cb, void* user, std::string* err) {
+                fs_progress_fn cb, void* user, std::string* err,
+                long long resume_from) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
     FILE* f = fopen(local, "rb");
     if (!f) { if (err) *err = std::string("cannot read ") + local + ": " + strerror(errno); return false; }
     struct stat st;
     long long size = -1;
     if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode)) size = (long long)st.st_size;
+    // A resume over FTP is an append: the offset is where in the local source
+    // libcurl starts reading and the server continues the file it already has. So
+    // the size the server is told is what is left to send, not the whole file.
+    if (resume_from > 0 && size >= 0 && resume_from > size) resume_from = 0;
+    // curl resumes an FTP upload with APPE rather than REST + STOR. With our own
+    // read callback there is no FILE* for curl to seek, so the remainder starts
+    // here, and INFILESIZE below is the remainder too.
+    if (resume_from > 0) fseeko(f, (off_t)resume_from, SEEK_SET);
 
     std::string url = curl_url(site, rpath);
     char errbuf[CURL_ERROR_SIZE];
@@ -1149,10 +1227,16 @@ bool net_upload(const NetSite& site, const std::string& rpath, const char* local
     // server does not have yet is an ordinary upload of a tree, not a mistake.
     curl_easy_setopt(h, CURLOPT_FTP_CREATE_MISSING_DIRS, (long)CURLFTP_CREATE_DIR_RETRY);
     curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
-    FileSink sink = { f };
+    FileSink sink = { f, 0 };
     curl_easy_setopt(h, CURLOPT_READFUNCTION, read_file_cb);
     curl_easy_setopt(h, CURLOPT_READDATA, &sink);
-    if (size >= 0) curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)size);
+    // curl wants the size of the local source, not the size of the remainder: it
+    // subtracts the resume offset itself. Telling it the remainder and the offset
+    // is what makes a resume upload nothing and call that a success.
+    if (size >= 0)
+        curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)size);
+    if (resume_from > 0)
+        curl_easy_setopt(h, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)resume_from);
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
     curl_easy_setopt(h, CURLOPT_XFERINFODATA, &pctx);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
@@ -1162,6 +1246,20 @@ bool net_upload(const NetSite& site, const std::string& rpath, const char* local
     if (rc != CURLE_OK) {
         if (err) *err = pctx.aborted ? std::string("aborted") : curl_error(rc, errbuf);
         return false;
+    }
+    // The check an upload resume does need. A resume over FTP is an APPE, so the
+    // only way the append can go wrong is by not landing, and the way to see that is
+    // to ask the server how big the file is now: it has to be the size of the local
+    // source. This is not a formality - a resume that told curl the size of the
+    // remainder made curl transfer nothing, report success, and leave the server
+    // holding half a file.
+    if (resume_from > 0) {
+        FileEntry me;
+        std::string serr;
+        if (net_stat(site, rpath, &me, &serr) && (long long)me.size != size) {
+            if (err) *err = "the server did not store the whole file - start again";
+            return false;
+        }
     }
     return true;
 }
@@ -1259,11 +1357,12 @@ static bool make_local_dirs(const char* path) {
 // FTP has no recursive retrieve either: a directory is one mkdir and one fetch
 // per entry, taken from a listing.
 bool net_download_tree(const NetSite& site, const std::string& rpath, const char* local,
-                       fs_progress_fn cb, void* user, std::string* err) {
+                       fs_progress_fn cb, void* user, std::string* err, bool resume) {
     FileEntry me;
     std::string stat_err;
     if (!net_stat(site, rpath, &me, &stat_err) || !S_ISDIR(me.mode))
-        return net_download(site, rpath, local, cb, user, err);
+        return net_download(site, rpath, local, cb, user, err,
+                            resume ? net_part_size(local) : 0, nullptr);
 
     if (!make_local_dirs(local)) {
         if (err) *err = std::string(local) + ": " + strerror(errno);
@@ -1275,7 +1374,16 @@ bool net_download_tree(const NetSite& site, const std::string& rpath, const char
         std::string child = rpath.empty() ? e.name : rpath + "/" + e.name;
         char child_local[4300];
         snprintf(child_local, sizeof(child_local), "%s/%s", local, e.name);
-        if (!net_download_tree(site, child, child_local, cb, user, err)) return false;
+        // Each entry resumes from its own sidecar: a tree that died on the fourth
+        // file continues the fourth and re-runs the ones after it. The listing
+        // already says which entries are directories, so the walk does not go and
+        // ask the server the same question per entry.
+        if (S_ISDIR(e.mode)) {
+            if (!net_download_tree(site, child, child_local, cb, user, err, resume)) return false;
+        } else {
+            long long from = resume ? net_part_size(child_local) : 0;
+            if (!net_download(site, child, child_local, cb, user, err, from, nullptr)) return false;
+        }
     }
     return true;
 }
@@ -1284,13 +1392,25 @@ bool net_download_tree(const NetSite& site, const std::string& rpath, const char
 // existing remote directory is kept rather than failed on, because uploading
 // over a folder that is already there is an overwrite, not an error.
 bool net_upload_tree(const NetSite& site, const char* local, const std::string& rpath,
-                     fs_progress_fn cb, void* user, std::string* err) {
+                     fs_progress_fn cb, void* user, std::string* err, bool resume) {
     struct stat st;
     if (stat(local, &st) != 0) {
         if (err) *err = std::string(local) + ": " + strerror(errno);
         return false;
     }
-    if (!S_ISDIR(st.st_mode)) return net_upload(site, rpath, local, cb, user, err);
+    if (!S_ISDIR(st.st_mode)) {
+        // A resumed store continues the file the server already has, so the offset
+        // is the size the server says that file has. Without a number there is
+        // nothing to continue from and the store starts over.
+        long long from = 0;
+        if (resume) {
+            FileEntry there;
+            std::string serr;
+            if (net_stat(site, rpath, &there, &serr) && S_ISREG(there.mode))
+                from = (long long)there.size;
+        }
+        return net_upload(site, rpath, local, cb, user, err, from);
+    }
 
     FileEntry me;
     std::string stat_err;
@@ -1308,7 +1428,7 @@ bool net_upload_tree(const NetSite& site, const char* local, const std::string& 
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         std::string child_local = std::string(local) + "/" + de->d_name;
         std::string child_remote = rpath.empty() ? de->d_name : rpath + "/" + de->d_name;
-        if (!net_upload_tree(site, child_local.c_str(), child_remote, cb, user, err)) { ok = false; break; }
+        if (!net_upload_tree(site, child_local.c_str(), child_remote, cb, user, err, resume)) { ok = false; break; }
         if (cb && !cb(0, 0, 0, 0, user)) { ok = false; if (err) *err = "aborted"; break; }
     }
     closedir(d);
@@ -1349,6 +1469,7 @@ void net_what(char* out, size_t n) {
 }
 
 void net_forget(const NetSite*) {}
+void net_forget_root(const char*) {}
 void net_shutdown(void) {}
 
 static const char* const kNoCurl = "this build has no FTP support: install libcurl and rebuild";
@@ -1363,8 +1484,10 @@ bool net_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, s
     return no_curl(err);
 }
 bool net_stat(const NetSite&, const std::string&, FileEntry*, std::string* err) { return no_curl(err); }
-bool net_download(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
-bool net_upload(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
+bool net_download(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
+                  long long, long long*) { return no_curl(err); }
+bool net_upload(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
+                long long) { return no_curl(err); }
 bool net_download_prefix(const NetSite&, const std::string&, std::string* out, size_t, fs_progress_fn, void*, std::string* err) {
     out->clear();
     return no_curl(err);
@@ -1372,8 +1495,8 @@ bool net_download_prefix(const NetSite&, const std::string&, std::string* out, s
 bool net_mkdir(const NetSite&, const std::string&, std::string* err) { return no_curl(err); }
 bool net_remove(const NetSite&, const std::string&, bool, std::string* err) { return no_curl(err); }
 bool net_remove_tree(const NetSite&, const std::string&, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
-bool net_download_tree(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
-bool net_upload_tree(const NetSite&, const char*, const std::string&, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
+bool net_download_tree(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err, bool) { return no_curl(err); }
+bool net_upload_tree(const NetSite&, const char*, const std::string&, fs_progress_fn, void*, std::string* err, bool) { return no_curl(err); }
 bool net_rename(const NetSite&, const std::string&, const char*, std::string* err) { return no_curl(err); }
 bool net_chmod(const NetSite&, const std::string&, int, std::string* err) { return no_curl(err); }
 

@@ -34,6 +34,11 @@ void mc_config_default(MCConfig* c) {
     // Keep in sync with qv_w/qv_h in AppPanes (panes.h): a config that says
     // nothing and an app that was never told have to agree on the same window.
     c->qv_w = 720; c->qv_h = 460;
+    // Keep in sync with console_w/console_h in AppPanes (panes.h).
+    c->console_w = 760; c->console_h = 420;
+    c->console_save = 1;
+    snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
+    c->console_entries.clear();
     c->font[0] = '\0';
     c->font_size = 0.0f;
     snprintf(c->hinting, sizeof(c->hinting), "default");
@@ -60,6 +65,42 @@ static char* trim(char* s) {
     return s;
 }
 
+// A console transcript line is one config line, and a command's output is
+// whatever the tool printed. So the characters this file format gives meaning to
+// are escaped on the way out and put back on the way in: a newline would end the
+// value and leave the rest of the output to be parsed as keys, and a bare
+// backslash would change what the next escape means.
+static std::string cfg_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n";  break;
+        case '\r': o += "\\r";  break;
+        case '\t': o += "\\t";  break;
+        default:   o += ch;     break;
+        }
+    }
+    return o;
+}
+
+static std::string cfg_unescape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '\\' || i + 1 >= s.size()) { o += s[i]; continue; }
+        switch (s[++i]) {
+        case 'n':  o += '\n'; break;
+        case 'r':  o += '\r'; break;
+        case 't':  o += '\t'; break;
+        case '\\': o += '\\'; break;
+        default:   o += s[i]; break;   // an unknown escape is the character itself
+        }
+    }
+    return o;
+}
+
 void mc_config_load(MCConfig* c) {
     mc_config_default(c);
     FILE* f = fopen(config_path().c_str(), "r");
@@ -81,6 +122,10 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "window_h"))  c->win_h = atoi(val);
         else if (!strcmp(key, "quickview_w")) c->qv_w = atoi(val);
         else if (!strcmp(key, "quickview_h")) c->qv_h = atoi(val);
+        else if (!strcmp(key, "console_w"))     c->console_w = atoi(val);
+        else if (!strcmp(key, "console_h"))     c->console_h = atoi(val);
+        else if (!strcmp(key, "console_save"))  c->console_save = atoi(val);
+        else if (!strcmp(key, "sfv_verify"))    snprintf(c->sfv_verify, sizeof(c->sfv_verify), "%s", val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
         else if (!strcmp(key, "font_hinting")) snprintf(c->hinting, sizeof(c->hinting), "%s", val);
@@ -94,6 +139,23 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "left_tab_active"))  c->left_tab_active = atoi(val);
         else if (!strcmp(key, "right_tab_active")) c->right_tab_active = atoi(val);
         else {
+            // console<N>_cwd / _cmd / _out / _code / _builtin: one command of the
+            // backlog. The index is read out of the key, so a hand-edited file
+            // with a gap in it still lands in the right slot instead of shifting
+            // everything up one command.
+            int idx = -1;
+            char field[16];
+            if (sscanf(key, "console%d_%15s", &idx, field) == 2 && idx >= 0 &&
+                idx < MC_MAX_CONSOLE_ENTRIES) {
+                if ((int)c->console_entries.size() <= idx) c->console_entries.resize(idx + 1);
+                MCConsoleEntry& e = c->console_entries[idx];
+                if      (!strcmp(field, "cwd"))     e.cwd = cfg_unescape(val);
+                else if (!strcmp(field, "cmd"))     e.cmd = cfg_unescape(val);
+                else if (!strcmp(field, "out"))     e.out = cfg_unescape(val);
+                else if (!strcmp(field, "code"))    e.code = atoi(val);
+                else if (!strcmp(field, "builtin")) e.builtin = atoi(val) != 0;
+            }
+
             for (int i = 0; i < MC_MAX_TABS; i++) {
                 char k[24];
                 snprintf(k, sizeof(k), "left_tab%d", i);
@@ -119,6 +181,13 @@ void mc_config_load(MCConfig* c) {
     // row of text, and a window that small is hard to drag back by its title bar.
     if (c->qv_w < 200) c->qv_w = 720;
     if (c->qv_h < 120) c->qv_h = 460;
+    if (c->console_w < 240) c->console_w = 760;
+    if (c->console_h < 120) c->console_h = 420;
+    c->console_save = c->console_save ? 1 : 0;
+    // Only the three words mean anything. Anything else, including a typo, falls
+    // back to asking.
+    if (strcmp(c->sfv_verify, "always") && strcmp(c->sfv_verify, "never"))
+        snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
     if (c->left_tab_count  < 0) c->left_tab_count  = 0;
     if (c->left_tab_count  > MC_MAX_TABS) c->left_tab_count = MC_MAX_TABS;
     if (c->right_tab_count < 0) c->right_tab_count = 0;
@@ -197,6 +266,43 @@ void mc_config_save(const MCConfig* c) {
     for (int i = 0; i < c->right_tab_count; i++)
         fprintf(f, "right_tab%d = %s\n", i, c->right_tabs[i]);
     fprintf(f, "right_tab_active = %d\n", c->right_tab_active);
+
+    // The console backlog: the commands and their output, oldest first, so the
+    // transcript you hid with Esc is still there in the next session and in a
+    // directory you have never opened before. Only the tail is kept, and only a
+    // bounded amount of each command's output, because this file is meant to stay
+    // readable by the person it belongs to.
+    fprintf(f,
+        "\n# Console window size in pixels (written on exit)\n"
+        "console_w = %d\n"
+        "console_h = %d\n"
+        "\n# 1 = keep the console backlog in this file across sessions. The\n"
+        "# transcript is plain text: a command that carried a password is written\n"
+        "# here too, which is what this switch is for. 0 = start empty.\n"
+        "console_save = %d\n"
+        // What a download does when the folder it landed in holds a .sfv: "ask"
+        // offers the check, "always" runs it without asking, "never" leaves it
+        // alone. A verification is also always available from the Commands menu.
+        "\n# After a download that landed beside a .sfv: ask | always | never\n"
+        "sfv_verify = %s\n",
+        c->console_w, c->console_h, c->console_save, c->sfv_verify);
+
+    if (c->console_save) {
+        fprintf(f,
+            "\n# Console backlog, oldest first. A command's output is escaped so that\n"
+            "# one entry stays one line: newline, tab and carriage return come out as\n"
+            "# backslash-n, backslash-t and backslash-r, and a backslash is doubled.\n");
+        int n = (int)c->console_entries.size();
+        if (n > MC_MAX_CONSOLE_ENTRIES) n = MC_MAX_CONSOLE_ENTRIES;
+        for (int i = 0; i < n; i++) {
+            const MCConsoleEntry& e = c->console_entries[i];
+            fprintf(f, "console%d_cwd = %s\n", i, cfg_escape(e.cwd).c_str());
+            fprintf(f, "console%d_cmd = %s\n", i, cfg_escape(e.cmd).c_str());
+            fprintf(f, "console%d_out = %s\n", i, cfg_escape(e.out).c_str());
+            fprintf(f, "console%d_code = %d\n", i, e.code);
+            fprintf(f, "console%d_builtin = %d\n", i, e.builtin ? 1 : 0);
+        }
+    }
 
     fclose(f);
 }

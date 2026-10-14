@@ -201,6 +201,13 @@ int main(int argc, char** argv)
                 SDL_Keycode k = event.key.key;
                 SDL_Keymod m = event.key.mod;
 
+                // A three-answer dialog: every key goes to the pane handler, where
+                // R, S and Esc are the answers and everything else is swallowed.
+                if (panes->choice != CHOICE_NONE) {
+                    app_panes_handle_key(panes, k, m);
+                    continue;
+                }
+
                 // Modal confirm dialog: every key goes to the pane handler (Y/N/Esc).
                 if (panes->confirm != CONF_NONE) {
                     app_panes_handle_key(panes, k, m);
@@ -241,8 +248,27 @@ int main(int argc, char** argv)
                     continue;
                 }
 
+                // The console owns the keyboard while its field holds it: Esc hides
+                // it, Enter runs the line, Up/Down recall the commands, and every
+                // other key belongs to the text field - including the Ctrl
+                // combinations the panes would otherwise take for marking and the
+                // file clipboard. That is what makes Ctrl+C, Ctrl+V, Ctrl+A and
+                // Ctrl+Z copy, paste, select and undo *inside* the console's own
+                // line, which the command line could never do.
+                // Once a click hands the keyboard back to the panes the window is
+                // only a transcript, and the normal routing applies again.
+                if (panes->console_open && panes->console_field_active) {
+                    if (k == SDLK_ESCAPE || k == SDLK_RETURN || k == SDLK_KP_ENTER ||
+                        ((k == SDLK_UP || k == SDLK_DOWN) &&
+                         !(m & (SDL_KMOD_CTRL | SDL_KMOD_ALT))))
+                        app_panes_handle_key(panes, k, m);
+                    else
+                        ImGui_ImplSDL3_ProcessEvent(&event);
+                    continue;
+                }
+
                 // Navigation / function / shortcut keys are the app's;
-                // printable keys fall through to the command line InputText.
+                // printable keys type into whatever field ImGui has the caret in.
                 if (app_key_is_special(k, m, panes)) {
                     app_panes_handle_key(panes, k, m);
                     continue;
@@ -259,7 +285,7 @@ int main(int argc, char** argv)
 
         // Deferred actions from menus/dialog buttons: run outside the ImGui
         // frame so copy/move can pump their own progress UI.
-        if (panes->pending_op || panes->pending_confirm_yes)
+        if (panes->pending_op || panes->pending_confirm_answer != CONF_ANS_NONE)
             app_panes_run_pending(panes);
 
         // A font the Options dialog picked is rebuilt here too: ImGui does not

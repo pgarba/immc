@@ -2,7 +2,7 @@
 
 [![build and test]][ci]
 
-A dual-pane file manager for the keyboard. Two file panes, a command line, and the
+A dual-pane file manager for the keyboard. Two file panes, a console window, and the
 file operations under the F-keys, in the shape Total Commander and Midnight
 Commander trained people on: `F5` copies, `F6` moves, `F7` makes a folder, `F3`
 previews, `Tab` switches panes, `Space` marks, `Insert` selects.
@@ -125,6 +125,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | `Alt+F3` | open with the desktop's default program |
 | `F4` | edit in the terminal editor |
 | `F5` `F6` | copy, move — a dialog first, and `Tab` walks it |
+| `Y` `N` `R` | when a target already exists: overwrite it, leave it alone, or write beside it (`report.pdf` → `report (2).pdf`). `Esc` cancels the operation instead |
 | `F7` | new folder |
 | `Shift+F4` | new text file, then edit it |
 | `F2` | rename |
@@ -135,7 +136,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | the app's own file clipboard |
 | `Ctrl+L` | total size of the marked entries |
 | `Alt+Shift+Enter` | fill in the size of every directory |
-| `Alt+Enter` | properties |
+| `Alt+Enter` | properties: size and counts, and the mode, owner and group — editable on a local file, mode only on a site |
 
 Each pane ends with a status row: what the files on screen add up to, how many
 files there are, and how many directories. With marks it becomes
@@ -147,14 +148,35 @@ the rows you can see, and in branch view they describe the subtree branch view
 listed. Inside an archive the sizes are the members' sizes as the archive lists
 them, and the row says `packed`.
 
-The command line at the bottom holds the keyboard whenever nothing else has it,
-which is why “the box is focused” cannot decide whether `Space` marks a file or
-types a space. Clicking into the box decides it. While you hold it there, `Space`
-`Backspace` `Del` `/` `+` `-` `*` are typing, so a space as the first character
-arrives as a space instead of marking the cursor’s file and the `Enter` after it
-acts on nothing. `Enter` itself is unchanged: an empty command line still opens
-the file under the cursor. Hand the keyboard to anything else — `Ctrl+S` gives it
-to the filter — and the shortcuts come back.
+There is no command line. `Ctrl+Enter` opens a console window over the panes: type
+a command, `Enter` runs it in the directory the focused pane is showing, and its
+output lands in the window's transcript. `Esc` hides the window and keeps the
+transcript, so the console you opened in one directory is the same console in the
+next one, and the same one after a restart. While the console holds the keyboard its
+field owns it: `Space` types a space, `Ctrl+C` and `Ctrl+V` copy and paste inside
+the line, and nothing marks a file behind your back. With the window closed the
+marking keys belong to the panes unconditionally — the argument about whether an
+empty box meant typing or marking is gone, because there is no box that is always
+focused. `Enter` on a file is unchanged, and `Enter` on an executable runs it and
+puts its output in the console.
+
+### Console
+
+| | |
+| --- | --- |
+| `Ctrl+Enter` | open the console; run the line when it is already open |
+| `Enter` | run it |
+| `Esc` | cancel a running command, then hide the window — the backlog stays |
+| `Up` `Down` | recall commands |
+| `Alt+F8` | the history list, inside the window |
+| `Alt+PgUp` `Alt+PgDn` | walk the history |
+| `Ctrl+P` | put the pane's path in the console |
+| `Alt+C` | open it with `cd ` already typed |
+| `cd` `pwd` `clear` `history` `exit` | builtins; `cd` moves the focused pane |
+
+Anything else goes to `/bin/sh`, so pipes and redirection work. A command runs on a
+worker thread: a `find` that takes a minute shows its results during the minute and
+the panes keep answering underneath it.
 
 ### Tabs
 
@@ -186,6 +208,8 @@ to the filter — and the shortcuts come back.
 | --- | --- |
 | `Ctrl+F` | the saved-site manager |
 | `Ctrl+N` | quick connect to one host |
+| `Ctrl+D` | leave the site this pane is on, and close its connection (`Commands → Disconnect from site`) |
+| `Commands → Verify SFV` | check the focused pane's directory against the `.sfv` in it |
 | `cd ftp://…` | go there in the active pane |
 | `Alt+F5` | pack the marked entries into an archive |
 | `Alt+F6` | extract an archive into the other pane |
@@ -196,10 +220,29 @@ to the filter — and the shortcuts come back.
 | | |
 | --- | --- |
 | `Shift+F7` `Alt+F7` | search |
-| `Alt+F8` | command history |
-| `Alt+C` | put `cd ` on the command line |
 | `Shift+Esc` | minimize |
 | `Alt+F4` | quit |
+
+## Transfers, resume and checksums
+
+A copy or move that crosses a network runs on its own thread and shows as a row in
+the strip under the panes. Aborting one leaves the row there with a **Resume** button:
+the answer is Resume / Start over / Skip (`R / S / Esc`), and a resumed download picks
+up from the `<name>.part` beside the target rather than from the beginning.
+
+When a target already exists the question has three answers — **Overwrite**, **Skip**,
+**Rename** (`Y / N / R`, `Esc` cancels the whole operation). Rename writes beside the
+existing file: `name.ext` becomes `name (2).ext`, then `(3)`.
+
+A download that lands in a folder holding a `.sfv` offers to verify against it:
+**Verify / Not now / Always** (`V / N / A`). Verification runs on a thread, counts up
+in the strip, and reports mismatched and missing files in a window. `Commands →
+Verify SFV` runs the same check on the focused pane's directory with no fetching
+involved, and the report's **Re-fetch the bad ones** rebuilds the failed names out of
+the transfer that fetched them. The behaviour after a download is a line in the config
+file:
+
+    sfv_verify = ask      # ask | always | never
 
 ## Where things are
 
@@ -208,10 +251,12 @@ to the filter — and the shortcuts come back.
                          quick view, background transfers, the remote pane mode
     src/filesystem.*     local filesystem operations, trash, tree counting
     src/archive.*        browse, extract, pack — driven by the installed zip/tar/7z
+    src/proc.*           the child-process runner the archives and the console share
     src/remote.*         FTP/FTPS/SFTP through libcurl: sites file, parsers, transport
+    src/sfv.*            CRC-32 and the .sfv parser, with no dependency on zlib
     src/config.*         ~/.config/mc-clone/config, and the 0600 sites file beside it
     src/theme.*          eight themes and the accent colours the panes draw with
-    tests/               the four suites and the FTP fixture
+    tests/               the five suites and the FTP fixture
     scripts/get-deps.sh  the pinned Dear ImGui checkout
     FEATURES_PLAN.md     the project's own record: what landed, what was refused, and why
 
@@ -224,6 +269,32 @@ to the filter — and the shortcuts come back.
 - **Saved site passwords are cleartext**, in `~/.config/mc-clone/ftp_sites`, created
   `0600`. The main config is written world-readable, which is why it stays
   password-free.
+- **The console backlog is written to that world-readable config too**, because the
+  transcript is the point of the feature. A command that carried a password is in
+  the file; `clear` before quitting, or `console_save = 0`, keeps it out.
+- **The console has no terminal to give a command.** stdout and stderr come back,
+  stdin is `/dev/null`, so a tool that wants a password or a TTY (`vim`, `ssh`,
+  `less`) fails immediately instead of waiting for one. `F4` is the answer for
+  editors: it forks a terminal emulator so the editor gets a real TTY.
+- **Resume is only as good as the server.** A download keeps its bytes in
+  `<name>.part` and continues from there when the server honours `REST`; an upload
+  continues with `APPE`. If the finished length does not match the file on the
+  server, the partial is thrown away and the transfer is reported as needing to start
+  again rather than accepted. Partial files survive quitting the app; the transfer
+  rows do not.
+- **A checksum that matches is not a proof.** `.sfv` carries CRC-32, which catches a
+  truncated or damaged file. It is not a signature: a server that lies about where a
+  resumed transfer starts can produce a file of the right length with the wrong bytes,
+  and a length check cannot see that. `.md5` files beside a download are a different
+  format with a different algorithm and are not verified here.
+- **Ownership changes need root**, unless you are giving a file back to yourself. The
+  Properties window reports `not permitted (ownership changes need root)` rather than
+  reporting a change that did not happen. It uses `lchown`, so the link is chowned and
+  not whatever it points at; on Linux a symlink has no mode of its own to set, and the
+  window says so instead of silently chmod-ing the target.
+- **FTP has no owner or group.** `SITE CHMOD` is a site extension rather than part of
+  the protocol, so a server can refuse it; the Properties window says both instead of
+  hiding the fields.
 - **A site's directory listing is fetched in the frame that asks for it**, so a slow
   server freezes the UI until it answers. Transfers and quick-view previews run on
   worker threads; listings do not yet.

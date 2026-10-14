@@ -69,7 +69,7 @@ def mlst_facts(st):
 
 
 class Session:
-    def __init__(self, ctl, root, user, password, tls_ctx):
+    def __init__(self, ctl, root, user, password, tls_ctx, no_rest=False, no_size=False):
         self.ctl = ctl
         self.buf = b""
         self.root = os.path.realpath(root)
@@ -82,6 +82,15 @@ class Session:
         self.user_seen = None
         self.rename_from = None
         self.pasv_srv = None
+        # REST arrives before the transfer command that consumes it, so the offset
+        # is state between two commands. --no-rest is how the test for "the server
+        # said no to resuming" is run.
+        self.no_rest = no_rest
+        # A server that cannot report a size is the one curl will not resume against
+        # at all: it has no number to check a resumed transfer against. --no-size is
+        # that server.
+        self.no_size = no_size
+        self.resume = 0
 
     # --- control channel ---------------------------------------------------
 
@@ -233,8 +242,12 @@ class Session:
         if cmd == "SYST":
             self.reply(215, "UNIX Type: L8")
         elif cmd == "FEAT":
-            self.ctl.sendall(b"211-Features\r\n MLSD\r\n MLST type*;size*;modify*;unix.mode;\r\n"
-                             b" UTF8 MDTM SITE CHMOD\r\n211 End\r\n")
+            # A server that disables REST does not advertise it either.
+            feats = " APPE\r\n MLSD\r\n MLST type*;size*;modify*;unix.mode;\r\n"
+            if not self.no_rest:
+                feats += " REST\r\n"
+            feats += " UTF8 MDTM SIZE SITE CHMOD\r\n"
+            self.ctl.sendall(("211-Features\r\n" + feats + "211 End\r\n").encode())
         elif cmd == "TYPE":
             self.reply(200, f"Type set to {arg or 'I'}")
         elif cmd == "NOOP":
@@ -254,16 +267,37 @@ class Session:
             self.open_data()
         elif cmd in ("PORT", "EPRT", "EPSV"):
             self.reply(500, "This test server speaks passive mode only")
-        elif cmd in ("LIST", "NLST", "MLSD", "RETR", "STOR"):
+        elif cmd in ("LIST", "NLST", "MLSD", "RETR", "STOR", "APPE"):
             self.transfer(cmd, arg)
         elif cmd == "MLST":
             self.mlst(arg)
+        elif cmd == "REST":
+            # curl asks for SIZE first and then sends REST with the offset it worked
+            # out, before the RETR or STOR that consumes it.
+            if self.no_rest:
+                self.reply(502, "REST is not implemented here")
+                return True
+            try:
+                off = int(arg)
+            except (TypeError, ValueError):
+                self.reply(501, "REST needs a byte offset")
+                return True
+            if off < 0:
+                self.reply(501, "REST needs a byte offset")
+                return True
+            self.resume = off
+            self.reply(350, f"Ready to resume at {off}")
         elif cmd == "SIZE":
-            path = self.real(arg)
-            if path and os.path.isfile(path):
-                self.reply(213, str(os.path.getsize(path)))
+            # curl asks the size before it will resume, so a server that does not
+            # have one stops the resume at the door.
+            if self.no_size:
+                self.reply(550, "SIZE is not available here")
             else:
-                self.reply(550, "No such file")
+                path = self.real(arg)
+                if path and os.path.isfile(path):
+                    self.reply(213, str(os.path.getsize(path)))
+                else:
+                    self.reply(550, "No such file")
         elif cmd == "MDTM":
             path = self.real(arg)
             if path and os.path.exists(path):
@@ -370,6 +404,10 @@ class Session:
             return
         self.reply(150, f"Opening data connection for {arg or ''}")
         ok = True
+        # The offset a REST left behind, consumed here and never carried into the
+        # next transfer.
+        resume = self.resume
+        self.resume = 0
         try:
             if cmd in ("LIST", "MLSD", "NLST"):
                 body = self.listing(path, ls_line if cmd == "LIST" else mlsd_line)
@@ -378,18 +416,38 @@ class Session:
                 data.sendall(body.encode())
             elif cmd == "RETR":
                 with open(path, "rb") as f:
+                    if resume:
+                        # The server sends everything after the point it was told to
+                        # skip; the client is the one that already has the rest.
+                        f.seek(resume)
                     while True:
                         chunk = f.read(65536)
                         if not chunk:
                             break
                         data.sendall(chunk)
-            elif cmd == "STOR":
-                with open(path, "wb") as f:
-                    while True:
-                        chunk = data.recv(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
+            elif cmd in ("STOR", "APPE"):
+                # curl resumes an FTP upload with APPE rather than REST and STOR,
+                # which is the plain reading of "append the rest of the file".
+                append = cmd == "APPE"
+                if resume and os.path.isfile(path) and not append:
+                    # A resumed store continues the file that is already there:
+                    # write from the offset, and cut whatever the last attempt
+                    # left past it.
+                    with open(path, "rb+") as f:
+                        f.seek(resume)
+                        f.truncate()
+                        while True:
+                            chunk = data.recv(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                else:
+                    with open(path, "ab" if append else "wb") as f:
+                        while True:
+                            chunk = data.recv(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
         except OSError:
             ok = False
         finally:
@@ -423,6 +481,10 @@ def main():
     ap.add_argument("--password", default="hunter2")
     ap.add_argument("--cert", help="serve AUTH TLS with this certificate")
     ap.add_argument("--key", help="private key for --cert")
+    ap.add_argument("--no-rest", action="store_true",
+                    help="answer REST with 502, the way a server that disables it does")
+    ap.add_argument("--no-size", action="store_true",
+                    help="answer SIZE with 550, the way a server that cannot report a size does")
     args = ap.parse_args()
 
     root = os.path.realpath(args.root)
@@ -444,7 +506,8 @@ def main():
 
     def session(ctl):
         try:
-            Session(ctl, root, args.user, args.password, tls_ctx).serve()
+            Session(ctl, root, args.user, args.password, tls_ctx, args.no_rest,
+                    args.no_size).serve()
         except (OSError, ssl.SSLError):
             pass
         finally:

@@ -75,7 +75,7 @@ else()
 endif()
 
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 
@@ -83,7 +83,7 @@ target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
 # checked without a display.
 enable_testing()
-add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp ${MC_REMOTE_SOURCES})
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 add_test(NAME panes COMMAND test-panes)
@@ -95,7 +95,7 @@ set_tests_properties(version PROPERTIES PASS_REGULAR_EXPRESSION "immc [0-9]+\\.[
 # Archive backend. It shells out to zip/unzip, tar and 7z, so the test builds
 # real archives with those same tools and checks the listing parsers, the
 # member round-trip and the progress accounting. No display needed.
-add_executable(test-archive tests/test_archive.cpp src/archive.cpp)
+add_executable(test-archive tests/test_archive.cpp src/archive.cpp src/proc.cpp)
 target_include_directories(test-archive PRIVATE src)
 add_test(NAME archive COMMAND test-archive)
 
@@ -112,3 +112,11 @@ target_link_libraries(test-remote PRIVATE ${MC_REMOTE_LIBS})
 target_compile_definitions(test-remote PRIVATE
     MC_FTP_SERVER="${CMAKE_CURRENT_SOURCE_DIR}/tests/ftp_server.py")
 add_test(NAME remote COMMAND test-remote)
+
+# .sfv verification. The CRC is checked against the published check value and the
+# parser against the shapes real .sfv writers produce - names with spaces, CRLF,
+# comments, backslash separators, checksums written first - so the format is read
+# the way it arrives rather than the way it is documented. No display, no network.
+add_executable(test-sfv tests/test_sfv.cpp src/sfv.cpp)
+target_include_directories(test-sfv PRIVATE src)
+add_test(NAME sfv COMMAND test-sfv)

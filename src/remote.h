@@ -112,6 +112,10 @@ void net_what(char* out, size_t n);
 // this reaches the calling thread's handles only, and deliberately not the ones
 // a background transfer opened, which its own thread releases when it ends.
 void net_forget(const NetSite* site);   // null = every site
+// Drop the cached connection for a site root URL. A pane knows the root it is
+// browsing even when the saved entry behind it has been edited or deleted, and
+// "leave this site" has to close the right connection without finding the login.
+void net_forget_root(const char* root);
 // Release the connections and then the library. Every transfer thread has to be
 // joined before this runs.
 void net_shutdown();
@@ -136,10 +140,38 @@ bool net_stat(const NetSite& site, const std::string& rpath,
 // Download to and upload from a local file. `cb` is the same callback the copy
 // operations use, so the progress dialog's Abort stops a transfer the way
 // killing a child process stops unzip: it returns false to abort.
+//
+// A download writes `<local>.part` and renames it to `<local>` when the transfer
+// is good, so the real name is only ever the complete file and an aborted transfer
+// leaves its partial behind where a resume can find it.
+//   resume_from  bytes already in the sidecar. 0 starts from nothing and clears a
+//                leftover; > 0 continues it, which is a REST before the RETR.
+//   got          out: bytes this call wrote, valid whatever the outcome.
+//
+// A resume is not length-checked on the download side, and the reason is in the
+// protocol: curl asks the size, subtracts the offset it sent in REST, and stops at
+// that many bytes, so an honest resume lands on the remote size by construction.
+// A server that refuses REST, or that is asked to resume past its end, answers with
+// a reason and curl returns false. What no length check can catch is a server that
+// accepts REST and ignores it - the file comes out the right size with the wrong
+// bytes in it, which is a checksum question and not a size one.
 bool net_download(const NetSite& site, const std::string& rpath, const char* local,
-                  fs_progress_fn cb, void* user, std::string* err);
+                  fs_progress_fn cb, void* user, std::string* err,
+                  long long resume_from = 0, long long* got = nullptr);
+// An upload resume is an APPE: the offset is where in the local source reading
+// starts, and the server continues the file it already holds. `net_upload` checks
+// afterwards that the server now holds exactly the local file's size, because an
+// append that did not land is otherwise indistinguishable from one that did.
 bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
-                fs_progress_fn cb, void* user, std::string* err);
+                fs_progress_fn cb, void* user, std::string* err,
+                long long resume_from = 0);
+
+// The sidecar a download writes before it is known good, and how much of it is
+// real. `net_part_size` is the offset a resume continues from, and 0 means there
+// is nothing to continue - which is also the answer for a transfer that never
+// started, because a download that received nothing keeps nothing.
+std::string net_part_path(const char* local);
+long long net_part_size(const char* local);
 
 // Fetch the beginning of a remote file, into memory rather than onto disk: the
 // amount a preview needs, and no more. A quick view of a 4 GB file still has to
@@ -166,14 +198,16 @@ bool net_remove_tree(const NetSite& site, const std::string& rpath,
                      fs_progress_fn cb, void* user, std::string* err);
 
 // Fetch a remote entry, file or directory, to a local path. A directory becomes
-// one mkdir and one fetch per entry: FTP has no recursive retrieve.
+// one mkdir and one fetch per entry: FTP has no recursive retrieve. `resume` picks
+// up each entry from the sidecar that entry already has, which is what a stopped
+// tree transfer continues instead of re-fetching.
 bool net_download_tree(const NetSite& site, const std::string& rpath, const char* local,
-                       fs_progress_fn cb, void* user, std::string* err);
+                       fs_progress_fn cb, void* user, std::string* err, bool resume = false);
 
 // Put a local entry, file or directory, at a remote path. A directory becomes one
 // MKD and one store per entry, which is the only way a server gets a folder.
 bool net_upload_tree(const NetSite& site, const char* local, const std::string& rpath,
-                     fs_progress_fn cb, void* user, std::string* err);
+                     fs_progress_fn cb, void* user, std::string* err, bool resume = false);
 bool net_rename(const NetSite& site, const std::string& rpath, const char* new_name,
                 std::string* err);
 // SITE CHMOD. Not every server implements it; the server's own reply is what
