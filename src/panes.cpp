@@ -3,6 +3,8 @@
 #include "archive.h"
 #include "proc.h"   // the shared child-process runner: pipe, /dev/null stdin, cancel
 #include "sfv.h"    // .sfv verification: CRC-32 and the parser
+#include "img.h"     // picture previews: what a file is, and its pixels
+#include "texture.h" // and getting those pixels onto the screen
 #include "theme.h"
 #include "config.h"
 #include "version.h"   // generated: MC_APP_NAME, MC_VERSION
@@ -4978,6 +4980,20 @@ static const size_t k_qv_cache_max = 32;
 // here would block the frame, which is the whole thing being avoided.
 static const size_t k_qv_inflight_max = 3;
 
+// How much of a picture is read. A preview is a look, not an import: past this the
+// file is refused rather than slurped, and the cap is what keeps a 200 MB scan from
+// being decoded to answer one F3.
+static const size_t k_qv_image_max_bytes = 32 * 1024 * 1024;
+// Pictures kept, oldest first. Deliberately nothing like the text cache's 32: a
+// decoded 4032x3024 photograph is 48 MB of pixels, so this is bounded by bytes as
+// well as by count.
+static const size_t k_qv_image_cache_max = 4;
+static const size_t k_qv_image_cache_bytes = 96 * 1024 * 1024;
+// The longest side a texture is made at. A 4032x3024 photo shown in a 700x525 window
+// does not need 12 million texels, and shrinking once here costs one pass instead of
+// a resample every frame - and the window is resized with the mouse.
+static const int k_qv_tex_max_px = 2048;
+
 enum QvKind { QV_LOCAL, QV_ARCHIVE, QV_REMOTE };
 
 // What has to be read, copied out of the pane before the thread starts: the pane
@@ -4990,6 +5006,10 @@ struct QvJob {
     std::string member;   // the member inside that archive, as the tool names it
     NetSite site;         // a copy of the site, password and all
     std::string rpath;    // the file on the server
+    // Whether this row may turn out to be a picture, and may therefore be read
+    // further than a screenful. Decided when the job is made, because it changes how
+    // much is read, and the thread must not have to ask the app anything.
+    bool want_image = false;
 };
 
 // The answers a preview can only give in words.
@@ -5030,6 +5050,55 @@ static void qv_cache_put(AppPanes* app, const std::string& key, const std::strin
         app->qv_cache.erase(app->qv_cache.begin());
 }
 
+// The decoded pictures, kept apart from the text because the two hold things three
+// orders of magnitude apart: 32 previews of a screenful of text is nothing, and four
+// decoded photographs is a lot. Both bounds are applied where the picture is filed,
+// not where it is drawn, and dropping one frees its texture with it - a cache that
+// only ever grew would be holding GPU memory for files this session stopped looking
+// at.
+static QvImage* qv_image_find(AppPanes* app, const std::string& key) {
+    for (std::pair<std::string, std::unique_ptr<QvImage>>& e : app->qv_images)
+        if (e.first == key) return e.second.get();
+    return nullptr;
+}
+
+static size_t qv_image_bytes(const AppPanes* app) {
+    size_t total = 0;
+    for (const std::pair<std::string, std::unique_ptr<QvImage>>& e : app->qv_images)
+        total += e.second->rgba.size();
+    return total;
+}
+
+static void qv_image_drop(AppPanes* app, size_t i) {
+    tex_free(app->qv_images[i].second->tex);
+    app->qv_images.erase(app->qv_images.begin() + (long)i);
+}
+
+static void qv_image_evict(AppPanes* app) {
+    while (app->qv_images.size() > k_qv_image_cache_max) qv_image_drop(app, 0);
+    // The byte bound may have to give way to the newest one on its own: a single
+    // picture over the limit is kept rather than dropped the moment it arrives,
+    // because the alternative is a preview that never appears at all.
+    while (app->qv_images.size() > 1 && qv_image_bytes(app) > k_qv_image_cache_bytes)
+        qv_image_drop(app, 0);
+}
+
+static void qv_image_put(AppPanes* app, const std::string& key, QvFetch* f) {
+    for (size_t i = 0; i < app->qv_images.size(); i++)
+        if (app->qv_images[i].first == key) { qv_image_drop(app, i); break; }
+    std::unique_ptr<QvImage> img = std::make_unique<QvImage>();
+    img->w          = f->img_w;
+    img->h          = f->img_h;
+    img->src_w      = f->img_src_w;
+    img->src_h      = f->img_src_h;
+    img->fmt        = f->img_fmt;
+    img->orientation = f->img_orient;
+    img->file_bytes = f->img_bytes;
+    img->rgba       = std::move(f->img_rgba);
+    app->qv_images.emplace_back(key, std::move(img));
+    qv_image_evict(app);
+}
+
 // The beginning of a file that is already on this disk.
 static void qv_read_file(const std::string& path, std::string* body, std::string* err) {
     FILE* f = fopen(path.c_str(), "rb");
@@ -5038,6 +5107,40 @@ static void qv_read_file(const std::string& path, std::string* body, std::string
     size_t n;
     while (body->size() < k_qv_max_bytes && (n = fread(buf, 1, sizeof buf, f)) > 0)
         body->append(buf, n);
+    fclose(f);
+}
+
+// A name that says "picture" often enough to be worth reading whole on a thread
+// instead of a screenful of it on the UI thread. This is only a routing hint: what a
+// file is comes from its bytes, so a PNG named `data` is previewed too - it takes the
+// other path, where the head read finds the magic and the rest goes to a worker.
+static bool name_looks_like_image(const char* name) {
+    static const char* ext[] = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".pbm",
+                                ".pgm", ".ppm", ".pnm", ".tga", ".hdr", ".webp",
+                                ".tif", ".tiff", ".svg", ".ico", nullptr};
+    const char* dot = name ? strrchr(name, '.') : nullptr;
+    if (!dot) return false;
+    for (int i = 0; ext[i]; i++)
+        if (!strcasecmp(dot, ext[i])) return true;
+    return false;
+}
+
+// The whole of a file that turned out to be a picture, from the same open handle
+// that found the magic: one read, decided by what the bytes are rather than by what
+// the file is called.
+static void qv_read_body(const std::string& path, std::string* body, ImgFormat* fmt,
+                         std::string* err) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { *err = "cannot read " + path; return; }
+    char buf[8192];
+    size_t n;
+    while (body->size() < k_qv_max_bytes && (n = fread(buf, 1, sizeof buf, f)) > 0)
+        body->append(buf, n);
+    *fmt = img_sniff(*body);
+    if (img_decodable(*fmt)) {
+        while (body->size() < k_qv_image_max_bytes && (n = fread(buf, 1, sizeof buf, f)) > 0)
+            body->append(buf, n);
+    }
     fclose(f);
 }
 
@@ -5051,6 +5154,7 @@ static bool qv_still_wanted_cb(long long, long long, int, int, void* user) {
 // sees done can read both. Nothing here touches the app, the panes, or ImGui.
 static void qv_run_fetch(QvFetch* f, QvJob job) {
     std::string body, err, file = job.path;
+    ImgFormat fmt = IMG_NONE;
     char tmpdir[4096];
     tmpdir[0] = '\0';
 
@@ -5064,13 +5168,52 @@ static void qv_run_fetch(QvFetch* f, QvJob job) {
                                   tmp, sizeof tmp, tmpdir, sizeof tmpdir, &err))
                 file = tmp;
         }
-        if (err.empty()) qv_read_file(file, &body, &err);
+        if (err.empty()) {
+            if (job.want_image) qv_read_body(file, &body, &fmt, &err);
+            else qv_read_file(file, &body, &err);
+        }
     }
     if (tmpdir[0]) {
         char cmd[4200];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
         int rc = system(cmd);
         (void)rc;
+    }
+
+    // A picture is settled here, on the worker: it is the only place the whole file
+    // is in hand, and the only place a 12-megapixel decode is allowed to happen.
+    // Anything the decoder refuses comes back as a sentence about why, which is what
+    // a broken or oversized file deserves instead of a wall of hex.
+    if (err.empty() && job.want_image) {
+        ImgFormat kind = img_sniff(body);
+        if (kind != IMG_NONE) {
+            std::string why;
+            int w = 0, h = 0, orient = 0;
+            std::vector<unsigned char> rgba;
+            // The canvas the file declares, asked for before the decode turns it:
+            // a photograph stored sideways has two honest sizes and a caption that
+            // shows only one of them is half the story.
+            int src_w = 0, src_h = 0;
+            std::string dwhy;
+            if (img_dims(body, &src_w, &src_h, &dwhy)) { /* the header's own numbers */ }
+            if (img_decode(body, kind, &w, &h, &rgba, &orient, &why)) {
+                int tw = w, th = h;
+                img_fit(&tw, &th, &rgba, k_qv_tex_max_px);
+                f->is_image   = true;
+                f->img_fmt    = kind;
+                f->img_src_w  = src_w ? src_w : w;
+                f->img_src_h  = src_h ? src_h : h;
+                f->img_w      = tw;
+                f->img_h      = th;
+                f->img_orient = orient;
+                f->img_bytes  = (long long)body.size();
+                f->img_rgba   = std::move(rgba);
+            } else {
+                f->text = "(" + why + ")";
+            }
+            f->done = true;
+            return;
+        }
     }
 
     if (err.empty() && !qv_to_text(&body)) body = k_qv_binary;
@@ -5109,7 +5252,10 @@ static void qv_reap(AppPanes* app) {
     for (size_t i = 0; i < app->qv_fetches.size();) {
         QvFetch* f = app->qv_fetches[i].get();
         if (!f->done.load()) { i++; continue; }
-        if (f->err.empty()) qv_cache_put(app, f->key, f->text);
+        if (f->err.empty()) {
+            if (f->is_image) qv_image_put(app, f->key, f);
+            else qv_cache_put(app, f->key, f->text);
+        }
         f->worker.join();
         app->qv_fetches.erase(app->qv_fetches.begin() + i);
     }
@@ -5145,6 +5291,16 @@ static bool qv_job_for(AppPanes* app, const Pane& pane, int idx, QvJob* job) {
         job->kind = QV_LOCAL;
         job->path = job->key;
     }
+    // Whether this row may turn out to be a picture, and may therefore be read
+    // further than a screenful. A site is left out on purpose: a preview is not a
+    // reason to pull a whole photograph down just to find out what a row is, and the
+    // byte cap that keeps a preview cheap would have to go with it. A member of an
+    // archive is read whole when it is a picture because it is already local by the
+    // time it is looked at; a name on this disk only routes the read onto a thread,
+    // and a picture with no extension in its name is still found, one frame later.
+    job->want_image = app->qv_images_on && job->kind != QV_REMOTE &&
+                      (job->kind == QV_ARCHIVE ||
+                       name_looks_like_image(pane.entries[idx]->name));
     return true;
 }
 
@@ -5156,11 +5312,27 @@ static std::string qv_preview(AppPanes* app, const Pane& pane, int idx) {
     QvJob job;
     if (!qv_job_for(app, pane, idx, &job)) return "";
     if (std::string* hit = qv_cache_find(app, job.key)) return *hit;
+    // A picture is drawn rather than printed, so there is no text to hand back for
+    // one. The window that can draw it asks through qv_draw_image().
+    if (app->qv_images_on && qv_image_find(app, job.key)) return "";
 
-    if (job.kind == QV_LOCAL) {
+    if (job.kind == QV_LOCAL && !job.want_image) {
         std::string body, err;
         qv_read_file(job.path, &body, &err);
         if (!err.empty()) return "(" + err + ")";
+        if (app->qv_images_on && img_sniff(body) != IMG_NONE) {
+            // A picture whose name did not say picture, so it was read like any
+            // other file and only the head of it is in hand. Reading the rest of a
+            // 3 MB file here would stall the frame, which is the one thing all of
+            // this is arranged to avoid, so the rest goes to a worker and this frame
+            // says what it is doing.
+            QvJob full = job;
+            full.want_image = true;
+            for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
+                if (f->key == full.key) { f->wanted = true; return k_qv_reading; }
+            if (app->qv_fetches.size() < k_qv_inflight_max) qv_start(app, full);
+            return k_qv_reading;
+        }
         if (!qv_to_text(&body)) body = k_qv_binary;
         qv_cache_put(app, job.key, body);
         return body;
@@ -5180,6 +5352,54 @@ static std::string qv_preview(AppPanes* app, const Pane& pane, int idx) {
     return k_qv_reading;
 }
 
+// A decoded picture, drawn. True when this row is a picture and it was put on the
+// screen, false when there is nothing drawn yet - which is the signal for the caller
+// to fall back on the text path, including the hex dump a binary file has always
+// gotten. One function for both quick views, so the F3 window and the Ctrl+Q panel
+// cannot drift apart on what a preview of a picture looks like.
+//
+// The texture is made here rather than when the pixels arrive, because asking for a
+// preview and then arrowing past is the common case and should not have cost a GL
+// texture. It is kept afterwards, because the window is resized with the mouse and a
+// picture has to refit every frame.
+static bool qv_draw_image(AppPanes* app, const Pane& pane, int idx) {
+    if (!app->qv_images_on) return false;
+    if (idx < 0 || idx >= pane.entry_count || !pane.entries) return false;
+    if (is_directory(pane.entries[idx]->name, pane.entries[idx]->mode)) return false;
+    QvImage* img = qv_image_find(app, pane_row_path(pane, idx));
+    if (!img) return false;   // qv_preview() is the half that starts the read
+
+    if (!img->tex) img->tex = tex_upload(img->w, img->h, img->rgba.data());
+    if (!img->tex) {
+        // Decoded, and nowhere to put it: no GL context, or a build whose renderer
+        // never loaded the entry points. Better to say that than to draw nothing.
+        ImGui::TextUnformatted("(no picture on screen to draw this in)");
+        return true;
+    }
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    float scale = 1.0f;
+    if (img->w > 0 && img->h > 0 && avail.x > 1.0f && avail.y > 1.0f) {
+        scale = avail.x / (float)img->w;
+        if (avail.y / (float)img->h < scale) scale = avail.y / (float)img->h;
+        if (scale > 1.0f) scale = 1.0f;   // never enlarge: a thumbnail is not a preview
+    }
+    const float dw = (float)img->w * scale, dh = (float)img->h * scale;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ImageBorderSize, 0.0f);
+    ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)img->tex), ImVec2(dw, dh));
+    ImGui::PopStyleVar();
+
+    // What the file is, and what is being shown, because "4032x3024 shown at
+    // 1365x1024" is the difference between a preview and a lie about one.
+    char cap[256];
+    snprintf(cap, sizeof cap, "%dx%d %s  shown %dx%d%s",
+             img->src_w, img->src_h, img_format_name(img->fmt), img->w, img->h,
+             img->orientation >= 2 ? "  turned to match the camera" : "");
+    ImGui::TextUnformatted(cap);
+    return true;
+}
+
 // Ctrl+Q: the inactive pane turns into a quick view of the file under the
 // cursor in the active pane (TC's quick view panel). An archive member previews
 // like any other file now; it is unpacked on a thread, one member at a time.
@@ -5194,6 +5414,11 @@ static void render_quick_view_panel(AppPanes* app, float w, float h, const char*
     FileEntry* e = src.entries[src.selected];
     if (is_directory(e->name, e->mode)) {
         ImGui::TextDisabled("(directory: %s)", e->name);
+        ImGui::EndChild();
+        return;
+    }
+    if (qv_draw_image(app, src, src.selected)) {
+        ImGui::TextDisabled("%s", e->name);
         ImGui::EndChild();
         return;
     }
@@ -5619,21 +5844,27 @@ static void render_quick_view(AppPanes* app, Pane& pane) {
     ImGui::Separator();
 
     if (!is_directory(e->name, e->mode)) {
-        std::string text = qv_preview(app, pane, pane.selected);
-        // A binary file on this disk still gets its hex dump. A member of an
-        // archive and a file on a site are not on this disk to dump, and pulling
-        // one down to find out is not what a preview is for.
-        if (text == k_qv_binary && !in_archive(pane) && !in_remote(pane)) {
-            static char hexbuf[16384];
-            long dumped = fs_hex_dump(pane_row_path(pane, pane.selected).c_str(),
-                                      hexbuf, sizeof(hexbuf), 2048);
-            if (dumped < 0) ImGui::TextUnformatted("(unreadable)");
-            else {
-                ImGui::TextUnformatted("(binary - hex dump)");
-                ImGui::TextUnformatted(hexbuf);
-            }
+        // A picture first. Only when there is no picture to show does this row go
+        // through the text path, so a photograph never gets a hex dump.
+        if (qv_draw_image(app, pane, pane.selected)) {
+            // drawn, with its caption
         } else {
-            ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
+            std::string text = qv_preview(app, pane, pane.selected);
+            // A binary file on this disk still gets its hex dump. A member of an
+            // archive and a file on a site are not on this disk to dump, and pulling
+            // one down to find out is not what a preview is for.
+            if (text == k_qv_binary && !in_archive(pane) && !in_remote(pane)) {
+                static char hexbuf[16384];
+                long dumped = fs_hex_dump(pane_row_path(pane, pane.selected).c_str(),
+                                          hexbuf, sizeof(hexbuf), 2048);
+                if (dumped < 0) ImGui::TextUnformatted("(unreadable)");
+                else {
+                    ImGui::TextUnformatted("(binary - hex dump)");
+                    ImGui::TextUnformatted(hexbuf);
+                }
+            } else {
+                ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
+            }
         }
     }
     ImGui::End();
@@ -6072,6 +6303,7 @@ static void render_about(AppPanes* app) {
         "Ctrl+A all         Ctrl+I other pane  Shift+arrows range mark\n"
         "Ctrl+F3/F4/F5/F6/F7 sort name / ext / date / size / unsorted\n"
         "Shift+F3 view only the entry under the cursor\n"
+        "F3 draws a picture as a picture; one this build cannot decode says which kind it is\n"
         "Tab switch pane    Enter open/run   Backspace or Ctrl+PgUp parent\n"
         "Ctrl+PgDn open entry under cursor  Alt+Left/Right dir history\n"
         "Ctrl+T new tab     Ctrl+W close     Ctrl+Shift+W close all tabs\n"
@@ -7699,6 +7931,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     // window that cannot be grabbed.
     cfg->qv_w = (int)app->qv_w;
     cfg->qv_h = (int)app->qv_h;
+    cfg->qv_images = app->qv_images_on ? 1 : 0;
     cfg->console_w = (int)app->console_w;
     cfg->console_h = (int)app->console_h;
     // The console backlog, oldest first, and only its tail: a session that ran a
@@ -7786,6 +8019,10 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
         app->qv_w = (float)cfg->qv_w;
         app->qv_h = (float)cfg->qv_h;
     }
+    // Pictures in quick view are on unless the config says otherwise. Read as a
+    // switch, not as a preference to guess at: a config that never carried the line
+    // leaves the behaviour the app was built with, which is the new one.
+    app->qv_images_on = cfg->qv_images ? 1 : 0;
     if (cfg->console_w > 0 && cfg->console_h > 0) {
         app->console_w = (float)cfg->console_w;
         app->console_h = (float)cfg->console_h;
@@ -7877,6 +8114,12 @@ void app_panes_free(AppPanes* app) {
         if (held->worker.joinable()) held->worker.join();
     }
     app->sfv_jobs.clear();
+    // Decoded previews hold GL textures. Freeing them while the context is still up
+    // is the polite half; if the context is already gone the textures went with it
+    // and tex_free() knows not to call into a dead one.
+    for (std::pair<std::string, std::unique_ptr<QvImage>>& held : app->qv_images)
+        tex_free(held.second->tex);
+    app->qv_images.clear();
     // A console command that was still running when the app closed: ask the shell
     // to stop and wait for the worker, because a std::thread that is still joinable
     // when AppPanes is destroyed ends the process.

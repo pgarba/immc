@@ -38,6 +38,7 @@ void mc_config_default(MCConfig* c) {
     c->console_w = 760; c->console_h = 420;
     c->console_save = 1;
     snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
+    c->qv_images = 1;
     c->console_entries.clear();
     c->font[0] = '\0';
     c->font_size = 0.0f;
@@ -126,6 +127,7 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "console_h"))     c->console_h = atoi(val);
         else if (!strcmp(key, "console_save"))  c->console_save = atoi(val);
         else if (!strcmp(key, "sfv_verify"))    snprintf(c->sfv_verify, sizeof(c->sfv_verify), "%s", val);
+        else if (!strcmp(key, "qv_images"))     c->qv_images = atoi(val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
         else if (!strcmp(key, "font_hinting")) snprintf(c->hinting, sizeof(c->hinting), "%s", val);
@@ -184,6 +186,7 @@ void mc_config_load(MCConfig* c) {
     if (c->console_w < 240) c->console_w = 760;
     if (c->console_h < 120) c->console_h = 420;
     c->console_save = c->console_save ? 1 : 0;
+    c->qv_images = c->qv_images ? 1 : 0;
     // Only the three words mean anything. Anything else, including a typo, falls
     // back to asking.
     if (strcmp(c->sfv_verify, "always") && strcmp(c->sfv_verify, "never"))
@@ -284,8 +287,9 @@ void mc_config_save(const MCConfig* c) {
         // offers the check, "always" runs it without asking, "never" leaves it
         // alone. A verification is also always available from the Commands menu.
         "\n# After a download that landed beside a .sfv: ask | always | never\n"
-        "sfv_verify = %s\n",
-        c->console_w, c->console_h, c->console_save, c->sfv_verify);
+        "sfv_verify = %s\n"
+        "qv_images = %d\n",
+        c->console_w, c->console_h, c->console_save, c->sfv_verify, c->qv_images);
 
     if (c->console_save) {
         fprintf(f,

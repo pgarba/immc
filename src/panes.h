@@ -10,6 +10,7 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "filesystem.h"
+#include "img.h"      // ImgFormat, for what a quick view preview turned out to be
 #include "remote.h"   // NetSite, for the site list AppPanes owns
 
 static const int MAX_TABS = 8;
@@ -272,7 +273,31 @@ struct QvFetch {
     std::string key;                   // the path this is a preview of
     std::string text;                  // the worker's answer, written before done
     std::string err;
+    // A picture instead of text. Read after `done`, like `text`, so the same rule
+    // covers both: the worker writes them, then publishes done, and only a frame
+    // that saw done reads them.
+    bool                is_image = false;
+    int                 img_w = 0, img_h = 0;      // as decoded
+    int                 img_src_w = 0, img_src_h = 0;   // as the file declares them
+    ImgFormat           img_fmt = IMG_NONE;
+    int                 img_orient = 0;            // the EXIF tag that was applied
+    long long           img_bytes = 0;             // the file's own size
+    std::vector<unsigned char> img_rgba;
     std::thread worker;
+};
+
+// A picture a quick view can draw. The pixels are kept because the window is
+// resized with the mouse and a picture has to refit every frame, and the texture is
+// made lazily on the first frame that actually draws it: a preview that is asked for
+// and then arrowed past should not have cost a GL texture.
+struct QvImage {
+    int w = 0, h = 0;                       // the pixels held here
+    int src_w = 0, src_h = 0;               // what the file declared
+    ImgFormat fmt = IMG_NONE;
+    int orientation = 0;                    // the EXIF tag that was applied
+    long long file_bytes = 0;
+    std::vector<unsigned char> rgba;
+    unsigned long long tex = 0;             // 0 until it is first drawn
 };
 
 // One line of the console's backlog: what was typed, the directory it ran in,
@@ -552,6 +577,14 @@ public:
     // are the previews that are not on this disk and are still on their way.
     std::vector<std::pair<std::string, std::string>> qv_cache;
     std::vector<std::unique_ptr<QvFetch>> qv_fetches;
+    // Pictures the quick view has decoded, oldest first, keyed by the same path the
+    // text cache uses. Kept apart from `qv_cache` because the two hold things three
+    // orders of magnitude apart in size, and one cap cannot serve both.
+    std::vector<std::pair<std::string, std::unique_ptr<QvImage>>> qv_images;
+    // 1 (default): a picture row is drawn as a picture. 0: it gets the hex dump it
+    // always got. A line in the config file rather than a dialog setting, like
+    // console_save.
+    int qv_images_on = 1;
     // .sfv verification runs, oldest first, drawn as a row in the same strip while
     // they hash and as a report window once they finish.
     std::vector<std::unique_ptr<SfvJob>> sfv_jobs;

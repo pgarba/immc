@@ -51,6 +51,22 @@ if (TARGET Freetype::Freetype)
     target_compile_definitions(imgui PUBLIC MC_HAVE_FREETYPE)
 endif()
 
+# Pictures. Quick view decodes them with stb_image: one public domain header, no
+# system library, fetched by scripts/get-deps.sh into extern_dont_commit/stb the
+# same way ImGui is fetched into extern_dont_commit/imgui.
+#
+# Optional in the same shape as libcurl and FreeType: without the header the app
+# builds, runs, and a picture row shows the hex dump it shows today. src/img.cpp
+# answers with a reason instead of failing to link, so a clone that never ran the
+# script is a supported build rather than a broken one.
+set(STB_DIR ${CMAKE_SOURCE_DIR}/extern_dont_commit/stb)
+set(MC_STB_FOUND FALSE)
+if (EXISTS ${STB_DIR}/stb_image.h)
+    set(MC_STB_FOUND TRUE)
+else()
+    message(STATUS "no stb_image.h: run scripts/get-deps.sh to get picture previews")
+endif()
+
 # Remote sites (FTP/FTPS/SFTP) go through libcurl rather than a command-line
 # client, for two reasons a password rules out and archives do not: a password in
 # argv is readable through /proc by anyone on the machine, and a login plus a TLS
@@ -75,17 +91,25 @@ else()
 endif()
 
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp ${MC_REMOTE_SOURCES})
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
-target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
+if (MC_STB_FOUND)
+    target_compile_definitions(mc-clone PRIVATE MC_HAVE_STB_IMAGE=1)
+endif()
 
 # Logic tests. tests/test_panes.cpp includes src/panes.cpp so the file-static
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
 # checked without a display.
 enable_testing()
-add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp ${MC_REMOTE_SOURCES})
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
-target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
+target_compile_definitions(test-panes PRIVATE
+    MC_IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
+if (MC_STB_FOUND)
+    target_compile_definitions(test-panes PRIVATE MC_HAVE_STB_IMAGE=1)
+endif()
 add_test(NAME panes COMMAND test-panes)
 
 # --version is handled before SDL is initialized, so it runs headless.
@@ -120,3 +144,44 @@ add_test(NAME remote COMMAND test-remote)
 add_executable(test-sfv tests/test_sfv.cpp src/sfv.cpp)
 target_include_directories(test-sfv PRIVATE src)
 add_test(NAME sfv COMMAND test-sfv)
+
+# Picture decoding. The fixtures are written by the test itself - a BMP byte by
+# byte, a real PNG built from stored deflate blocks with the CRC-32 this repository
+# already has in src/sfv.cpp, and a JPEG with an EXIF orientation tag - because CI
+# installs no image tool and a test that needs one is a test that skips itself.
+# No display, no network, no decoder dependency: the sniffing, the EXIF walk and
+# the fit run with or without stb present.
+add_executable(test-img tests/test_img.cpp src/img.cpp src/sfv.cpp)
+target_include_directories(test-img PRIVATE src ${STB_DIR})
+# The committed JPEG fixtures, by absolute path, so the test runs from any build
+# directory and from ctest's own working directory.
+target_compile_definitions(test-img PRIVATE
+    MC_IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
+if (MC_STB_FOUND)
+    target_compile_definitions(test-img PRIVATE MC_HAVE_STB_IMAGE=1)
+endif()
+add_test(NAME img COMMAND test-img)
+
+# The texture upload, against a real GL context. On a machine with no screen it says
+# so and passes; on one with a screen it uploads the pixels a decoder produced.
+add_executable(test-texture tests/test_texture.cpp src/img.cpp src/sfv.cpp src/texture.cpp)
+target_include_directories(test-texture PRIVATE src ${STB_DIR})
+target_link_libraries(test-texture PRIVATE SDL3::SDL3 OpenGL::GL)
+if (MC_STB_FOUND)
+    target_compile_definitions(test-texture PRIVATE MC_HAVE_STB_IMAGE=1)
+endif()
+add_test(NAME texture COMMAND test-texture)
+
+# The whole feature, on screen: a fixture decoded, cached, textured and drawn by the
+# real renderer, then read back out of the framebuffer. Skips itself where there is no
+# display.
+add_executable(test-gl-preview tests/test_gl_preview.cpp src/filesystem.cpp src/config.cpp
+    src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp
+    ${MC_REMOTE_SOURCES})
+target_link_libraries(test-gl-preview PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
+target_include_directories(test-gl-preview PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
+target_compile_definitions(test-gl-preview PRIVATE MC_IMAGE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
+if (MC_STB_FOUND)
+    target_compile_definitions(test-gl-preview PRIVATE MC_HAVE_STB_IMAGE=1)
+endif()
+add_test(NAME gl-preview COMMAND test-gl-preview)

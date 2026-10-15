@@ -51,15 +51,21 @@ installs exactly that set, which is the quickest way to check the list is still
 correct. Installing it elsewhere works too; point CMake
 at the prefix with `-DCMAKE_PREFIX_PATH=/path/to/prefix`.
 
-Dear ImGui is not vendored in this repository. Fetch the pinned copy first:
+Dear ImGui is not vendored in this repository. Fetch the pinned copies first:
 
     scripts/get-deps.sh
 
 That clones `ocornut/imgui` to the exact commit this project is built and tested
 against (`v1.92.9b-112-gf502f9c98`) into `extern_dont_commit/imgui`, which is where
-`CMakeLists.txt` looks for it. The commit is pinned rather than "latest" because
+`CMakeLists.txt` looks for it, and downloads `stb_image.h` - the picture decoder
+quick view uses - to `extern_dont_commit/stb`, at a pinned commit with its SHA-256
+checked. The commit is pinned rather than "latest" because
 ImGui's master carries a `WIP` version string and moves, so an unpinned clone can
 break a build whose own source never changed.
+
+Both are optional in the same way. A build without ImGui does not exist; a build
+without `stb_image.h` configures with a message, runs, and previews a picture by
+saying it has no decoder rather than by failing.
 
 Then:
 
@@ -76,18 +82,24 @@ still tested; only the transport answers that this build has no FTP support, and
 
     cd build && ctest
 
-Four suites, all headless, about 2,200 checks between them:
+Eight suites, about 2,500 checks between them:
 
 | suite | what it covers |
 | --- | --- |
-| `panes` | the pane logic: marking, selection, sorting, filtering, tabs, directory history, the operation dialogs and their keyboard ring, quick view, background transfers, config round-trips through the real file. It `#include`s `src/panes.cpp` so the file-static helpers can be exercised directly. |
+| `panes` | the pane logic: marking, selection, sorting, filtering, tabs, directory history, the operation dialogs and their keyboard ring, quick view including its picture path, background transfers, config round-trips through the real file. It `#include`s `src/panes.cpp` so the file-static helpers can be exercised directly. |
 | `archive` | the archive backends, against real `zip`/`tar`/`7z` files that the test builds with the same tools the app shells out to |
 | `remote` | the URL layer, the sites file and its `0600` mode, the MLSD and LIST dialects against recorded server output, and then the transport against a real FTP server the test starts on `127.0.0.1` (`tests/ftp_server.py`) |
+| `sfv` | CRC-32 against the published check value, and the `.sfv` parser against the forms real files take: comments, names with spaces, checksum-first lines, backslash separators, broken UTF-8 |
+| `img` | picture recognition and decoding: format sniffing from bytes, PNG and BMP fixtures built in the test, all eight EXIF orientations, malformed EXIF, and the size guard that refuses a 9000x9000 header before allocating it |
+| `texture` | the GL texture upload, against a real context, including the way out when there is no context at all |
+| `gl-preview` | the whole feature on screen: a fixture decoded, cached, textured, drawn by the real renderer, and read back out of the framebuffer as magenta pixels |
 | `version` | `mc-clone --version`, which runs before SDL is initialised |
 
-The remote suite skips its network half when the build has no libcurl or the
-fixture will not start, and runs the parsers either way. The no-libcurl
-configuration is verified as a first-class build, not assumed:
+Three of them skip half their work rather than failing for want of an environment,
+and say so on the way out: `remote` without libcurl or a startable fixture, `img` and
+`panes` without the fetched decoder, `texture` and `gl-preview` without a display. A
+check that cannot run announces itself. The no-libcurl configuration is verified as a
+first-class build, not assumed:
 
     cmake -S . -B build-nocurl -DCMAKE_DISABLE_FIND_PACKAGE_CURL=ON
     cmake --build build-nocurl -j4
@@ -120,7 +132,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | --- | --- |
 | `Enter` `Right` | open |
 | `Backspace` `Left` | up a directory |
-| `F3` | quick view: the beginning of the file under the cursor, including one on a site or inside an archive |
+| `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor, including one on a site or inside an archive |
 | `Ctrl+Q` | quick view as a pane, instead of a file pane |
 | `Alt+F3` | open with the desktop's default program |
 | `F4` | edit in the terminal editor |
@@ -244,6 +256,27 @@ file:
 
     sfv_verify = ask      # ask | always | never
 
+## Pictures in quick view
+
+`F3` on a picture shows the picture. What a file *is* comes from its bytes and not
+from its name, so `photo.JPG`, `notes.jpg.txt` and a PNG called `data` are all
+previewed, and a format this build recognises but does not decode - webp, TIFF, SVG,
+ICO - is named in words instead of being answered with a hex dump.
+
+A picture is read and decoded on a worker, never in the frame that asked for it, and
+the pixels are kept so the window can be resized without decoding again. A JPEG is
+turned to match the way the camera held it before anything is drawn, and the caption
+says both numbers: what the file declared and what is being shown.
+
+Only files on this disk and members of an archive are previewed this way. A row on a
+site keeps the text preview it always had, because a preview is not a reason to pull a
+whole photograph down to find out what a row is.
+
+Two lines in the config file:
+
+    qv_images = 1         # 0 puts the hex dump back
+    quickview_w = 720     # the window's size, as before
+
 ## Where things are
 
     src/main.cpp         window, SDL and ImGui setup, the frame loop, key dispatch
@@ -254,10 +287,13 @@ file:
     src/proc.*           the child-process runner the archives and the console share
     src/remote.*         FTP/FTPS/SFTP through libcurl: sites file, parsers, transport
     src/sfv.*            CRC-32 and the .sfv parser, with no dependency on zlib
+    src/img.*            picture recognition, decoding, EXIF orientation, downscaling
+    src/texture.*        decoded pixels to a GL texture, and back out again
     src/config.*         ~/.config/mc-clone/config, and the 0600 sites file beside it
     src/theme.*          eight themes and the accent colours the panes draw with
-    tests/               the five suites and the FTP fixture
-    scripts/get-deps.sh  the pinned Dear ImGui checkout
+    tests/               the eight suites, the FTP fixture, and the pictures the
+                         picture tests build for themselves
+    scripts/get-deps.sh  the pinned Dear ImGui checkout and the pinned stb_image.h
     FEATURES_PLAN.md     the project's own record: what landed, what was refused, and why
 
 ## Things worth knowing before you rely on it
@@ -287,6 +323,12 @@ file:
   resumed transfer starts can produce a file of the right length with the wrong bytes,
   and a length check cannot see that. `.md5` files beside a download are a different
   format with a different algorithm and are not verified here.
+- **A preview is a look, not an import.** A picture is read up to 32 MB and refused
+  above it, and a header claiming 9000x9000 is refused before any pixels are
+  allocated. Decoded pictures are cached four at a time and 96 MB at a time, oldest
+  first, because a decoded 4032x3024 photograph is 48 MB of pixels. What is shown is
+  downscaled to 2048 on the longest side, so a preview of a large picture is a
+  downscaled picture and the caption says so.
 - **Ownership changes need root**, unless you are giving a file back to yourself. The
   Properties window reports `not permitted (ownership changes need root)` rather than
   reporting a change that did not happen. It uses `lchown`, so the link is chowned and

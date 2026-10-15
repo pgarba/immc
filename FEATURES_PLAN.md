@@ -39,6 +39,8 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | N console | done | the bottom command line is gone. `Ctrl+Enter` opens a console window over either pane, `Enter` runs the line through `/bin/sh` **on a worker thread** in the focused pane's directory, output arrives as it is produced, `Esc` cancels a running command and then hides the window. The backlog - every command and its output, oldest first, with the directory each ran in - outlives the window, the pane, the directory and the process: it is written to the config and read back. `cd`/`pwd`/`clear`/`history`/`exit` are builtins, `cd` moves a pane. `Ctrl+P`, `Alt+C`, `Alt+F8` and `Alt+PgUp/PgDn` retargeted onto it, `Ctrl+Enter` on an executable file runs it into the same transcript. `src/proc.{h,cpp}` is the child-process runner the archives and the console now share. `CONSOLE_PLAN.md` is the record of the decisions. |
 | O transfer resume, the exists choice, `.sfv` | done | `TRANSFER_RESUME_PLAN.md`. A remote download writes to `<name>.part` and renames only on success, so an aborted transfer keeps its bytes; a stopped row gets **Resume**, and the answer is Resume / Start over / Skip (`R / S / Esc`). Resume is byte-level: `REST` for a download, `APPE` for an upload, and a finished length that does not match the server throws the partial away instead of accepting it. `test-remote` exercises it against three servers — one that honours `REST`, one that refuses it, one that will not answer `SIZE`. The exists prompt now has three answers, **Overwrite / Skip / Rename** (`Y / N / R`, `Esc` cancels the operation), carried through the plan record so the local copy, the extractor and the network worker all honour the same choice. `src/sfv.{h,cpp}` is CRC-32 (reflected `0xEDB88320`, table built in the source, no zlib dependency) and a parser for the shapes real `.sfv` writers produce; verification runs on a thread, counts up in the transfer strip, reports mismatch and missing in a window, and `Commands → Verify SFV` runs it on the focused pane. `sfv_verify = ask \| always \| never` in the config. The Properties window (`Alt+Enter`) now edits mode, owner and group on a local entry: nine `rwx` boxes and an octal field kept in step with each other, owner and group accepted as a name or a number, an empty field meaning unchanged, `lchown` so the link is chowned and not its target, a recursive apply that counts what it changed, and a refusal reported as `not permitted (ownership changes need root)` instead of as a change that happened. On a site it is `SITE CHMOD` only, and the window says that FTP has no owner or group to set. |
 
+| P pictures in quick view | done | `QUICK_VIEW_IMAGE_PLAN.md`. `F3` on a picture draws it. `src/img.{h,cpp}` sniffs the format from the bytes rather than the extension, decodes through a pinned `stb_image.h` that `scripts/get-deps.sh` fetches next to the pinned ImGui, reads the JPEG EXIF orientation tag by hand because stb throws it away, applies all eight orientations, and refuses a canvas too large to preview before allocating it. `src/texture.{h,cpp}` makes the GL texture the renderer needs, asking SDL for the entry points rather than reaching into a backend's private loader. The read and the decode run on the quick view's existing worker, the pixels are cached apart from the text cache and bounded by count and by bytes, and the texture is made by the frame that draws it rather than the fetch that produced it. `qv_images = 1\|0` in the config. A row on a site keeps the preview it always had. |
+
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`,
 `font_hinting` and the size of the F3 quick view window (`quickview_w`/`quickview_h`). The hinting value
 is a name and not a number, so a hand-edited config says what the dialog shows and a name this build does
@@ -48,7 +50,9 @@ nothing down — and its position is deliberately not carried: coordinates from 
 leave a window whose title bar cannot be reached. The console adds `console_w`, `console_h`,
 `console_save` and the backlog itself as `console<N>_cwd/_cmd/_out/_code/_builtin`, with a command's
 output escaped so one entry stays one config line: 50 entries and 2 KB of each one's output, because
-the file is meant to stay readable by the person it belongs to.
+the file is meant to stay readable by the person it belongs to. Quick view adds `qv_images`, which is
+a line rather than a dialog row for the same reason `console_save` is: it is the switch that puts the
+old hex dump back, and every dialog row is something everyone reads past.
 
 **Archives (§6) closed the last missing binding**, and inside an archive `F5` copies the marked
 members out into the other pane, as TC's does. Four rows stay partial, each a deliberate shape
@@ -71,8 +75,10 @@ drawn, the quick filter taking the caret with the keys typed straight after
 it, the console's keyboard ownership, backlog, builtins, caps and config
 round-trip, and the buffer-ownership rule that a text field ImGui has the caret in
 must be asked to reload before the app's own write to its buffer is visible) run
-headless — 2075 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` and 51 in `test-sfv`:
-`cmake --build build -j4 && (cd build && ctest)`.
+headless — 2145 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` (190 without
+libcurl), 51 in `test-sfv`, 148 in `test-img`, 12 in `test-texture` and 7 in `test-gl-preview`:
+`cmake --build build -j4 && (cd build && ctest)`, which is 8/8 with libcurl, 8/8 without it, and 8/8
+with no decoder fetched either.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
 line at the bottom of the window asks on every frame - with offset `-1`, which
@@ -1178,3 +1184,67 @@ slash always comes from the filesystem half, and a member name a listing can bui
 contains one.
 
 20 of the new checks fail with the normalizer reduced to a copy, 0 with it in place.
+
+## 12. A picture in the quick view, and the checks that had to be built with it
+
+`F3` on a picture now draws it. The feature is small; the reasoning about *how to
+test it* is the part worth keeping.
+
+**The dependency follows the rule the project already had.** `stb_image.h` is fetched
+by `scripts/get-deps.sh` into `extern_dont_commit/stb`, at a pinned commit with its
+SHA-256 checked, exactly like ImGui. It is not vendored in-tree. It is also optional in
+the same sense libcurl is: a build that never ran the script configures with a printed
+line, runs, and previews a picture by saying `this build has no image decoder: run
+scripts/get-deps.sh` rather than by failing to build. `stb` has no usable tags, so the
+pin is the last commit that touches the file.
+
+**A format is what the bytes are.** Sniffing instead of an extension table is what makes
+`photo.JPG`, `notes.jpg.txt` and a PNG called `data` all work, and it is what lets a
+webp be *named* — "webp: this build cannot decode it" — instead of answered with a hex
+dump. Two sniffers needed the second look a byte-level test forces: Radiance HDR starts
+`#!` and not only `#?`, and `BM` alone is not a BMP, so the header size that follows has
+to be one of the five a writer produces.
+
+**Routing and mechanism are different things, and both need a check.** A name that says
+picture sends the read onto a worker; a name that does not gets the old synchronous
+screenful and, if the magic turns up in it, hands the rest of the file to a worker a
+frame later. Neutering either half fails a different set of checks — 2 when the routing
+is removed, 4 when the sniff escape is — which is the evidence that the escape is a
+mechanism and not decoration.
+
+**The texture is this app's job.** This build renders through `ImGui_ImplOpenGL3`, which
+binds a raw `GLuint` as the texture id, and the pinned ImGui (1.93.0 WIP) offers no
+texture API to an app. `src/texture.cpp` asks **SDL** for the GL entry points rather
+than reaching into `imgl3wProcs`, a name inside one backend's private header: same
+context, same function pointers, public API, and a file that compiles without ImGui.
+`tex_available()` is the guard that keeps a headless test from calling `glGenTextures`
+on a context that does not exist.
+
+**"Made a texture" and "drew a picture" are different failures.** Every part of this
+feature can run correctly while nothing appears. So `test-gl_preview` builds a solid
+magenta PNG — no colour in this interface is magenta — drives the real renderer for a
+few frames, reads the framebuffer back with `glReadPixels`, and requires a horizontal
+run of magenta. Deleting the `ImGui::Image()` call and leaving the upload in place fails
+exactly that one check. It skips itself, with a printed reason, where there is no display
+or no decoder.
+
+**Building the fixtures found the bugs.** The CI image has no ImageMagick and no PIL, so
+the pictures are written by the tests (`tests/image_fixtures.h`, plus two committed JPEGs
+from `tests/make_image_fixtures.py` because EXIF is awkward to hand-write). Writing a PNG
+from scratch is a lesson list: a chunk is length, then type and data, then the CRC —
+writing the CRC before the body produces a file that is a magic number and nothing else;
+ADLER32 is two running sums and not one; the IHDR CRC sits at byte 29 and not 28, so a
+size-guard test that patched 28 was refused for a checksum instead of for its size; and an
+icon directory entry is 16 bytes, so a 20-byte fixture asked for at length 22 was an
+out-of-bounds read in the *test*, which ASAN reported immediately.
+
+**stb's own guard fires first on the absurd.** A 30000x30000 PNG is refused by stb before
+it will report the size at all, so the project's guard — 8192 on a side, 40 million
+pixels — is the one that catches the merely very large, which is the case a real scan or
+a panorama arrives as. `img_dims()` asks the header what it claims before any pixel is
+allocated.
+
+**Three suites now skip instead of failing, and say so.** `remote` without libcurl, `img`
+and `panes` without the fetched decoder, `texture` and `gl-preview` without a display. A
+check that cannot run announces itself; a check that quietly does nothing is worse than no
+check, because it gets counted.

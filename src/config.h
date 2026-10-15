@@ -81,6 +81,12 @@ struct MCConfig {
     // misspelled, is read as "ask": the default that asks is safer than the one that
     // stays quiet, and a typo in a config line should not silently turn off a check.
     char sfv_verify[16];
+
+    // 1 (default): quick view draws a picture as a picture. 0: a picture row gets the
+    // hex dump it always got. Here rather than in the Options dialog for the same
+    // reason console_save is: it is a switch for the person who wants the old
+    // behaviour back, and every dialog row is something everyone reads past.
+    int qv_images;
 };
 
 // Absolute path of the config file, for the About window to name. Does not
