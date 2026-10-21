@@ -3,3 +3,6 @@ build-nocurl/
 extern_dont_commit/
 compile_commands.json
 imgui.ini
+# Pictures to point F3 at while testing. Nothing in the build or in the tests reads
+# this directory - the pictures the suites use are built by the suites, under tests/.
+samples/
