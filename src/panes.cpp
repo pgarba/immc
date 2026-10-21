@@ -2,7 +2,8 @@
 #include "filesystem.h"
 #include "archive.h"
 #include "proc.h"   // the shared child-process runner: pipe, /dev/null stdin, cancel
-#include "sfv.h"    // .sfv verification: CRC-32 and the parser
+#include "sfv.h"
+#include "text.h"    // .sfv verification: CRC-32 and the parser
 #include "img.h"     // picture previews: what a file is, and its pixels
 #include "texture.h" // and getting those pixels onto the screen
 #include "theme.h"
@@ -4325,6 +4326,19 @@ static void open_viewer(AppPanes* app, const char* path) {
         int hn = snprintf(viewer_buf, sizeof(viewer_buf), "(binary - hex dump of first 16384 bytes)\n\n");
         long dumped = fs_hex_dump(path, viewer_buf + hn, sizeof(viewer_buf) - (size_t)hn, 16384);
         if (dumped < 0) snprintf(viewer_buf, sizeof(viewer_buf), "(binary or unreadable)");
+    } else {
+        // The same alphabet question the quick view asks, because a file that is viewed
+        // rather than previewed should not be the one place that still shows the garbage.
+        std::string text(viewer_buf, (size_t)n);
+        if (text_decide_codepage(text, text_codepage_from_name(app->preview_codepage)) ==
+            TEXT_CODEPAGE_CP437) {
+            std::string drawn = text_cp437_to_utf8(text);
+            // UTF-8 is longer than the bytes it came from and this buffer is fixed, so
+            // a transcode that would not fit is not attempted. What is on screen is one
+            // alphabet or the other, never half of one.
+            if (drawn.size() + 1 <= sizeof(viewer_buf))
+                memcpy(viewer_buf, drawn.c_str(), drawn.size() + 1);
+        }
     }
     viewer_scroll = 0.0f;
     viewer_dirty = false;
@@ -5010,6 +5024,9 @@ struct QvJob {
     // further than a screenful. Decided when the job is made, because it changes how
     // much is read, and the thread must not have to ask the app anything.
     bool want_image = false;
+    // Which alphabet to read the bytes in. Same reason: decided here, on the UI
+    // thread, from the config, so the worker never has to ask the app.
+    TextCodepage codepage = TEXT_CODEPAGE_AUTO;
 };
 
 // The answers a preview can only give in words.
@@ -5028,13 +5045,71 @@ static std::string pane_row_path(const Pane& pane, int idx) {
 // is dropped and a lone CR becomes a newline, because ImGui advances over a
 // carriage return without breaking the line, and a text file that came off a
 // server is likely to have them.
-static bool qv_to_text(std::string* body) {
+//
+// Then the alphabet. ImGui reads text as UTF-8, so a UTF-8 file or a plain ASCII one
+// is already right. A file from the DOS world - an .nfo, a .diz, ANSI art - is not:
+// its box drawing is the single bytes 0xB0 to 0xDF, which are not valid UTF-8 and
+// arrive as garbage, a border of ─ turning into two characters of nothing. AUTO
+// consults the rule in text.h about the shape of the high bytes; utf8 and cp437 are
+// the user overriding that call in either direction, which is what a file the rule
+// misreads needs.
+static bool qv_to_text(std::string* body, TextCodepage page = TEXT_CODEPAGE_AUTO) {
     if (body->find('\0') != std::string::npos) return false;
     for (size_t i = body->find('\r'); i != std::string::npos; i = body->find('\r', i)) {
         if (i + 1 < body->size() && (*body)[i + 1] == '\n') body->erase(i, 1);
         else (*body)[i] = '\n';
     }
+    if (text_decide_codepage(*body, page) == TEXT_CODEPAGE_CP437)
+        *body = text_cp437_to_utf8(*body);
     return true;
+}
+
+// Box drawing and block characters are what an ANSI drawing is made of. When the font
+// in use has no glyphs for them the preview is correct and invisible, which looks from
+// the outside exactly like the wrong code page - so say which of the two it is, and
+// name the cure. Asked of the font's own coverage rather than matched against a list
+// of fonts, because the answer depends on the file and the size the user chose.
+static int qv_missing_art_glyphs(const char* text) {
+    bool seen[0x25A1 - 0x2500] = {};
+    int missing = 0;
+    ImFont* font = ImGui::GetFont();
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
+    while (*p) {
+        // Only U+2500..U+25A0 matters, and every one of them is three bytes. ASCII
+        // cannot be in that range, so it is stepped over rather than decoded: this
+        // runs on a preview that can be 64 KB, every frame.
+        if (*p < 0x80) { p++; continue; }
+        unsigned int cp;
+        int extra;
+        if ((*p & 0xE0) == 0xC0)      { cp = *p & 0x1Fu;  extra = 1; }
+        else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0Fu;  extra = 2; }
+        else if ((*p & 0xF8) == 0xF0) { cp = *p & 0x07u;  extra = 3; }
+        else { p++; continue; }        // a stray byte: skip it, do not resync the world
+        bool ok = true;
+        for (int k = 1; k <= extra; k++) {
+            if ((p[k] & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (p[k] & 0x3Fu);
+        }
+        if (!ok) { p++; continue; }
+        p += extra + 1;
+        if (cp >= 0x2500 && cp <= 0x25A0) {
+            int i = (int)cp - 0x2500;
+            if (!seen[i]) {
+                seen[i] = true;
+                if (!font->IsGlyphInFont((ImWchar)cp)) missing++;
+            }
+        }
+    }
+    return missing;
+}
+
+// The line that tells the user their font is the problem rather than the file.
+static void qv_font_note(const char* text) {
+    const int missing = qv_missing_art_glyphs(text);
+    if (missing <= 0) return;
+    ImGui::TextDisabled("(%d of these characters have no glyph in this font: a font"
+                        " with box drawing draws them - font = in the config, or"
+                        " Options > Fonts and theme)", missing);
 }
 
 static std::string* qv_cache_find(AppPanes* app, const std::string& key) {
@@ -5216,7 +5291,7 @@ static void qv_run_fetch(QvFetch* f, QvJob job) {
         }
     }
 
-    if (err.empty() && !qv_to_text(&body)) body = k_qv_binary;
+    if (err.empty() && !qv_to_text(&body, job.codepage)) body = k_qv_binary;
     f->text = err.empty() ? body : "";
     f->err = err;
     f->done = true;
@@ -5301,6 +5376,7 @@ static bool qv_job_for(AppPanes* app, const Pane& pane, int idx, QvJob* job) {
     job->want_image = app->qv_images_on && job->kind != QV_REMOTE &&
                       (job->kind == QV_ARCHIVE ||
                        name_looks_like_image(pane.entries[idx]->name));
+    job->codepage = text_codepage_from_name(app->preview_codepage);
     return true;
 }
 
@@ -5333,7 +5409,7 @@ static std::string qv_preview(AppPanes* app, const Pane& pane, int idx) {
             if (app->qv_fetches.size() < k_qv_inflight_max) qv_start(app, full);
             return k_qv_reading;
         }
-        if (!qv_to_text(&body)) body = k_qv_binary;
+        if (!qv_to_text(&body, job.codepage)) body = k_qv_binary;
         qv_cache_put(app, job.key, body);
         return body;
     }
@@ -5426,6 +5502,7 @@ static void render_quick_view_panel(AppPanes* app, float w, float h, const char*
     ImGui::TextDisabled("%s", e->name);
     ImGui::Separator();
     ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
+    qv_font_note(text.c_str());
     ImGui::EndChild();
 }
 
@@ -5864,6 +5941,7 @@ static void render_quick_view(AppPanes* app, Pane& pane) {
                 }
             } else {
                 ImGui::TextUnformatted(text.empty() ? "(nothing to preview)" : text.c_str());
+                qv_font_note(text.c_str());
             }
         }
     }
@@ -5881,6 +5959,7 @@ static void render_viewer(AppPanes* app) {
     ImGui::Separator();
     ImGui::BeginChild("##viewerbody", ImVec2(0, 0));
     ImGui::TextUnformatted(viewer_buf);
+    qv_font_note(viewer_buf);
     if (viewer_dirty) {
         float maxs = ImGui::GetScrollMaxY();
         if (viewer_scroll > maxs) viewer_scroll = maxs;
@@ -6304,6 +6383,7 @@ static void render_about(AppPanes* app) {
         "Ctrl+F3/F4/F5/F6/F7 sort name / ext / date / size / unsorted\n"
         "Shift+F3 view only the entry under the cursor\n"
         "F3 draws a picture as a picture; one this build cannot decode says which kind it is\n"
+        "F3 reads an old .nfo's box drawing as CP437 when the bytes look like a drawing\n"
         "Tab switch pane    Enter open/run   Backspace or Ctrl+PgUp parent\n"
         "Ctrl+PgDn open entry under cursor  Alt+Left/Right dir history\n"
         "Ctrl+T new tab     Ctrl+W close     Ctrl+Shift+W close all tabs\n"
@@ -8011,6 +8091,8 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     // not recognise came back as "ask".
     snprintf(app->sfv_verify, sizeof(app->sfv_verify), "%s",
              cfg->sfv_verify[0] ? cfg->sfv_verify : "ask");
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "%s",
+             cfg->preview_codepage[0] ? cfg->preview_codepage : "auto");
     if (cfg->columns[0]) snprintf(app->columns, sizeof(app->columns), "%s", cfg->columns);
     // A config that never carried these, or carries a 0 from a hand-edited file,
     // leaves the size the app was built with. mc_config_load has already clamped a

@@ -5210,6 +5210,193 @@ static void test_qv_images(AppPanes* app, const std::string& root) {
     p.list_mode = LIST_NORMAL;
 }
 
+// Which alphabet the quick view reads a preview in, through the real preview path.
+//
+// A .nfo from the DOS world draws its boxes with the single bytes 0xB0-0xDF. ImGui
+// reads text as UTF-8, so those bytes used to arrive as garbage. What is being pinned
+// down here is the whole decision: the transcode happens, it happens for an archive
+// member on a worker as well as for a file on this disk, a file that is already UTF-8
+// is not touched, a Western European file in 8 bits is not touched, and both of those
+// can be overridden by config.
+static void test_preview_codepage(AppPanes* app, const std::string& root) {
+    const std::string d = root + "/codepage";
+    sh("rm -rf '" + d + "' && mkdir -p '" + d + "/src'");
+    auto write_bytes = [&](const std::string& path, const std::string& bytes) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
+    };
+
+    // ╔═════╗ / ║ ANSI ART ║ / ╚═════╝ / ░▒▓█▄▀, written the way the file is written.
+    const std::string nfo =
+        "\xC9\xCD\xCD\xCD\xCD\xCD\xBB\n"
+        "\xBA ANSI ART \xBA\n"
+        "\xC8\xCD\xCD\xCD\xCD\xCD\xBC\n"
+        "\xB0\xB1\xB2\xDB\xDC\xDF\n";
+    const std::string nfo_drawn =
+        "\xE2\x95\x94\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x97\n"
+        "\xE2\x95\x91 ANSI ART \xE2\x95\x91\n"
+        "\xE2\x95\x9A\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x9D\n"
+        "\xE2\x96\x91\xE2\x96\x92\xE2\x96\x93\xE2\x96\x88\xE2\x96\x84\xE2\x96\x80\n";
+    write_bytes(d + "/src/art.nfo", nfo);
+
+    // A Latin-1 German file: high bytes, several of them inside the box-drawing range
+    // (Ü ß), and not one drawing. The rule looks at runs for exactly this case.
+    const std::string german =
+        "\xDC" "bersicht \xFC" "ber die Stra\xDF" "e\n"
+        "seit 1987 in K\xF6" "ln und Z\xFC" "rich\n";
+    write_bytes(d + "/src/german.txt", german);
+
+    // The same drawing spelled correctly, and an ordinary ASCII file: neither is
+    // anything's business.
+    write_bytes(d + "/src/modern.txt", nfo_drawn);
+    write_bytes(d + "/src/plain.txt", "just words\n");
+
+    Pane& p = app->left;
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "auto");
+    refresh_pane(&p, (d + "/src").c_str());
+    CHECK(idx_of(p, "art.nfo") >= 0);
+
+    // The .nfo, read the way the user will read it: the preview is the drawing.
+    CHECK(qv_preview(app, p, idx_of(p, "art.nfo")) == nfo_drawn);
+    std::string shown = qv_preview(app, p, idx_of(p, "art.nfo"));
+    CHECK(shown.find('\xCD') == std::string::npos);   // no raw CP437 byte left behind
+    CHECK(shown.find(" ANSI ART ") != std::string::npos);
+
+    // A file that is already UTF-8 with the art in it comes out byte for byte. It has
+    // more box drawing than the .nfo does, and that is precisely why it must not be
+    // run through a table a second time.
+    CHECK(qv_preview(app, p, idx_of(p, "modern.txt")) == nfo_drawn);
+
+    // Latin-1 prose is left alone, and nothing in it became a line-drawing character.
+    CHECK(qv_preview(app, p, idx_of(p, "german.txt")) == german);
+
+    // ASCII is untouched, and so is a binary file's answer.
+    CHECK(qv_preview(app, p, idx_of(p, "plain.txt")) == "just words\n");
+
+    // The internal viewer asks the same question, so that a file viewed rather than
+    // previewed is not the one place that still shows the garbage.
+    open_viewer(app, (d + "/src/art.nfo").c_str());
+    CHECK(!strcmp(viewer_buf, nfo_drawn.c_str()));
+    open_viewer(app, (d + "/src/german.txt").c_str());
+    CHECK(!strcmp(viewer_buf, german.c_str()));
+    open_viewer(app, (d + "/src/modern.txt").c_str());
+    CHECK(!strcmp(viewer_buf, nfo_drawn.c_str()));
+    close_viewer(app);
+
+    // utf8: the override that refuses, even for a real .nfo. Someone whose file is
+    // written in something else entirely gets their bytes back.
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "utf8");
+    app->qv_cache.clear();
+    CHECK(qv_preview(app, p, idx_of(p, "art.nfo")) == nfo);
+    CHECK(qv_preview(app, p, idx_of(p, "german.txt")) == german);
+
+    // cp437: the override that insists, for the drawing the guess missed. It applies
+    // to the German file too, which is what "the rule got this one wrong" looks like.
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "cp437");
+    app->qv_cache.clear();
+    CHECK(qv_preview(app, p, idx_of(p, "art.nfo")) == nfo_drawn);
+    std::string forced = qv_preview(app, p, idx_of(p, "german.txt"));
+    CHECK(forced != german);
+    CHECK(forced.find("\xE2\x96\x84") != std::string::npos);   // Ü became ▄
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "auto");
+    app->qv_cache.clear();
+
+    // The decision is carried on the job, so a member unpacked on a worker is read in
+    // the same alphabet as a file read in the frame. The archive goes outside the
+    // directory it packs: an archive inside the tree it is built from is its own
+    // recursion.
+    {
+        StringList names;
+        names.push_back("art.nfo");
+        std::string err;
+        CHECK(arch_pack((root + "/cp-pkg.zip").c_str(), (d + "/src").c_str(), names,
+                        nullptr, nullptr, &err));
+    }
+    refresh_pane(&p, (root + "/cp-pkg.zip").c_str());
+    CHECK(in_archive(p));
+    int member = idx_of(p, "art.nfo");
+    CHECK(member >= 0);
+    QvJob job;
+    CHECK(qv_job_for(app, p, member, &job));
+    CHECK(job.codepage == TEXT_CODEPAGE_AUTO);
+    CHECK(qv_preview(app, p, member) == k_qv_reading);
+    std::string out = k_qv_reading;
+    for (int tries = 0; tries < 200 && out == k_qv_reading; tries++) {
+        SDL_Delay(25);
+        qv_reap(app);
+        out = qv_preview(app, p, member);
+    }
+    CHECK(out == nfo_drawn);
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "utf8");
+    app->qv_cache.clear();
+    CHECK(qv_job_for(app, p, member, &job));
+    CHECK(job.codepage == TEXT_CODEPAGE_UTF8);
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "cp437");
+    CHECK(qv_job_for(app, p, member, &job));
+    CHECK(job.codepage == TEXT_CODEPAGE_CP437);
+    snprintf(app->preview_codepage, sizeof(app->preview_codepage), "auto");
+    qv_stop_all(app);
+    app->qv_cache.clear();
+
+    // The font half. Test-panes has no renderer of its own, so a context is made here
+    // with the built-in font, which has no box drawing at all: a preview of a drawing
+    // must produce the line that says so, and a preview with no art in it must not.
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1280, 800);
+    io.Fonts->AddFontDefault();
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+    ImGui::NewFrame();
+    ImGui::Begin("Quick view");
+    CHECK(qv_missing_art_glyphs(nfo_drawn.c_str()) > 0);
+    CHECK(qv_missing_art_glyphs("just words\n") == 0);
+    CHECK(qv_missing_art_glyphs(german.c_str()) == 0);
+    CHECK(qv_missing_art_glyphs("") == 0);
+    // Counted once per character, not once per occurrence: a border of sixty ─ is one
+    // missing glyph, and sixty different ones would be sixty.
+    std::string long_border;
+    for (int i = 0; i < 60; i++) long_border += "\xE2\x94\x80";
+    CHECK(qv_missing_art_glyphs(long_border.c_str()) == 1);
+    ImGui::End();
+    ImGui::EndFrame();
+    ImGui::DestroyContext(ctx);
+
+    // And the config line itself: the value has to survive the file, and a word that
+    // means nothing has to fall back rather than select something else.
+    {
+        const char* real_home = getenv("HOME");
+        std::string home = root + "/cp-home";
+        mkdir(home.c_str(), 0755);
+        setenv("HOME", home.c_str(), 1);
+        MCConfig cfg;
+        mc_config_default(&cfg);
+        CHECK(!strcmp(cfg.preview_codepage, "auto"));
+        snprintf(cfg.preview_codepage, sizeof(cfg.preview_codepage), "cp437");
+        mc_config_save(&cfg);
+        MCConfig back;
+        mc_config_default(&back);
+        mc_config_load(&back);
+        CHECK(!strcmp(back.preview_codepage, "cp437"));
+
+        FILE* f = fopen((home + "/.config/mc-clone/config").c_str(), "a");
+        if (f) { fprintf(f, "preview_codepage = koi8-r\n"); fclose(f); }
+        mc_config_default(&back);
+        mc_config_load(&back);
+        CHECK(!strcmp(back.preview_codepage, "auto"));
+        if (real_home) setenv("HOME", real_home, 1); else unsetenv("HOME");
+    }
+
+    app->qv_cache.clear();
+    free_entries(p.entries, p.entry_count);
+    p.entries = nullptr;
+    p.entry_count = 0;
+    p.selected = 0;
+    p.current_dir[0] = '\0';
+    p.archive_path[0] = '\0';
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -5327,6 +5514,7 @@ int main() {
     test_properties_permissions(&app, root);
     test_tab_bar_click(&app, root);
     test_path_normalization(&app, p, root);
+    test_preview_codepage(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

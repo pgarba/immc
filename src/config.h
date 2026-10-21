@@ -82,6 +82,11 @@ struct MCConfig {
     // stays quiet, and a typo in a config line should not silently turn off a check.
     char sfv_verify[16];
 
+    // How the quick view reads a file that is not UTF-8: "auto" (default) transcodes
+    // CP437 when the bytes look like ANSI art, "utf8" never transcodes, "cp437" always
+    // does. An unrecognised word, like a typo, is read as "auto".
+    char preview_codepage[16];
+
     // 1 (default): quick view draws a picture as a picture. 0: a picture row gets the
     // hex dump it always got. Here rather than in the Options dialog for the same
     // reason console_save is: it is a switch for the person who wants the old

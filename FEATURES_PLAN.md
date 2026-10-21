@@ -40,6 +40,7 @@ Legend: `OK` matches · `PART` partial · `MISS` missing · `CONFLICT` we bind t
 | O transfer resume, the exists choice, `.sfv` | done | `TRANSFER_RESUME_PLAN.md`. A remote download writes to `<name>.part` and renames only on success, so an aborted transfer keeps its bytes; a stopped row gets **Resume**, and the answer is Resume / Start over / Skip (`R / S / Esc`). Resume is byte-level: `REST` for a download, `APPE` for an upload, and a finished length that does not match the server throws the partial away instead of accepting it. `test-remote` exercises it against three servers — one that honours `REST`, one that refuses it, one that will not answer `SIZE`. The exists prompt now has three answers, **Overwrite / Skip / Rename** (`Y / N / R`, `Esc` cancels the operation), carried through the plan record so the local copy, the extractor and the network worker all honour the same choice. `src/sfv.{h,cpp}` is CRC-32 (reflected `0xEDB88320`, table built in the source, no zlib dependency) and a parser for the shapes real `.sfv` writers produce; verification runs on a thread, counts up in the transfer strip, reports mismatch and missing in a window, and `Commands → Verify SFV` runs it on the focused pane. `sfv_verify = ask \| always \| never` in the config. The Properties window (`Alt+Enter`) now edits mode, owner and group on a local entry: nine `rwx` boxes and an octal field kept in step with each other, owner and group accepted as a name or a number, an empty field meaning unchanged, `lchown` so the link is chowned and not its target, a recursive apply that counts what it changed, and a refusal reported as `not permitted (ownership changes need root)` instead of as a change that happened. On a site it is `SITE CHMOD` only, and the window says that FTP has no owner or group to set. |
 
 | P pictures in quick view | done | `QUICK_VIEW_IMAGE_PLAN.md`. `F3` on a picture draws it. `src/img.{h,cpp}` sniffs the format from the bytes rather than the extension, decodes through a pinned `stb_image.h` that `scripts/get-deps.sh` fetches next to the pinned ImGui, reads the JPEG EXIF orientation tag by hand because stb throws it away, applies all eight orientations, and refuses a canvas too large to preview before allocating it. `src/texture.{h,cpp}` makes the GL texture the renderer needs, asking SDL for the entry points rather than reaching into a backend's private loader. The read and the decode run on the quick view's existing worker, the pixels are cached apart from the text cache and bounded by count and by bytes, and the texture is made by the frame that draws it rather than the fetch that produced it. `qv_images = 1\|0` in the config. A row on a site keeps the preview it always had. |
+| T text that is not UTF-8 in quick view | done | `F3` on an `.nfo` or an ANSI art file reads the bytes as CP437 when they look like a drawing, so `0xB0`-`0xDF` box drawing reaches ImGui as the UTF-8 it already expects. `src/text.{h,cpp}` holds the UTF-8 validator, the table (generated from Python's `cp437` codec rather than typed), and the rule that decides: not valid UTF-8, four or more bytes in the art block, and either four of them in a row or six different ones. A Western European file saved in 8 bits is left alone, because reading `É` through that table turns it into `╔`. `preview_codepage = auto\|utf8\|cp437` overrides the call in either direction. When the font has no glyph for what was produced, the preview says so and counts them. |
 
 Config now also persists `view_mode`, `sort_mode`, `show_hidden`, `filter_preset`, `trash`, `columns`,
 `font_hinting` and the size of the F3 quick view window (`quickview_w`/`quickview_h`). The hinting value
@@ -76,9 +77,10 @@ drawn, the quick filter taking the caret with the keys typed straight after
 it, the console's keyboard ownership, backlog, builtins, caps and config
 round-trip, and the buffer-ownership rule that a text field ImGui has the caret in
 must be asked to reload before the app's own write to its buffer is visible) run
-headless — 2145 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` (190 without
-libcurl), 51 in `test-sfv`, 148 in `test-img`, 12 in `test-texture` and 7 in `test-gl-preview`:
-`cmake --build build -j4 && (cd build && ctest)`, which is 8/8 with libcurl, 8/8 without it, and 8/8
+headless — 2179 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` (190 without
+libcurl), 51 in `test-sfv`, 148 in `test-img`, 78 in `test-text`, 12 in `test-texture` and 7 in
+`test-gl-preview`:
+`cmake --build build -j4 && (cd build && ctest)`, which is 9/9 with libcurl, 9/9 without it, and 9/9
 with no decoder fetched either.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
@@ -1250,3 +1252,61 @@ allocated.
 and `panes` without the fetched decoder, `texture` and `gl-preview` without a display. A
 check that cannot run announces itself; a check that quietly does nothing is worse than no
 check, because it gets counted.
+
+## 13. Box drawing in an `.nfo`, which turned out to be an encoding problem
+
+The report was that `F3` on a `.nfo` showed the art wrong. Two things could cause
+that, and they look identical from the outside: a font with no glyphs for the
+characters, or bytes read in the wrong alphabet. Measuring both before writing any
+code is what made this a small change.
+
+**The font was not it — for this file.** Asked directly, the built-in ImGui font has 0
+of the 148 codepoints in U+2500–U+2593, and `Hack-Regular.ttf` has 148 of 148. The user
+running the app had Hack configured, so the glyphs were there and the bytes arriving
+were wrong: a `.nfo` writes its boxes with the single CP437 bytes `0xB0`–`0xDF`, and
+ImGui reads text as UTF-8, where those bytes are not a character at all. It is still
+worth knowing the built-in font has none of them, because that is what "the preview is
+empty" means on a machine that has no font file configured. `ImFont::IsGlyphInFont()`
+answers this against the font's own coverage without rasterising anything, which is why
+the quick view can ask it every frame.
+
+**The transcode is the easy half.** CP437's upper half is 128 entries. It was generated
+from Python's `cp437` codec rather than typed from a chart, because the chart people
+misremember is Latin-1: CP437 has no `ã` at `0x84`, it has `ä` there. A wrong row in
+that table produces a wrong character that looks like a plausible one.
+
+**The rule is the whole feature.** "Not valid UTF-8, so read it as CP437" is wrong often
+enough to matter, because a Western European text file saved in 8 bits is also not valid
+UTF-8, and its accents happen to sit inside the box-drawing range: `Ä` is `0xC4`, `Ö` is
+`0xD6`, `Ü` is `0xDC`, `ß` is `0xDF`. Running one through the table turns `É` into `╔`.
+So the rule looks at the *shape* of the high bytes: not valid UTF-8, at least four of
+them in `0xB0`–`0xDF`, and then either four in a row — which is what a border is — or at
+least six different ones, which is what a table of box characters framing ASCII words
+looks like. Prose does not put four accented letters side by side, and that is the whole
+discriminator. It is overridable with `preview_codepage = utf8` and `= cp437` because a
+rule that guesses will eventually guess wrong on a real file.
+
+**Five of my own test expectations were wrong, and the tests are better for it.** The
+bottom-right box corner is `0xBC`, not `0xDD` (`0xDD` is `╪`). CP437's `0xA0` is `á`, not
+`Á`. `C2 80` is *valid* UTF-8 — it is the shortest encoding of U+0080 — and `E2 A0 80` is
+a Braille pattern, not an over-long form, so the validator was right and the checks
+against it were wrong. And a fixture meant to demonstrate "box characters that never
+touch" contained a horizontal rule, which is a run of seven, so it demonstrated the
+other half of the rule instead: the suite now has both shapes, one with a rule and one
+with the characters held apart by text.
+
+**Verified by breaking it.** With the transcode removed from the preview path,
+`test-panes` fails 6 checks — the local read, both config overrides, and the archive
+member on a worker, which is the path that proves the decision travels on the job
+instead of being asked for by the thread. With only the auto rule disabled, it fails 3,
+and the forced overrides still pass, which is the difference between the guess and the
+transcode working. `test-text` is 78 checks: the table against its anchors, UTF-8's
+invalid forms and its looks-wrong-but-isn't forms, and the Latin-1 file the rule must
+leave alone. `ctest` is 9/9 with libcurl, 9/9 without it.
+
+**What is still true after this.** The preview is capped at 64 KB, so only the previewed
+part is transcoded, which is the part being looked at. The rule can still be fooled by a
+non-UTF-8 file that really does put four accented capitals side by side, and the answer
+for that file is the config line. A font without box-drawing glyphs is not something the
+config can fix: the preview says how many characters have no glyph and points at `font =`
+and Options → Fonts and theme.

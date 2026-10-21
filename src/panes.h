@@ -618,6 +618,11 @@ public:
     // holds its own copy rather than reaching for the config struct, the same way it
     // holds its own theme and font: the panes module has no pointer to the config.
     char sfv_verify[16] = "ask";
+
+    // Which alphabet the quick view reads a preview in: "auto" | "utf8" | "cp437".
+    // Copied from the config for the same reason sfv_verify is: the preview code has
+    // no config pointer, and the answer must be settled before a worker is started.
+    char preview_codepage[16] = "auto";
     // The .sfv the verify offer is asking about, and the transfer it came from. The
     // transfer is kept because "re-fetch the bad ones" needs the plan that fetched
     // them, and a verification started from the menu has no such thing.

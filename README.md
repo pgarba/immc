@@ -82,7 +82,7 @@ still tested; only the transport answers that this build has no FTP support, and
 
     cd build && ctest
 
-Eight suites, about 2,500 checks between them:
+Nine suites, a little over 3,000 checks between them:
 
 | suite | what it covers |
 | --- | --- |
@@ -91,6 +91,7 @@ Eight suites, about 2,500 checks between them:
 | `remote` | the URL layer, the sites file and its `0600` mode, the MLSD and LIST dialects against recorded server output, and then the transport against a real FTP server the test starts on `127.0.0.1` (`tests/ftp_server.py`) |
 | `sfv` | CRC-32 against the published check value, and the `.sfv` parser against the forms real files take: comments, names with spaces, checksum-first lines, backslash separators, broken UTF-8 |
 | `img` | picture recognition and decoding: format sniffing from bytes, PNG and BMP fixtures built in the test, all eight EXIF orientations, malformed EXIF, and the size guard that refuses a 9000x9000 header before allocating it |
+| `text` | which alphabet a preview is written in: UTF-8 validation including the forms that look wrong and are not, the CP437 table against its anchors, and the rule that tells an ANSI drawing from a Western European text file in 8 bits |
 | `texture` | the GL texture upload, against a real context, including the way out when there is no context at all |
 | `gl-preview` | the whole feature on screen: a fixture decoded, cached, textured, drawn by the real renderer, and read back out of the framebuffer as magenta pixels |
 | `version` | `mc-clone --version`, which runs before SDL is initialised |
@@ -132,7 +133,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | --- | --- |
 | `Enter` `Right` | open |
 | `Backspace` `Left` | up a directory |
-| `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor, including one on a site or inside an archive |
+| `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor — including one on a site or inside an archive, and an old `.nfo` read as CP437 when it looks like a drawing |
 | `Ctrl+Q` | quick view as a pane, instead of a file pane |
 | `Alt+F3` | open with the desktop's default program |
 | `F4` | edit in the terminal editor |
@@ -277,6 +278,40 @@ Two lines in the config file:
     qv_images = 1         # 0 puts the hex dump back
     quickview_w = 720     # the window's size, as before
 
+## Text in the quick view that is not UTF-8
+
+ImGui reads text as UTF-8. A file that is UTF-8, or plain ASCII, is therefore already
+right and is not touched. A file from the DOS world - an `.nfo`, a `.diz`, a BBS ANSI
+art file - is not: it draws its boxes with the single bytes `0xB0` to `0xDF` of CP437,
+which are not valid UTF-8, so a border drawn as `─` used to arrive as a pair of
+characters of nothing.
+
+The quick view reads those bytes as CP437 and hands UTF-8 to ImGui instead. It does
+that when the bytes look like a drawing rather than whenever a byte is above 0x7F,
+because the other kind of not-UTF-8 file is a Western European text file saved in
+8 bits, and reading `É` through the CP437 table turns it into `╔`. The tell is the
+shape of the high bytes: a border is four or more of them in a row, and a table of box
+characters uses many different ones, while prose never puts four accented letters side
+by side.
+
+When the guess matters and is wrong, the config says which way:
+
+    preview_codepage = auto      # auto | utf8 | cp437
+
+The same decision is made for the internal viewer, so a file you view is not the one place
+that still shows the wrong characters.
+
+`utf8` never transcodes anything. `cp437` transcodes everything, which is what a drawing the rule missed needs.
+
+The last piece is the font, and it is the one the config cannot fix for you. The
+box-drawing and block characters have to exist in the font you chose: the built-in one
+ImGui falls back to has none of them, so a correct preview of an `.nfo` looks empty.
+The quick view says which of the two problems you have - it prints a line under the
+preview naming the count of characters with no glyph. Pick a font that carries them:
+
+    font = /usr/share/fonts/TTF/Hack-Regular.ttf
+    font_size = 16
+
 ## Where things are
 
     src/main.cpp         window, SDL and ImGui setup, the frame loop, key dispatch
@@ -289,9 +324,10 @@ Two lines in the config file:
     src/sfv.*            CRC-32 and the .sfv parser, with no dependency on zlib
     src/img.*            picture recognition, decoding, EXIF orientation, downscaling
     src/texture.*        decoded pixels to a GL texture, and back out again
+    src/text.*           UTF-8 validation and the CP437 transcode the quick view reads old text in
     src/config.*         ~/.config/mc-clone/config, and the 0600 sites file beside it
     src/theme.*          eight themes and the accent colours the panes draw with
-    tests/               the eight suites, the FTP fixture, and the pictures the
+    tests/               the nine suites, the FTP fixture, and the pictures the
                          picture tests build for themselves
     scripts/get-deps.sh  the pinned Dear ImGui checkout and the pinned stb_image.h
     FEATURES_PLAN.md     the project's own record: what landed, what was refused, and why

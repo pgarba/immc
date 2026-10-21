@@ -38,6 +38,7 @@ void mc_config_default(MCConfig* c) {
     c->console_w = 760; c->console_h = 420;
     c->console_save = 1;
     snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
+    snprintf(c->preview_codepage, sizeof(c->preview_codepage), "auto");
     c->qv_images = 1;
     c->console_entries.clear();
     c->font[0] = '\0';
@@ -127,6 +128,8 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "console_h"))     c->console_h = atoi(val);
         else if (!strcmp(key, "console_save"))  c->console_save = atoi(val);
         else if (!strcmp(key, "sfv_verify"))    snprintf(c->sfv_verify, sizeof(c->sfv_verify), "%s", val);
+        else if (!strcmp(key, "preview_codepage"))
+            snprintf(c->preview_codepage, sizeof(c->preview_codepage), "%s", val);
         else if (!strcmp(key, "qv_images"))     c->qv_images = atoi(val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
@@ -191,6 +194,10 @@ void mc_config_load(MCConfig* c) {
     // back to asking.
     if (strcmp(c->sfv_verify, "always") && strcmp(c->sfv_verify, "never"))
         snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
+    // The same rule as sfv_verify: three words mean anything, and a typo falls back to
+    // the one that guesses from the bytes rather than to a silent override.
+    if (strcmp(c->preview_codepage, "utf8") && strcmp(c->preview_codepage, "cp437"))
+        snprintf(c->preview_codepage, sizeof(c->preview_codepage), "auto");
     if (c->left_tab_count  < 0) c->left_tab_count  = 0;
     if (c->left_tab_count  > MC_MAX_TABS) c->left_tab_count = MC_MAX_TABS;
     if (c->right_tab_count < 0) c->right_tab_count = 0;
@@ -288,8 +295,15 @@ void mc_config_save(const MCConfig* c) {
         // alone. A verification is also always available from the Commands menu.
         "\n# After a download that landed beside a .sfv: ask | always | never\n"
         "sfv_verify = %s\n"
+        // A file from the DOS world writes its box drawing as single bytes (CP437).
+        // "auto" reads those as CP437 when the bytes look like a drawing, "utf8" leaves
+        // every file alone, "cp437" forces it for the drawing the guess missed. A font
+        // without box-drawing glyphs shows a line about it in the quick view.
+        "\n# How the quick view reads a file that is not UTF-8: auto | utf8 | cp437\n"
+        "preview_codepage = %s\n"
         "qv_images = %d\n",
-        c->console_w, c->console_h, c->console_save, c->sfv_verify, c->qv_images);
+        c->console_w, c->console_h, c->console_save, c->sfv_verify,
+        c->preview_codepage, c->qv_images);
 
     if (c->console_save) {
         fprintf(f,
