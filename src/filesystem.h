@@ -77,6 +77,13 @@ void format_mode(mode_t mode, char* out);
 // Read up to max_bytes of a file into buf (NUL-terminated). Returns bytes read,
 // or -1 if the file is binary (contains NUL) or unreadable.
 long fs_read_preview(const char* path, char* buf, size_t max_bytes);
+
+// Whether a file's bytes are text, decided by looking at them rather than by its
+// extension, and naming what it is when a magic number says more than "not text":
+// "an ELF shared object", "a Windows executable", "an archive (zip)". `why` is only
+// written when the answer is yes. An unreadable file answers no: not being able to
+// read it is not the same as knowing it is a binary.
+bool fs_is_binary_file(const char* path, char* why, size_t why_n);
 long fs_hex_dump(const char* path, char* out, size_t out_size, long max_bytes);
 void fs_count_tree(const char* path, long long* total_size, long* nfiles, long* ndirs);
 

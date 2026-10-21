@@ -5397,6 +5397,201 @@ static void test_preview_codepage(AppPanes* app, const std::string& root) {
     p.archive_path[0] = '\0';
 }
 
+// F4: finding a terminal, and asking before opening a binary in a text editor.
+//
+// The report this came from was "No terminal emulator found for vim" on a machine that
+// has alacritty and none of the five names the app used to look for. Two halves to
+// check: the lookup and the exact command it produces, and the new question that stops
+// F4 turning a `.so` into a vim buffer full of mojibake.
+static void test_f4_terminal_and_binary(AppPanes* app, const std::string& root) {
+    const std::string d = root + "/f4";
+    sh("rm -rf '" + d + "' && mkdir -p '" + d + "'");
+    auto write_bytes = [&](const std::string& path, const std::string& bytes) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
+    };
+    auto slurp = [](const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return std::string();
+        std::string out;
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+        fclose(f);
+        return out;
+    };
+
+    // What a file's head says it is, decided from the bytes.
+    std::string elf64_le;
+    elf64_le.append(1, (char)0x7F); elf64_le += "ELF";
+    elf64_le.append(1, (char)2);  elf64_le.append(1, (char)1);   // 64-bit, little endian
+    elf64_le.append(1, (char)1);                                 // version
+    elf64_le.append(9, (char)0);                                 // pad to 16 bytes of e_ident
+    elf64_le.append(1, (char)3);  elf64_le.append(1, (char)0);   // e_type at 16: ET_DYN
+    elf64_le.append(200, (char)0);
+    write_bytes(d + "/libfake.so", elf64_le);
+
+    std::string elf_be = elf64_le;
+    elf_be[5] = (char)2;                            // big endian
+    elf_be[16] = (char)0; elf_be[17] = (char)2;    // e_type = ET_EXEC, byte-swapped
+    write_bytes(d + "/elf_be", elf_be);
+
+    write_bytes(d + "/notes.txt", "a plain text file\n");
+    // Built a byte at a time: std::string(const char*) stops at the first NUL, so a
+    // literal is not a way to write a file that has one.
+    std::string nultxt = "text";
+    nultxt.append(1, (char)0);
+    nultxt += "then not\n";
+    write_bytes(d + "/nul.txt", nultxt);
+    write_bytes(d + "/empty.txt", "");
+    write_bytes(d + "/win.exe", "MZ\x90\x00" "stub");
+    write_bytes(d + "/pkg.bin", "PK\x03\x04" "archive");
+    write_bytes(d + "/gz.bin", "\x1F\x8B" "compressed");
+    write_bytes(d + "/bz.bin", "BZh9" "compressed");
+    write_bytes(d + "/doc.pdf", "%PDF-1.7 document");
+    write_bytes(d + "/a.ar", "!<arch>\nmember");
+
+    char why[160] = {};   // written only when the answer is yes, so it starts empty
+    CHECK(fs_is_binary_file((d + "/libfake.so").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "an ELF shared object"));
+    // The endianness comes from the file, not from the machine reading it.
+    CHECK(fs_is_binary_file((d + "/elf_be").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "an ELF executable"));
+    CHECK(fs_is_binary_file((d + "/win.exe").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "a Windows executable"));
+    CHECK(fs_is_binary_file((d + "/pkg.bin").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "an archive (zip)"));
+    CHECK(fs_is_binary_file((d + "/gz.bin").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "a compressed file (gzip)"));
+    CHECK(fs_is_binary_file((d + "/bz.bin").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "a compressed file (bzip2)"));
+    CHECK(fs_is_binary_file((d + "/doc.pdf").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "a PDF"));
+    CHECK(fs_is_binary_file((d + "/a.ar").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "an archive (ar)"));
+    // The tell that is not a magic number: a NUL in the head, the same one the quick
+    // view uses to decide on a hex dump.
+    CHECK(fs_is_binary_file((d + "/nul.txt").c_str(), why, sizeof why));
+    CHECK(!strcmp(why, "not a text file"));
+    // And the ones that are text, or cannot be read at all.
+    CHECK(!fs_is_binary_file((d + "/notes.txt").c_str(), why, sizeof why));
+    CHECK(!fs_is_binary_file((d + "/empty.txt").c_str(), why, sizeof why));
+    CHECK(!fs_is_binary_file((d + "/no-such-file").c_str(), why, sizeof why));
+
+    // The F4 flow, on a pane pointed at the fixtures.
+    Pane& p = app->left;
+    app->left_focus = true;
+    refresh_pane(&p, d.c_str());
+    int so = idx_of(p, "libfake.so");
+    CHECK(so >= 0);
+    p.selected = so;
+    snprintf(app->term_pref, sizeof(app->term_pref), "");
+    edit_cursor(app);
+    CHECK(app->confirm == CONF_EDIT_BINARY);
+    CHECK(strstr(app->confirm_text, "an ELF shared object") != nullptr);
+    CHECK(strstr(app->confirm_text, "anyway") != nullptr);
+    CHECK(strstr(app->confirm_text, "vim") != nullptr);   // the editor it is asking about
+    CHECK(strstr(app->pending_edit_path, "libfake.so") != nullptr);
+
+    // Esc on a yes/no confirm is No, not the overwrite confirm's "cancel the whole
+    // operation": which kind of confirm it is decides which keys mean what.
+    app->pending_confirm_answer = CONF_ANS_NONE;
+    app_panes_handle_key(app, SDLK_ESCAPE, 0);
+    app_panes_run_pending(app);
+    CHECK(app->confirm == CONF_NONE);
+    CHECK(app->pending_edit_path[0] == '\0');
+    CHECK(strstr(app->status_msg, "Not edited") != nullptr);
+
+    // A terminal that exists, in a directory of fake ones, so the command the app
+    // actually runs can be read back off disk. This is the check that would have
+    // failed on the reported machine: alacritty was there and was not looked for.
+    const std::string fake = root + "/fakebin";
+    sh("rm -rf '" + fake + "' && mkdir -p '" + fake + "'");
+    const std::string log = root + "/term-log";
+    // The arguments only. In a `#!` script `$0` is the path the kernel opened, not the
+    // argv[0] the app passed, so the script cannot report which name was exec'd; the
+    // status line already says that, and the fact that *this* fake ran is the proof.
+    const std::string script = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + log + "'\n";
+    write_bytes(fake + "/alacritty", script);
+    chmod((fake + "/alacritty").c_str(), 0755);
+    const char* real_path = getenv("PATH");
+    const std::string keep_path = real_path ? real_path : "";
+    setenv("PATH", fake.c_str(), 1);
+
+    auto launched = [&]() {
+        for (int tries = 0; tries < 200; tries++) {
+            std::string s = slurp(log);
+            if (!s.empty()) {
+                while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+                return s;
+            }
+            SDL_Delay(10);
+        }
+        return std::string();
+    };
+
+    // A text file: no question, and the editor goes to the terminal the lookup chose.
+    remove(log.c_str());
+    p.view.clear();
+    p.selected = idx_of(p, "notes.txt");
+    edit_cursor(app);
+    CHECK(app->confirm == CONF_NONE);
+    CHECK(strstr(app->status_msg, "alacritty") != nullptr);
+    CHECK(strstr(app->status_msg, "vim") != nullptr);
+    CHECK(launched() == "-e vim " + d + "/notes.txt");
+
+    // A binary, answered yes: the file that gets edited is the one the question was
+    // asked about, not whatever the cursor moved to meanwhile.
+    remove(log.c_str());
+    p.selected = so;
+    edit_cursor(app);
+    CHECK(app->confirm == CONF_EDIT_BINARY);
+    confirm_answer(app, CONF_ANS_YES);
+    CHECK(app->confirm == CONF_NONE);
+    CHECK(launched() == "-e vim " + d + "/libfake.so");
+
+    // The config line names somebody else's terminal, flags and all.
+    remove(log.c_str());
+    write_bytes(fake + "/my-term", script);
+    chmod((fake + "/my-term").c_str(), 0755);
+    snprintf(app->term_pref, sizeof(app->term_pref), "my-term --hold");
+    p.selected = idx_of(p, "notes.txt");
+    edit_cursor(app);
+    CHECK(strstr(app->status_msg, "my-term") != nullptr);
+    CHECK(launched() == "--hold vim " + d + "/notes.txt");
+
+    // A terminal named in the config that is not there is reported as that, rather
+    // than quietly launching a different one.
+    snprintf(app->term_pref, sizeof(app->term_pref), "not-installed-term");
+    edit_cursor(app);
+    CHECK(strstr(app->status_msg, "not-installed-term") != nullptr);
+    CHECK(strstr(app->status_msg, "config") != nullptr);
+    snprintf(app->term_pref, sizeof(app->term_pref), "");
+
+    // And the message for a machine with no terminal at now says what it looked for and
+    // how to name one, instead of naming the editor.
+    setenv("PATH", "/nonexistent-dir-xyz", 1);
+    edit_cursor(app);
+    CHECK(strstr(app->status_msg, "No terminal emulator found") != nullptr);
+    CHECK(strstr(app->status_msg, "terminal =") != nullptr);
+    CHECK(strstr(app->status_msg, "$TERMINAL") != nullptr);
+
+    if (!keep_path.empty()) setenv("PATH", keep_path.c_str(), 1); else unsetenv("PATH");
+    remove(log.c_str());
+
+    p.view.clear();
+    p.marked.clear();
+    p.dir_size.clear();
+    p.selected = 0;
+    free_entries(p.entries, p.entry_count);
+    p.entries = nullptr;
+    p.entry_count = 0;
+    p.current_dir[0] = '\0';
+    app->confirm = CONF_NONE;
+    app->confirm_text[0] = '\0';
+    app->pending_edit_path[0] = '\0';
+}
+
 int main() {
     char tmpl[] = "/tmp/mc-clone-test-XXXXXX";
     const char* dir = mkdtemp(tmpl);
@@ -5515,6 +5710,7 @@ int main() {
     test_tab_bar_click(&app, root);
     test_path_normalization(&app, p, root);
     test_preview_codepage(&app, root);
+    test_f4_terminal_and_binary(&app, root);
     sh("rm -rf '" + root + "/out'");
 
     free_entries(p.entries, p.entry_count);

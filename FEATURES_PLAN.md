@@ -77,11 +77,11 @@ drawn, the quick filter taking the caret with the keys typed straight after
 it, the console's keyboard ownership, backlog, builtins, caps and config
 round-trip, and the buffer-ownership rule that a text field ImGui has the caret in
 must be asked to reload before the app's own write to its buffer is visible) run
-headless — 2179 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` (190 without
-libcurl), 51 in `test-sfv`, 148 in `test-img`, 78 in `test-text`, 12 in `test-texture` and 7 in
-`test-gl-preview`:
-`cmake --build build -j4 && (cd build && ctest)`, which is 9/9 with libcurl, 9/9 without it, and 9/9
-with no decoder fetched either.
+headless — 2223 checks in `test-panes`, 220 in `test-archive`, 344 in `test-remote` (190 without
+libcurl), 51 in `test-sfv`, 148 in `test-img`, 78 in `test-text`, 59 in `test-terminal`, 12 in
+`test-texture` and 7 in `test-gl-preview`:
+`cmake --build build -j4 && (cd build && ctest)`, which is 10/10 with libcurl, 10/10 without it, and
+10/10 with no decoder fetched either.
 Focus is a place where "it compiles" and "it works" part company. ImGui keeps one
 keyboard-focus request per frame and the last one submitted wins, and the command
 line at the bottom of the window asks on every frame - with offset `-1`, which
@@ -1310,3 +1310,61 @@ non-UTF-8 file that really does put four accented capitals side by side, and the
 for that file is the config line. A font without box-drawing glyphs is not something the
 config can fix: the preview says how many characters have no glyph and points at `font =`
 and Options → Fonts and theme.
+
+## 14. "No terminal emulator found for vim", which was not a vim problem
+
+`F4` on a `.so` produced that message, and the wording is why it was confusing: the
+sentence named `$EDITOR` while the thing missing was the terminal. Measured on the
+reporting machine first — `alacritty` 0.17 installed, `vim` and `nvim` both installed,
+and all five names the app probed (`x-terminal-emulator`, `xterm`, `xfce4-terminal`,
+`konsole`, `gnome-terminal`) absent. Nothing was wrong with the editor, the file, or
+the `.so`; the list was too short and the machine's terminal was not in it.
+
+**The argument shape is the part that was never going to work for everyone.** Every one
+of these programs takes a command, and none of them take it the same way: `xterm`,
+`konsole`, `st`, `urxvt` and `alacritty` want `-e prog args`; `gnome-terminal`, `kitty`
+and `foot` refuse a command unless `--` comes first; `wezterm` wants `launch --`;
+`xfce4-terminal` and `terminator` want the whole command as a single string that they
+split themselves, which is where a path containing a space becomes two arguments unless
+it is quoted inside that string. A launcher that assumes one convention does not fail
+loudly on the others — it opens a window that says nothing and closes, which looks like
+a terminal problem rather than a quoting problem. So the shape is a table in
+`src/terminal.cpp` rather than a hardcoded `-e`.
+
+**The name is overridable, and a bad override is reported.** `terminal =` in the config
+first, then `$TERMINAL`, then the table. A config value may carry its own flags
+(`terminal = gnome-terminal --`), because the person who writes that has already worked
+out what their terminal needs. A config value naming a program that does not exist fails
+with a message naming it, rather than quietly launching somebody else's terminal:
+a setting that appears to do nothing is worse than an error. An `$TERMINAL` left over
+from a shell profile *does* fall through to the list, since an environment variable is
+nobody's deliberate choice in the same way a config line is.
+
+**`fs_is_binary_file` and the question it makes possible.** `F4` used to open any file in
+the editor. A `.so` is not text, and vim over it produces mojibake that a careless write
+turns into a destroyed library, so it now says what the file is — the ELF header's own
+`e_type`, read in the endianness the file declares, distinguishes an object file from an
+executable from a shared object — and asks. The classification reads bytes rather than
+the extension, so a `.txt` carrying ELF magic is asked about and a `.so` that is really
+a script is not. The NUL-in-the-head rule it falls back to is the same tell the quick
+view already uses to choose a hex dump, which keeps one definition of "binary" in the
+app.
+
+**Tests, and the harness mistakes worth recording.** `test-terminal` is 59 checks against
+a directory of fake terminals: every argv shape, the lookup order, both overrides, the
+quoting of a filename containing an apostrophe, and the failure messages. `test-panes`
+launches one of those fakes for real and reads the command line back off disk, which is
+the only way to check that what the app *means* to run is what it *runs*. Three things
+the tests got wrong before the code did: `access(X_OK)` is true for every **directory**,
+so a directory named `xterm` on PATH counted as a terminal until `term_which` grew a
+`S_ISREG` check; `std::string(const char*)` stops at the first NUL, so writing a fixture
+with `"text\0more"` in it writes four bytes and not nine; and in a `#!` script `$0` is
+the path the kernel opened, not the `argv[0]` the caller passed, so the fake reports its
+arguments and not its own name. Separately: pointing a test's `PATH` at a directory of
+fakes breaks the test's own `sh` helpers (`mkdir`, `rm`, `stdbuf` vanish) — prepend the
+fake directory instead of replacing `PATH`.
+
+**One wording change that matters on its own.** The failure now says which terminals it
+looked for and that `terminal =` or `$TERMINAL` is the answer, instead of naming the
+editor. The old message was not wrong about the missing thing, it was wrong about which
+thing was missing.

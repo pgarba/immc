@@ -363,6 +363,59 @@ long fs_read_preview(const char* path, char* buf, size_t max_bytes) {
     return (long)n;
 }
 
+// What the head of a file says about what it is. Only the magic numbers people
+// actually meet get a name; everything else that is not text gets the plain answer,
+// because "not a text file" is already the decision that matters.
+bool fs_is_binary_file(const char* path, char* why, size_t why_n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;                      // unreadable is not the same as binary
+    unsigned char head[8192];
+    size_t n = fread(head, 1, sizeof head, f);
+    fclose(f);
+    if (n == 0) return false;                  // an empty file is text, and harmless
+
+    auto name = [&](const char* what) {
+        if (why) snprintf(why, why_n, "%s", what);
+        return true;
+    };
+    auto has = [&](const void* magic, size_t m) {
+        return n >= m && memcmp(head, magic, m) == 0;
+    };
+
+    static const unsigned char elf[4] = {0x7F, 'E', 'L', 'F'};
+    if (has(elf, sizeof elf) && n >= 20) {
+        // e_type is two bytes at offset 16, in the endianness the file itself declares
+        // at offset 5. Naming the kind is the difference between "not text" and
+        // "that .so you are holding is a shared library".
+        const int le = head[5] == 1;
+        const unsigned char t0 = head[16], t1 = head[17];
+        unsigned int etype = le ? (unsigned)t0 | ((unsigned)t1 << 8)
+                                : (unsigned)t1 | ((unsigned)t0 << 8);
+        switch (etype) {
+            case 1: return name("an ELF object file");
+            case 2: return name("an ELF executable");
+            case 3: return name("an ELF shared object");
+            case 4: return name("an ELF core dump");
+            default: return name("an ELF file");
+        }
+    }
+    if (head[0] == 'M' && head[1] == 'Z') return name("a Windows executable");
+    if (has("!<arch>", 7)) return name("an archive (ar)");
+    if (has("%PDF", 4)) return name("a PDF");
+    if (head[0] == 0x1F && head[1] == 0x8B) return name("a compressed file (gzip)");
+    if (has("BZh", 3)) return name("a compressed file (bzip2)");
+    static const unsigned char xz[6] = {0x7A, 0x76, 0x5F, 0x27, 0x2A, 0x01};
+    if (has(xz, sizeof xz)) return name("a compressed file (xz)");
+    if (head[0] == 'P' && head[1] == 'K' && head[2] == 0x03 && head[3] == 0x04)
+        return name("an archive (zip)");
+
+    // The same tell the quick view uses for a hex dump: a NUL byte in the head is not
+    // something a text file has.
+    for (size_t i = 0; i < n; i++)
+        if (head[i] == '\0') return name("not a text file");
+    return false;
+}
+
 // Recursive tree count for the properties dialog. Symlinks are counted but
 // never followed (avoids loops). ndirs counts subdirectories, not the root.
 static void count_tree_recursive(const char* path, long long* total_size,

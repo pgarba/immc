@@ -87,6 +87,11 @@ struct MCConfig {
     // does. An unrecognised word, like a typo, is read as "auto".
     char preview_codepage[16];
 
+    // The terminal F4 runs the editor inside. Empty (default) means the built-in list
+    // of names. It may name any program, and may carry that program's own flags:
+    // "terminal = gnome-terminal --". $TERMINAL is honoured when this is empty.
+    char terminal[128];
+
     // 1 (default): quick view draws a picture as a picture. 0: a picture row gets the
     // hex dump it always got. Here rather than in the Options dialog for the same
     // reason console_save is: it is a switch for the person who wants the old

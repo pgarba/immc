@@ -4,6 +4,7 @@
 #include "proc.h"   // the shared child-process runner: pipe, /dev/null stdin, cancel
 #include "sfv.h"
 #include "text.h"    // .sfv verification: CRC-32 and the parser
+#include "terminal.h" // finding a terminal to run the editor in, and its argument shape
 #include "img.h"     // picture previews: what a file is, and its pixels
 #include "texture.h" // and getting those pixels onto the screen
 #include "theme.h"
@@ -4206,6 +4207,20 @@ static void do_paste(AppPanes* app) {
     do_paste_now(app, OpPlan::OW_OVERWRITE);
 }
 
+// F4 launches a terminal emulator to host the editor; answering a confirm is where a
+// deferred launch runs, so the pair is declared together.
+static void spawn_terminal_editor(AppPanes* app, const char* fullpath);
+
+// Which confirms are three-answer questions and which are plain yes/no. The overwrite
+// questions take Overwrite / Skip / Rename and treat Esc as "cancel the whole
+// operation"; the yes/no ones take Y / N and treat Esc as No. Asked as a question about
+// the kind rather than written as `confirm != CONF_DELETE`, because a yes/no confirm
+// added later would otherwise inherit the overwrite keys without anyone noticing.
+static bool confirm_is_overwrite(int confirm) {
+    return confirm == CONF_OVERWRITE || confirm == CONF_OVERWRITE_MOVE ||
+           confirm == CONF_OVERWRITE_PASTE || confirm == CONF_OVERWRITE_EXTRACT;
+}
+
 static void confirm_answer(AppPanes* app, int answer) {
     int confirm = app->confirm;
     app->confirm = CONF_NONE;
@@ -4251,6 +4266,18 @@ static void confirm_answer(AppPanes* app, int answer) {
         app->sfv_pending_path.clear();
         app->sfv_pending_dir.clear();
         app->sfv_pending_transfer = nullptr;
+        break;
+    case CONF_EDIT_BINARY:
+        // The question exists because a text editor over a shared library produces
+        // gibberish and a save can destroy the file. The path is the one the question
+        // was asked about, not whatever the cursor moved to while it was open.
+        if (answer == CONF_ANS_YES && app->pending_edit_path[0]) {
+            spawn_terminal_editor(app, app->pending_edit_path);
+        } else {
+            snprintf(app->status_msg, sizeof(app->status_msg), "Not edited: %s",
+                     app->pending_edit_path[0] ? app->pending_edit_path : "the file");
+        }
+        app->pending_edit_path[0] = '\0';
         break;
     default: break;
     }
@@ -4570,29 +4597,31 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
 }
 
 // F4: launch $EDITOR inside a terminal emulator so it gets a TTY.
+//
+// The command line is not the same for every terminal - see src/terminal.h - and the
+// old version of this looked for five names, on a machine whose only terminal was
+// alacritty, and then reported the failure by naming the editor: "No terminal emulator
+// found for vim", which reads as a vim problem and is a terminal problem.
 static void spawn_terminal_editor(AppPanes* app, const char* fullpath) {
-    static const char* terms[] = {
-        "x-terminal-emulator", "xterm", "xfce4-terminal", "konsole", "gnome-terminal", nullptr
-    };
-    const char* editor = getenv("EDITOR");
-    if (!editor || !*editor) editor = "vim";
-
-    const char* chosen = nullptr;
-    for (int i = 0; terms[i]; i++) {
-        char probe[256];
-        snprintf(probe, sizeof(probe), "command -v %s >/dev/null 2>&1", terms[i]);
-        if (system(probe) == 0) { chosen = terms[i]; break; }
-    }
-    if (!chosen) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "No terminal emulator found for %s", editor);
+    TermLaunch launch = term_find_launch(app->term_pref, fullpath);
+    if (launch.argv.empty()) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "%s", launch.note.c_str());
         return;
     }
     pid_t pid = fork();
     if (pid == 0) {
-        execlp(chosen, chosen, "-e", editor, fullpath, (char*)nullptr);
+        std::vector<char*> argv;
+        for (std::string& a : launch.argv) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        // Found a moment ago and still unrunnable: a name on PATH that went away, or a
+        // file that is not really executable. Say which one, on stderr, where a
+        // forked child is allowed to say things.
+        fprintf(stderr, "immc: cannot run %s: %s\n", argv[0], strerror(errno));
         _exit(127);
     }
-    snprintf(app->status_msg, sizeof(app->status_msg), "Edit: %s %s (in %s)", editor, fullpath, chosen);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Editing %s with %s in %s",
+             fullpath, term_editor_name(), launch.name.c_str());
 }
 
 // Alt+F3: hand the entry to the desktop's default handler.
@@ -4632,6 +4661,20 @@ static void edit_cursor(AppPanes* app) {
     if (is_directory(e->name, e->mode)) return;
     char full[4100];
     snprintf(full, sizeof(full), "%s/%s", active.current_dir, entry_rel(active, active.selected));
+
+    // A `.so` is not text, and vim over it produces mojibake that a careless write turns
+    // into a destroyed library. Say what the file is and ask, rather than opening it.
+    // The decision is made from the bytes, so a `.txt` with ELF magic in it is asked
+    // about too and a `.so` that is really a script is not.
+    char why[160];
+    if (fs_is_binary_file(full, why, sizeof why)) {
+        app->confirm = CONF_EDIT_BINARY;
+        snprintf(app->confirm_text, sizeof(app->confirm_text),
+                 "%s is %s, not text. Open it in %s anyway?",
+                 e->name, why, term_editor_name());
+        snprintf(app->pending_edit_path, sizeof(app->pending_edit_path), "%s", full);
+        return;
+    }
     spawn_terminal_editor(app, full);
 }
 
@@ -6303,7 +6346,7 @@ static void render_confirm(AppPanes* app) {
                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
     ImGui::TextWrapped("%s", app->confirm_text);
     ImGui::Spacing();
-    const bool overwrite_confirm = app->confirm != CONF_DELETE;
+    const bool overwrite_confirm = confirm_is_overwrite(app->confirm);
     if (app->confirm == CONF_SFV_VERIFY) {
         if (ImGui::Button("Verify")) app->pending_confirm_answer = CONF_ANS_VERIFY;
         ImGui::SameLine();
@@ -8093,6 +8136,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
              cfg->sfv_verify[0] ? cfg->sfv_verify : "ask");
     snprintf(app->preview_codepage, sizeof(app->preview_codepage), "%s",
              cfg->preview_codepage[0] ? cfg->preview_codepage : "auto");
+    snprintf(app->term_pref, sizeof(app->term_pref), "%s", cfg->terminal);
     if (cfg->columns[0]) snprintf(app->columns, sizeof(app->columns), "%s", cfg->columns);
     // A config that never carried these, or carries a 0 from a hand-edited file,
     // leaves the size the app was built with. mc_config_load has already clamped a
@@ -8750,7 +8794,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // to an overwrite question at all: it cancels the operation, which is the
     // promise people already have when a confirm turns out to be the wrong question.
     if (app->confirm != CONF_NONE) {
-        const bool overwrite_confirm = app->confirm != CONF_DELETE;
+        const bool overwrite_confirm = confirm_is_overwrite(app->confirm);
         const bool sfv_confirm = app->confirm == CONF_SFV_VERIFY;
         if (sfv_confirm) {
             // V starts the check, N leaves the files exactly as they are, A changes

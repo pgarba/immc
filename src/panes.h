@@ -366,7 +366,8 @@ enum AppConfirm {
     CONF_OVERWRITE_MOVE, // move (F6) targets that already exist
     CONF_OVERWRITE_PASTE, // clipboard paste (Ctrl+V) targets that already exist
     CONF_OVERWRITE_EXTRACT, // copy (F5) out of an archive onto existing files
-    CONF_SFV_VERIFY    // a download landed in a folder that holds a .sfv
+    CONF_SFV_VERIFY,   // a download landed in a folder that holds a .sfv
+    CONF_EDIT_BINARY   // F4 on a file whose bytes are not text: edit it anyway?
 };
 
 // The answer a confirm's button or key recorded. It is consumed between frames
@@ -623,6 +624,16 @@ public:
     // Copied from the config for the same reason sfv_verify is: the preview code has
     // no config pointer, and the answer must be settled before a worker is started.
     char preview_codepage[16] = "auto";
+
+    // The terminal F4 launches the editor in, straight from `terminal =` in the config.
+    // Empty means the built-in list. Copied for the same reason as preview_codepage:
+    // the launch code has no config pointer.
+    char term_pref[128] = "";
+
+    // Set when the binary-edit question is opened, so answering Yes launches the
+    // editor for the file the question was about rather than whatever the cursor
+    // moved to while it was open.
+    char pending_edit_path[4100] = "";
     // The .sfv the verify offer is asking about, and the transfer it came from. The
     // transfer is kept because "re-fetch the bad ones" needs the plan that fetched
     // them, and a verification started from the menu has no such thing.

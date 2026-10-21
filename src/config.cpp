@@ -39,6 +39,7 @@ void mc_config_default(MCConfig* c) {
     c->console_save = 1;
     snprintf(c->sfv_verify, sizeof(c->sfv_verify), "ask");
     snprintf(c->preview_codepage, sizeof(c->preview_codepage), "auto");
+    c->terminal[0] = '\0';
     c->qv_images = 1;
     c->console_entries.clear();
     c->font[0] = '\0';
@@ -130,6 +131,8 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "sfv_verify"))    snprintf(c->sfv_verify, sizeof(c->sfv_verify), "%s", val);
         else if (!strcmp(key, "preview_codepage"))
             snprintf(c->preview_codepage, sizeof(c->preview_codepage), "%s", val);
+        else if (!strcmp(key, "terminal"))
+            snprintf(c->terminal, sizeof(c->terminal), "%s", val);
         else if (!strcmp(key, "qv_images"))     c->qv_images = atoi(val);
         else if (!strcmp(key, "font"))      snprintf(c->font, sizeof(c->font), "%s", val);
         else if (!strcmp(key, "font_size")) c->font_size = (float)atof(val);
@@ -301,9 +304,14 @@ void mc_config_save(const MCConfig* c) {
         // without box-drawing glyphs shows a line about it in the quick view.
         "\n# How the quick view reads a file that is not UTF-8: auto | utf8 | cp437\n"
         "preview_codepage = %s\n"
+        // F4 runs the editor inside a terminal emulator, because a TUI editor needs a
+        // TTY this window cannot give it. Empty means the built-in list of terminals;
+        // a name here can be any terminal, with the flags that one needs written out.
+        "\n# Terminal for the editor (F4). Empty = the built-in list. $TERMINAL also works\n"
+        "terminal = %s\n"
         "qv_images = %d\n",
         c->console_w, c->console_h, c->console_save, c->sfv_verify,
-        c->preview_codepage, c->qv_images);
+        c->preview_codepage, c->terminal, c->qv_images);
 
     if (c->console_save) {
         fprintf(f,

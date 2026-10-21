@@ -82,7 +82,7 @@ still tested; only the transport answers that this build has no FTP support, and
 
     cd build && ctest
 
-Nine suites, a little over 3,000 checks between them:
+Ten suites, a little over 3,100 checks between them:
 
 | suite | what it covers |
 | --- | --- |
@@ -92,6 +92,7 @@ Nine suites, a little over 3,000 checks between them:
 | `sfv` | CRC-32 against the published check value, and the `.sfv` parser against the forms real files take: comments, names with spaces, checksum-first lines, backslash separators, broken UTF-8 |
 | `img` | picture recognition and decoding: format sniffing from bytes, PNG and BMP fixtures built in the test, all eight EXIF orientations, malformed EXIF, and the size guard that refuses a 9000x9000 header before allocating it |
 | `text` | which alphabet a preview is written in: UTF-8 validation including the forms that look wrong and are not, the CP437 table against its anchors, and the rule that tells an ANSI drawing from a Western European text file in 8 bits |
+| `terminal` | the search for a terminal to run the editor in, and the exact command line each one wants: `-e` for xterm and konsole, `--` for gnome-terminal, kitty and foot, one quoted string for xfce4-terminal, and the config or `$TERMINAL` overriding the whole list |
 | `texture` | the GL texture upload, against a real context, including the way out when there is no context at all |
 | `gl-preview` | the whole feature on screen: a fixture decoded, cached, textured, drawn by the real renderer, and read back out of the framebuffer as magenta pixels |
 | `version` | `mc-clone --version`, which runs before SDL is initialised |
@@ -136,7 +137,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor — including one on a site or inside an archive, and an old `.nfo` read as CP437 when it looks like a drawing |
 | `Ctrl+Q` | quick view as a pane, instead of a file pane |
 | `Alt+F3` | open with the desktop's default program |
-| `F4` | edit in the terminal editor |
+| `F4` | edit in the terminal editor — it asks first if the file's bytes are not text |
 | `F5` `F6` | copy, move — a dialog first, and `Tab` walks it |
 | `Y` `N` `R` | when a target already exists: overwrite it, leave it alone, or write beside it (`report.pdf` → `report (2).pdf`). `Esc` cancels the operation instead |
 | `F7` | new folder |
@@ -301,6 +302,34 @@ When the guess matters and is wrong, the config says which way:
 The same decision is made for the internal viewer, so a file you view is not the one place
 that still shows the wrong characters.
 
+## F4, and the terminal it runs the editor in
+
+`F4` cannot put `vim` inside its own window: a TUI editor needs a TTY, and a window it
+ draws itself does not have one. So it launches a terminal emulator and puts the editor
+ inside it. Two things were wrong about that.
+
+The old code looked for five names - `x-terminal-emulator`, `xterm`, `xfce4-terminal`,
+`konsole`, `gnome-terminal` - and when none existed it printed "No terminal emulator
+found for vim", which points at the editor while the terminal is what is missing. A
+machine whose only terminal is `alacritty`, `kitty`, `foot` or `wezterm` had no way to
+say so. Now the list is longer, `$TERMINAL` is honoured, and the config can name any
+program at all:
+
+    terminal =                 # empty = the built-in list
+    terminal = alacritty       # a name you have
+    terminal = gnome-terminal --    # a name plus the flags that one needs
+
+Each known terminal is asked in the shape it actually takes, because they are not
+interchangeable: `xterm` and `konsole` want `-e prog args`, `gnome-terminal`, `kitty`
+and `foot` refuse a command unless `--` comes first, `wezterm` wants `launch --`, and
+`xfce4-terminal` and `terminator` want the whole command as one string they split
+themselves. Getting that wrong opens a window that says nothing and closes.
+
+`F4` also asks before opening a file whose bytes are not text - it says what the file
+is (`an ELF shared object`, `a PDF`, `an archive (zip)`, `not a text file`) and waits
+for Y or N, because a text editor over a library produces gibberish that a careless
+write turns into a destroyed file. `F3` is the look, `Alt+F3` is the desktop's handler.
+
 `utf8` never transcodes anything. `cp437` transcodes everything, which is what a drawing the rule missed needs.
 
 The last piece is the font, and it is the one the config cannot fix for you. The
@@ -325,9 +354,10 @@ preview naming the count of characters with no glyph. Pick a font that carries t
     src/img.*            picture recognition, decoding, EXIF orientation, downscaling
     src/texture.*        decoded pixels to a GL texture, and back out again
     src/text.*           UTF-8 validation and the CP437 transcode the quick view reads old text in
+    src/terminal.*       finding a terminal for the editor, and the command line each one wants
     src/config.*         ~/.config/mc-clone/config, and the 0600 sites file beside it
     src/theme.*          eight themes and the accent colours the panes draw with
-    tests/               the nine suites, the FTP fixture, and the pictures the
+    tests/               the ten suites, the FTP fixture, and the pictures the
                          picture tests build for themselves
     scripts/get-deps.sh  the pinned Dear ImGui checkout and the pinned stb_image.h
     FEATURES_PLAN.md     the project's own record: what landed, what was refused, and why
@@ -347,7 +377,8 @@ preview naming the count of characters with no glyph. Pick a font that carries t
 - **The console has no terminal to give a command.** stdout and stderr come back,
   stdin is `/dev/null`, so a tool that wants a password or a TTY (`vim`, `ssh`,
   `less`) fails immediately instead of waiting for one. `F4` is the answer for
-  editors: it forks a terminal emulator so the editor gets a real TTY.
+  editors: it forks a terminal emulator so the editor gets a real TTY, and the
+  emulator it picks is `terminal =` in the config, then `$TERMINAL`, then its own list.
 - **Resume is only as good as the server.** A download keeps its bytes in
   `<name>.part` and continues from there when the server honours `REST`; an upload
   continues with `APPE`. If the finished length does not match the file on the

@@ -91,7 +91,7 @@ else()
 endif()
 
 # Build the application
-add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp ${MC_REMOTE_SOURCES})
+add_executable(mc-clone src/main.cpp src/panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp src/terminal.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(mc-clone PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(mc-clone PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
 if (MC_STB_FOUND)
@@ -102,7 +102,7 @@ endif()
 # helpers (quick filter, row->entry view map, marking, clipboard paths) can be
 # checked without a display.
 enable_testing()
-add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp ${MC_REMOTE_SOURCES})
+add_executable(test-panes tests/test_panes.cpp src/filesystem.cpp src/config.cpp src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp src/terminal.cpp ${MC_REMOTE_SOURCES})
 target_link_libraries(test-panes PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(test-panes PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
 target_compile_definitions(test-panes PRIVATE
@@ -168,6 +168,11 @@ add_executable(test-text tests/test_text.cpp src/text.cpp)
 target_include_directories(test-text PRIVATE src)
 add_test(NAME text COMMAND test-text)
 
+# Finding a terminal to run an editor in, and the command line each one actually wants.
+add_executable(test-terminal tests/test_terminal.cpp src/terminal.cpp)
+target_include_directories(test-terminal PRIVATE src)
+add_test(NAME terminal COMMAND test-terminal)
+
 # The texture upload, against a real GL context. On a machine with no screen it says
 # so and passes; on one with a screen it uploads the pixels a decoder produced.
 add_executable(test-texture tests/test_texture.cpp src/img.cpp src/sfv.cpp src/texture.cpp)
@@ -182,7 +187,7 @@ add_test(NAME texture COMMAND test-texture)
 # real renderer, then read back out of the framebuffer. Skips itself where there is no
 # display.
 add_executable(test-gl-preview tests/test_gl_preview.cpp src/filesystem.cpp src/config.cpp
-    src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp
+    src/theme.cpp src/archive.cpp src/proc.cpp src/sfv.cpp src/img.cpp src/texture.cpp src/text.cpp src/terminal.cpp
     ${MC_REMOTE_SOURCES})
 target_link_libraries(test-gl-preview PRIVATE imgui ${MC_REMOTE_LIBS} Threads::Threads)
 target_include_directories(test-gl-preview PRIVATE src ${CMAKE_BINARY_DIR}/generated ${STB_DIR})
