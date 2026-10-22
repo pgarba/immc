@@ -9,18 +9,25 @@
 // nobody anything.
 
 #include "../src/remote.h"
+#include "../src/xfer.h"
+#include "test_os.h"
 
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <poll.h>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include "proc.h"
+#else
+#include <poll.h>
 #include <sys/wait.h>
+#endif
 #include <thread>
 #include <time.h>
 #include <unistd.h>
@@ -78,7 +85,7 @@ static int mode_of(const std::string& p) {
     return stat(p.c_str(), &st) == 0 ? (int)(st.st_mode & 07777) : -1;
 }
 
-static void sh(const std::string& cmd) { int rc = system(cmd.c_str()); (void)rc; }
+static void sh(const std::string& cmd) { int rc = test_system(cmd); (void)rc; }
 
 static std::string q(const std::string& s) {
     std::string out = "'";
@@ -404,14 +411,10 @@ static void test_sites_file(void) {
     // The file holds passwords, so it is pointed at a temporary HOME instead of
     // the real one, and what matters is checked there: the mode it is created
     // with, and whether a password is written at all.
-    char tmp[] = "/tmp/mc-remote-sites-XXXXXX";
-    const char* dir = mkdtemp(tmp);
-    CHECK(dir != nullptr);
-    if (!dir) return;
-
-    const char* home = getenv("HOME");
-    std::string saved_home = home ? home : "";
-    setenv("HOME", dir, 1);
+    const std::string dir = test_mkdtemp("mc-remote-sites");
+    CHECK(!dir.empty());
+    if (dir.empty()) return;
+    auto test_home = std::make_unique<TestHome>(dir);
 
     std::vector<NetSite> sites;
     NetSite a;
@@ -432,6 +435,7 @@ static void test_sites_file(void) {
     b.user = "carol";
     b.password = "notsaved";
     b.remember = false;
+    b.threads = 5;
     sites.push_back(b);
 
     NetSite c;
@@ -440,6 +444,7 @@ static void test_sites_file(void) {
     c.host = "old.example.org";
     c.verify_tls = false;
     c.passive = false;
+    c.rar_order = true;
     sites.push_back(c);
 
     std::string err;
@@ -447,8 +452,10 @@ static void test_sites_file(void) {
 
     std::string path = net_sites_path();
     CHECK(exists(path));
+#ifndef _WIN32
     // The main config is world-readable; this file must not be.
     CHECK((mode_of(path) & 0777) == 0600);
+#endif
 
     std::string body = read_file(path);
     CHECK(body.find("hunter2") != std::string::npos);
@@ -462,10 +469,14 @@ static void test_sites_file(void) {
         CHECK(back[0].name == "Files" && back[0].password == "hunter2" && back[0].remember);
         CHECK(back[0].proto == NET_FTPS && back[0].path == "/pub");
         CHECK(back[1].proto == NET_SFTP && back[1].port == 2222);
+        CHECK(back[1].threads == 5);
+        CHECK(back[0].threads == 2);          // the default, written and read back
         CHECK(back[1].password.empty());
         CHECK(back[2].proto == NET_FTPS_IMPLICIT);
         CHECK(back[2].verify_tls == false);
         CHECK(back[2].passive == false);
+        CHECK(back[2].rar_order);
+        CHECK(!back[0].rar_order);            // off unless a site asks for it
     }
 
     // A lookup by root URL is how a restart puts the password back in a pane.
@@ -485,8 +496,250 @@ static void test_sites_file(void) {
     CHECK(net_sites_load(&back, &err));
     CHECK(back.size() == 1 && back[0].host == "future.example" && back[0].port == 2121);
 
-    if (!saved_home.empty()) setenv("HOME", saved_home.c_str(), 1);
-    sh("rm -rf " + q(std::string(dir)));
+    test_home.reset();
+    sh("rm -rf " + q(dir));
+}
+
+// RAR volumes in the order an unpacker reads them. Both namings, both cases, and
+// the names that only look like volumes.
+static void test_rar_order(void) {
+    std::string set;
+    int idx = -1;
+    CHECK(xfer_rar_volume("Movie.rar", &set, &idx) && set == "movie" && idx == 0);
+    CHECK(xfer_rar_volume("movie.r00", &set, &idx) && set == "movie" && idx == 1);
+    CHECK(xfer_rar_volume("movie.r99", &set, &idx) && idx == 100);
+    CHECK(xfer_rar_volume("MOVIE.S00", &set, &idx) && set == "movie" && idx == 101);
+    CHECK(xfer_rar_volume("movie.t05", &set, &idx) && idx == 206);
+    CHECK(xfer_rar_volume("show.part1.rar", &set, &idx) && set == "show" && idx == 1);
+    CHECK(xfer_rar_volume("show.part010.rar", &set, &idx) && set == "show" && idx == 10);
+    CHECK(xfer_rar_volume("a.b.c.rar", &set, &idx) && set == "a.b.c" && idx == 0);
+    CHECK(!xfer_rar_volume("movie.sfv", &set, &idx));
+    CHECK(!xfer_rar_volume("movie.nfo", &set, &idx));
+    CHECK(!xfer_rar_volume("movie.r0", &set, &idx));     // two digits, not one
+    CHECK(!xfer_rar_volume("movie.q00", &set, &idx));    // before .r is not a volume
+    CHECK(!xfer_rar_volume(".rar", &set, &idx));         // a name, not an extension
+    CHECK(!xfer_rar_volume("movie.mp4", &set, &idx));
+
+    // A listing in the server's order: alphabetical, which puts .rar after every
+    // .rNN and .s00 before .r10's successors. Two folders, two sets in the first.
+    auto item = [](const std::string& remote) {
+        XferItem it;
+        it.download = true;
+        it.remote = remote;
+        return it;
+    };
+    std::vector<XferItem> items = {
+        item("/rel/a.r00"), item("/rel/a.r01"), item("/rel/a.rar"), item("/rel/a.s00"),
+        item("/rel/a.sfv"), item("/rel/b.part2.rar"), item("/rel/b.part10.rar"),
+        item("/rel/b.part1.rar"), item("/rel/a.nfo"),
+        item("/rel/Sample/s.r00"), item("/rel/Sample/s.rar"),
+    };
+    xfer_order_rar(&items);
+    std::vector<std::string> got;
+    for (const XferItem& it : items) got.push_back(it.remote);
+    std::vector<std::string> want = {
+        "/rel/a.sfv", "/rel/a.nfo",                                   // the rest first
+        "/rel/a.rar", "/rel/a.r00", "/rel/a.r01", "/rel/a.s00",       // set a in order
+        "/rel/b.part1.rar", "/rel/b.part2.rar", "/rel/b.part10.rar", // set b in order
+        "/rel/Sample/s.rar", "/rel/Sample/s.r00",                     // the folder after
+    };
+    CHECK(got == want);
+
+    // An upload is ordered by the local names, which are the ones it has.
+    std::vector<XferItem> up(2);
+    up[0].download = false; up[0].local = "C:/x/v.r00"; up[0].remote = "/zz";
+    up[1].download = false; up[1].local = "C:/x/v.rar"; up[1].remote = "/aa";
+    xfer_order_rar(&up);
+    CHECK(up[0].local == "C:/x/v.rar" && up[1].local == "C:/x/v.r00");
+}
+
+// FileZilla's sitemanager.xml, written the way FileZilla 3 writes it: sites at
+// the top and inside nested folders, every protocol it numbers, and each way it
+// keeps (or does not keep) a password.
+static const char* kFileZillaXml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<!-- written by FileZilla -->
+<FileZilla3 version="3.67.1" platform="windows">
+    <Servers>
+        <Server>
+            <Host>ftp.example.org</Host>
+            <Port>21</Port>
+            <Protocol>0</Protocol>
+            <Type>0</Type>
+            <User>bob</User>
+            <Pass encoding="base64">aHVudGVyMg==</Pass>
+            <Logontype>1</Logontype>
+            <PasvMode>MODE_DEFAULT</PasvMode>
+            <EncodingType>Auto</EncodingType>
+            <BypassProxy>0</BypassProxy>
+            <Name>Plain &amp; simple</Name>
+            <RemoteDir>1 0 3 pub 8 my files</RemoteDir>
+            <SyncBrowsing>0</SyncBrowsing>
+        </Server>
+        <Folder expanded="1">Work
+            <Server>
+                <Host>sftp.example.org</Host>
+                <Port>2222</Port>
+                <Protocol>1</Protocol>
+                <Type>0</Type>
+                <User>carol</User>
+                <Logontype>2</Logontype>
+                <PasvMode>MODE_DEFAULT</PasvMode>
+                <MaximumMultipleConnections>4</MaximumMultipleConnections>
+                <Name>Deploy</Name>
+            </Server>
+            <Folder expanded="0">Old
+                <Server>
+                    <Host>legacy.example.org</Host>
+                    <Port>990</Port>
+                    <Protocol>3</Protocol>
+                    <Logontype>1</Logontype>
+                    <User>dave</User>
+                    <Pass encoding="crypt" pubkey="0123abcd">c2VjcmV0</Pass>
+                    <PasvMode>MODE_ACTIVE</PasvMode>
+                    <Name>Gr&#252;&#223;e</Name>
+                </Server>
+            </Folder>
+        </Folder>
+        <Server>
+            <Host>tls.example.org</Host>
+            <Port>21</Port>
+            <Protocol>4</Protocol>
+            <Logontype>0</Logontype>
+            <User>anonymous</User>
+            <Name>Explicit</Name>
+            <RemoteDir />
+        </Server>
+        <Server>
+            <Host>bucket.s3.amazonaws.com</Host>
+            <Port>443</Port>
+            <Protocol>7</Protocol>
+            <Logontype>1</Logontype>
+            <Name>Not FTP</Name>
+        </Server>
+        <Server>
+            <Host>keys.example.org</Host>
+            <Port>22</Port>
+            <Protocol>1</Protocol>
+            <Logontype>5</Logontype>
+            <User>erin</User>
+            <Keyfile>C:\keys\erin.ppk</Keyfile>
+            <Name>With a key</Name>
+        </Server>
+    </Servers>
+</FileZilla3>
+)";
+
+static const NetImported* find_import(const std::vector<NetImported>& v, const char* name) {
+    for (const NetImported& i : v)
+        if (i.site.name == name) return &i;
+    return nullptr;
+}
+
+static void test_filezilla_import(void) {
+    std::vector<NetImported> sites;
+    int skipped = -1;
+    std::string err;
+    CHECK(net_filezilla_parse(kFileZillaXml, &sites, &skipped, &err));
+    CHECK(err.empty());
+    CHECK(sites.size() == 5);
+    CHECK(skipped == 1);                                // the S3 bucket
+    CHECK(find_import(sites, "Not FTP") == nullptr);
+
+    // Plain FTP: the base64 password comes across, remembered; the port that is
+    // the protocol's own is left implicit; the path keeps its space.
+    const NetImported* plain = find_import(sites, "Plain & simple");
+    CHECK(plain != nullptr);
+    if (plain) {
+        CHECK(plain->site.proto == NET_FTP);
+        CHECK(plain->site.host == "ftp.example.org");
+        CHECK(plain->site.port == 0);
+        CHECK(plain->site.user == "bob");
+        CHECK(plain->site.password == "hunter2");
+        CHECK(plain->site.remember);
+        CHECK(plain->site.passive);
+        CHECK(plain->site.path == "/pub/my files");
+        CHECK(plain->note.empty());
+        CHECK(plain->site.threads == 2);      // no limit of its own: the default
+    }
+
+    // In a folder, a password FileZilla asks for each time: no password, a note.
+    const NetImported* deploy = find_import(sites, "Work/Deploy");
+    CHECK(deploy != nullptr);
+    if (deploy) {
+        CHECK(deploy->site.proto == NET_SFTP);
+        CHECK(deploy->site.port == 2222);
+        CHECK(deploy->site.user == "carol");
+        CHECK(deploy->site.password.empty() && !deploy->site.remember);
+        CHECK(deploy->site.threads == 4);     // the site's own connection limit
+        CHECK(!deploy->note.empty());
+    }
+
+    // Two folders deep, a numeric entity in the name, implicit FTPS on its own
+    // port, active mode, and a password under the master password: not decoded.
+    const NetImported* old = find_import(sites, "Work/Old/Grüße");
+    CHECK(old != nullptr);
+    if (old) {
+        CHECK(old->site.proto == NET_FTPS_IMPLICIT);
+        CHECK(old->site.port == 0);
+        CHECK(!old->site.passive);
+        CHECK(old->site.password.empty() && !old->site.remember);
+        CHECK(old->note.find("master password") != std::string::npos);
+    }
+
+    // Anonymous: the user FileZilla shows is not a login to carry over.
+    const NetImported* tls = find_import(sites, "Explicit");
+    CHECK(tls != nullptr);
+    if (tls) {
+        CHECK(tls->site.proto == NET_FTPS);
+        CHECK(tls->site.user.empty());
+        CHECK(tls->site.path.empty());
+        CHECK(tls->site.verify_tls);
+    }
+
+    const NetImported* key = find_import(sites, "With a key");
+    CHECK(key != nullptr);
+    if (key) {
+        CHECK(key->site.proto == NET_SFTP && key->site.user == "erin");
+        CHECK(key->note.find("key file") != std::string::npos);
+    }
+
+    // What is not a site manager says so instead of importing nothing silently.
+    CHECK(!net_filezilla_parse("<FileZilla3><Servers><Server>", &sites, &skipped, &err));
+    CHECK(!err.empty());
+    CHECK(!net_filezilla_parse("<?xml version=\"1.0\"?><Other/>", &sites, &skipped, &err));
+    CHECK(err.find("FileZilla") != std::string::npos);
+    CHECK(net_filezilla_parse("<FileZilla3><Servers/></FileZilla3>", &sites, &skipped, &err));
+    CHECK(sites.empty() && skipped == 0);
+
+    // From a file: a byte order mark is not part of the XML, and a missing file
+    // names the path that was looked at.
+    const std::string dir = test_mkdtemp("mc-remote-fz");
+    CHECK(!dir.empty());
+    if (dir.empty()) return;
+    std::string path = dir + "/sitemanager.xml";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f) {
+        fputs("\xEF\xBB\xBF", f);
+        fputs(kFileZillaXml, f);
+        fclose(f);
+    }
+    CHECK(net_filezilla_load(path, &sites, &skipped, &err));
+    CHECK(sites.size() == 5);
+    CHECK(!net_filezilla_load(dir + "/missing.xml", &sites, &skipped, &err));
+    CHECK(err.find("missing.xml") != std::string::npos);
+
+    // Where FileZilla keeps it: under the settings root this system gives it.
+    {
+        TestHome home(dir);
+        std::string where = net_filezilla_path();
+#ifdef _WIN32
+        CHECK(where == dir + "/.config/FileZilla/sitemanager.xml");
+#else
+        const char* xdg = getenv("XDG_CONFIG_HOME");
+        if (!xdg || !*xdg) CHECK(where == dir + "/.config/filezilla/sitemanager.xml");
+#endif
+    }
+    sh("rm -rf " + q(dir));
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +747,9 @@ static void test_sites_file(void) {
 // ---------------------------------------------------------------------------
 
 struct FtpFixture {
+#ifdef _WIN32
+    Proc proc;
+#endif
     pid_t pid = -1;
     int port = 0;
     std::string root;
@@ -510,13 +766,37 @@ bool FtpFixture::start(const std::string& dir, bool want_tls, const char* rest_m
         // that showed up in a listing would confuse the checks below.
         cert = dir + "-tls/cert.pem";
         key = dir + "-tls/key.pem";
+        // MSYS2_ARG_CONV_EXCL keeps Git for Windows' sh from reading /CN=localhost
+        // as a path and rewriting it; it means nothing anywhere else.
         sh("mkdir -p " + q(dir + "-tls") +
-           " && openssl req -x509 -newkey rsa:2048 -keyout " + q(key) +
+           " && MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -keyout " + q(key) +
            " -out " + q(cert) + " -days 1 -nodes -subj /CN=localhost"
            " -addext subjectAltName=IP:127.0.0.1 >/dev/null 2>&1");
         if (!exists(cert) || !exists(key)) return false;
     }
 
+#ifdef _WIN32
+    {
+        // No fork: the server runs through the app's own process runner, which joins
+        // its stderr to stdout. It only writes there when FTP_SERVER_LOG asks it to.
+        std::vector<std::string> argv = { "python", MC_FTP_SERVER, "--root", root,
+                                          "--port", "0", "--user", kUser, "--password", kPass };
+        if (want_tls) { argv.push_back("--cert"); argv.push_back(cert);
+                        argv.push_back("--key"); argv.push_back(key); }
+        if (rest_mode && *rest_mode) argv.push_back(rest_mode);
+        std::string err;
+        if (!proc_start(argv, nullptr, kNoEnv, &proc, &err)) return false;
+        pid = 1;
+        std::string line;
+        char c;
+        while (proc_read(&proc, &c, 1, 10000) == 1 && c != '\n') line.push_back(c);
+        size_t at = line.find("\"port\":");
+        if (at == std::string::npos) { stop(); return false; }
+        port = (int)strtoll(line.c_str() + at + 7, nullptr, 10);
+        if (port <= 0) { stop(); return false; }
+        return true;
+    }
+#else
     int fds[2];
     if (pipe(fds) != 0) return false;
     pid_t child = fork();
@@ -579,14 +859,19 @@ bool FtpFixture::start(const std::string& dir, bool want_tls, const char* rest_m
     port = (int)strtoll(line.c_str() + at + 7, nullptr, 10);
     if (port <= 0) { stop(); return false; }
     return true;
+#endif
 }
 
 void FtpFixture::stop() {
+#ifdef _WIN32
+    if (pid > 0) proc_finish(&proc, true);
+#else
     if (pid > 0) {
         kill(pid, SIGTERM);
         int status = 0;
         waitpid(pid, &status, 0);
     }
+#endif
     pid = -1;
 }
 
@@ -638,7 +923,13 @@ static void test_ftp_listing(FtpFixture& fx) {
     if (hello) {
         CHECK(hello->size == 12);
         CHECK(S_ISREG(hello->mode));
+#ifdef _WIN32
+        // NTFS keeps no mode for the server to report, only the read-only bit:
+        // Python makes every writable file rw-rw-rw-.
+        CHECK((hello->mode & 0777) == 0666);
+#else
         CHECK((hello->mode & 0777) == 0640);
+#endif
         // A listing with no date would sort itself to the top of every date sort.
         CHECK(hello->mtime != 0);
         CHECK(llabs((long long)(time(nullptr) - hello->mtime)) < 3600);
@@ -828,7 +1119,10 @@ static void test_ftp_transfer(FtpFixture& fx) {
 
     CHECK(net_chmod(site, "/renamed.txt", 0600, &err));
     CHECK(net_stat(site, "/renamed.txt", &e, &err));
+#ifndef _WIN32
+    // The SITE CHMOD reached the server either way; only a POSIX one can keep it.
     CHECK((e.mode & 0777) == 0600);
+#endif
 
     CHECK(net_remove(site, "/renamed.txt", false, &err));
     CHECK(!net_stat(site, "/renamed.txt", &e, &err));
@@ -1119,6 +1413,130 @@ static void test_ftp_tls(FtpFixture& fx) {
     CHECK(find_row(rows, "hello.txt") != nullptr);
 }
 
+// The transfer queue: a tree planned into files and moved by several threads at
+// once, each over its own connection. What has to hold is what held when one
+// thread walked the tree - every byte arrives, folders (empty ones too) are made,
+// a resume continues the .part - plus what the queue adds: the job knows its
+// total before it starts, counts every byte once whichever thread moved it, and
+// an abort leaves nothing pending.
+static void test_ftp_queue(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    site.threads = 4;
+    std::string err;
+
+    // Twelve files in three folders, sizes all different so a byte counted twice
+    // or not at all shows up in the total, and one empty folder.
+    long long want_total = 0;
+    for (int i = 0; i < 12; i++) {
+        std::string dir = fx.root + "/qtree/d" + std::to_string(i % 3);
+        sh("mkdir -p " + q(dir));
+        long long size = 50000 + i * 7919;
+        write_file(dir + "/f" + std::to_string(i) + ".bin", std::string((size_t)size, (char)('a' + i)));
+        want_total += size;
+    }
+    sh("mkdir -p " + q(fx.root + "/qtree/empty"));
+
+    const std::string out = fx.root + "-queue";
+    sh("rm -rf " + q(out) + " && mkdir -p " + q(out));
+
+    XferJob job;
+    job.begin(1);
+    std::vector<XferItem> items;
+    CHECK(xfer_plan_download(site, "/qtree", out + "/qtree", &job, 0, false, &items, &err));
+    CHECK(items.size() == 12);
+    CHECK(job.total.load() == want_total);           // known before a byte moves
+    CHECK(job.files_total.load() == 12);
+    CHECK(exists(out + "/qtree/empty"));             // folders are made by the plan
+    xfer_run(&job, site, site.threads, items);
+    CHECK(job.pending == 0);
+    CHECK(job.group_ok(0));
+    CHECK(job.files_done.load() == 12);
+    CHECK(job.done.load() == want_total);            // every byte once
+    bool all_good = true;
+    for (int i = 0; i < 12; i++) {
+        std::string p = out + "/qtree/d" + std::to_string(i % 3) + "/f" + std::to_string(i) + ".bin";
+        if (read_file(p) != std::string((size_t)(50000 + i * 7919), (char)('a' + i))) all_good = false;
+    }
+    CHECK(all_good);
+
+    // The site allowed four, and twelve files are enough work for four: that many
+    // threads were started, and they wait a moment for more before they end.
+    std::vector<XferThreadStat> threads;
+    int queued = -1;
+    xfer_snapshot(&threads, &queued);
+    CHECK(threads.size() == 4);
+    CHECK(queued == 0);
+    long long by_threads = 0;
+    for (const XferThreadStat& s : threads) by_threads += s.bytes;
+    CHECK(by_threads == want_total);                 // and between them moved it all
+
+    // Up again, into a new folder, over three threads.
+    XferJob up;
+    up.begin(1);
+    items.clear();
+    CHECK(xfer_plan_upload(site, out + "/qtree", "/qtree up", &up, 0, false, &items, &err));
+    CHECK(items.size() == 12);
+    xfer_run(&up, site, 3, items);
+    CHECK(up.group_ok(0));
+    CHECK(up.done.load() == want_total);
+    std::vector<FileEntry> rows;
+    CHECK(net_list(site, "/qtree up", &rows, &err));
+    CHECK(find_row(rows, "empty") != nullptr);       // the empty folder went up too
+    CHECK(net_list(site, "/qtree up/d1", &rows, &err));
+    CHECK(rows.size() == 4);
+    const FileEntry* f4 = find_row(rows, "f4.bin");
+    CHECK(f4 && (long long)f4->size == 50000 + 4 * 7919);
+
+    // A resume continues the .part and counts what was already there, so the job
+    // still ends at its total rather than short of it or past it.
+    std::string again = out + "/again";
+    sh("mkdir -p " + q(again));
+    std::string part = again + "/f5.bin.part";
+    long long size5 = 50000 + 5 * 7919;
+    write_file(part, std::string((size_t)(size5 / 2), 'f'));
+    XferJob res;
+    res.begin(1);
+    items.clear();
+    CHECK(xfer_plan_download(site, "/qtree/d2/f5.bin", again + "/f5.bin", &res, 0, true, &items, &err));
+    CHECK(items.size() == 1 && items[0].size == size5);
+    xfer_run(&res, site, 2, items);
+    CHECK(res.group_ok(0));
+    CHECK(read_file(again + "/f5.bin") == std::string((size_t)size5, 'f'));
+    CHECK(res.done.load() == size5);
+
+    // An abort: the job's files that no thread took are dropped from the queue at
+    // once, the job is not left waiting for them, and the group says it failed.
+    XferJob stop;
+    stop.begin(1);
+    items.clear();
+    CHECK(xfer_plan_download(site, "/qtree", out + "/stopped", &stop, 0, false, &items, &err));
+    stop.abort = true;
+    xfer_run(&stop, site, 4, items);
+    CHECK(stop.pending == 0);
+    CHECK(!stop.group_ok(0));
+    CHECK(stop.first_err == "aborted");
+
+    // Two groups in one job: a name whose file cannot be fetched fails alone.
+    XferJob two;
+    two.begin(2);
+    items.clear();
+    CHECK(xfer_plan_download(site, "/qtree/d0/f0.bin", out + "/two-a.bin", &two, 0, false, &items, &err));
+    CHECK(xfer_plan_download(site, "/qtree/no such.bin", out + "/two-b.bin", &two, 1, false, &items, &err));
+    xfer_run(&two, site, 2, items);
+    CHECK(two.group_ok(0));
+    CHECK(!two.group_ok(1));
+    CHECK(!two.first_err.empty());
+
+    // Quit: every thread stops and is joined, and the pools are gone.
+    xfer_shutdown();
+    xfer_snapshot(&threads, &queued);
+    CHECK(threads.empty());
+
+    net_remove_tree(site, "/qtree", nullptr, nullptr, &err);
+    net_remove_tree(site, "/qtree up", nullptr, nullptr, &err);
+    sh("rm -rf " + q(out));
+}
+
 // A wrong password is the server's answer, not a crash and not an empty listing
 // that looks like an empty directory.
 static void test_ftp_bad_login(FtpFixture& fx) {
@@ -1169,7 +1587,11 @@ static void test_without_curl(void) {
 // ---------------------------------------------------------------------------
 
 static bool have_python(void) {
+#ifdef _WIN32
+    int rc = test_system("command -v python >/dev/null 2>&1");
+#else
     int rc = system("command -v python3 >/dev/null 2>&1");
+#endif
     return rc == 0;
 }
 
@@ -1183,6 +1605,8 @@ int main(void) {
     test_list_parser();
     test_mode_from_rwx();
     test_sites_file();
+    test_filezilla_import();
+    test_rar_order();
     test_without_curl();
 
     if (!net_available()) {
@@ -1196,13 +1620,12 @@ int main(void) {
         return failures ? 1 : 0;
     }
 
-    char tmpl[] = "/tmp/mc-remote-ftp-XXXXXX";
-    const char* base = mkdtemp(tmpl);
-    if (!base) {
+    const std::string base = test_mkdtemp("mc-remote-ftp");
+    if (base.empty()) {
         printf("cannot make a temporary root: %s\n", strerror(errno));
         return 1;
     }
-    std::string root = std::string(base) + "/root";
+    std::string root = base + "/root";
     sh("mkdir -p " + q(root + "/sub") +
        " && mkdir -p " + q(root + "/IDA Pro 9.6.261001") +
        " && mkdir -p " + q(root + "/hash#and;percent%") +
@@ -1224,6 +1647,7 @@ int main(void) {
         test_ftp_partial(fx);
         test_ftp_resume(fx);
         test_ftp_concurrent(fx);
+        test_ftp_queue(fx);
         fx.stop();
     }
 
@@ -1257,7 +1681,7 @@ int main(void) {
         printf("openssl is not usable: the TLS tests are skipped\n");
     }
 
-    sh("rm -rf " + q(std::string(base)));
+    sh("rm -rf " + q(base));
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

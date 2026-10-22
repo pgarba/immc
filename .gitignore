@@ -1,5 +1,6 @@
 build/
 build-nocurl/
+build-win/
 extern_dont_commit/
 compile_commands.json
 imgui.ini

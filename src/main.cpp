@@ -4,9 +4,21 @@
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_opengl3.h"
 #include <SDL3/SDL.h>
+// On Windows this supplies the WinMain a GUI-subsystem program starts in, and hands
+// main() its arguments as UTF-8. Elsewhere it is empty.
+#include <SDL3/SDL_main.h>
 #include <SDL3/SDL_opengl.h>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 // Our application code
 #include "panes.h"
@@ -58,8 +70,26 @@ static int print_version(void) {
     return 0;
 }
 
+// The Windows build is a GUI program, so it starts with no console and its stdout
+// goes nowhere. When it was started from one (`mc-clone --version` in a terminal)
+// the text belongs in that terminal. Output already redirected to a file or a pipe,
+// which is how ctest reads it, is left where it was sent.
+static void attach_parent_console(void) {
+#ifdef _WIN32
+    if (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_UNKNOWN) return;
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
+#endif
+}
+
 static int print_usage(const char* argv0) {
     const char* name = strrchr(argv0, '/');
+#ifdef _WIN32
+    const char* bs = strrchr(argv0, '\\');
+    if (bs && (!name || bs > name)) name = bs;
+#endif
     char line[1200];
     snprintf(line, sizeof(line),
              "usage: %s [-v|--version] [-h|--help]\n"
@@ -84,8 +114,14 @@ static float window_pixel_scale(SDL_Window* window)
 int main(int argc, char** argv)
 {
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) return print_version();
-        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))    return print_usage(argv[0]);
+        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+            attach_parent_console();
+            return print_version();
+        }
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            attach_parent_console();
+            return print_usage(argv[0]);
+        }
     }
 
     // Load user configuration (~/.config/mc-clone/config)

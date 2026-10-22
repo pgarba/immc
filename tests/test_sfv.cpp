@@ -3,6 +3,7 @@
 // against the one shape the format description shows.
 
 #include "../src/sfv.h"
+#include "test_os.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,7 @@ static int checks = 0;
     } while (0)
 
 static void sh(const std::string& cmd) {
-    int rc = system(cmd.c_str());
+    int rc = test_system(cmd);
     (void)rc;
 }
 
@@ -191,8 +192,8 @@ static void test_find(const std::string& root) {
 }
 
 int main(void) {
-    char base[] = "/tmp/mc-sfv-XXXXXX";
-    char* dir = mkdtemp(base);
+    std::string tmp_dir = test_mkdtemp("mc-sfv");
+    const char* dir = tmp_dir.empty() ? nullptr : tmp_dir.c_str();
     if (!dir) { printf("cannot make a temp dir\n"); return 1; }
     std::string root(dir);
 

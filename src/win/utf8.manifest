@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The process code page is UTF-8, so fopen() and every other narrow-string CRT and
+     Win32 call take the UTF-8 paths the program passes around as they are. Without it
+     they would be read in the system's ANSI code page, and a file named in Greek or
+     Japanese would not open. Needs Windows 10 1903 or newer. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

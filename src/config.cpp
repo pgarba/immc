@@ -6,10 +6,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "platform.h"
+
 static std::string config_dir() {
-    const char* home = getenv("HOME");
-    if (!home || !*home) return ".mc-clone";
-    return std::string(home) + "/.config/mc-clone";
+    return plat_config_dir();
 }
 
 static std::string config_path() {
@@ -21,11 +21,7 @@ void mc_config_path(char* out, size_t n) {
 }
 
 static void ensure_config_dir() {
-    std::string dir = config_dir();
-    // Create ~/.config and ~/.config/mc-clone (ignore "already exists").
-    std::string parent = dir.substr(0, dir.find_last_of('/'));
-    mkdir(parent.c_str(), 0755);
-    mkdir(dir.c_str(), 0755);
+    plat_make_config_dir();
 }
 
 void mc_config_default(MCConfig* c) {

@@ -7,7 +7,18 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#else
 #include <sys/wait.h>
+#endif
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -33,6 +44,14 @@ void fs_set_sort_mode(int mode) { g_sort_mode = mode; }
 int  fs_get_sort_mode()        { return g_sort_mode; }
 void fs_set_show_hidden(bool s){ g_show_hidden = s; }
 bool fs_get_show_hidden()      { return g_show_hidden; }
+
+bool fs_entry_hidden(const struct dirent* de) {
+    if (de->d_name[0] == '.') return true;
+#ifdef _WIN32
+    if (de->d_attrib & FILE_ATTRIBUTE_HIDDEN) return true;
+#endif
+    return false;
+}
 
 bool fs_exists(const char* path) {
     struct stat st;
@@ -85,7 +104,7 @@ void list_directory(const char* path, FileEntry*** out_entries, int* out_count) 
     int count = 0;
     while ((de = readdir(dir)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!g_show_hidden && de->d_name[0] == '.') continue;
+        if (!g_show_hidden && fs_entry_hidden(de)) continue;
         count++;
     }
     rewinddir(dir);
@@ -111,7 +130,7 @@ void list_directory(const char* path, FileEntry*** out_entries, int* out_count) 
     int i = 1;
     while ((de = readdir(dir)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!g_show_hidden && de->d_name[0] == '.') continue;
+        if (!g_show_hidden && fs_entry_hidden(de)) continue;
         
         char fullpath[4100];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", path, de->d_name);
@@ -166,6 +185,32 @@ bool fs_symlink(const char* src, const char* dst) {
     return symlink(src, dst) == 0;
 }
 
+#ifdef _WIN32
+// TC splits delete into "direkt" and "Papierkorb". On Windows the bin is the shell's:
+// a delete with undo allowed is a move to the Recycle Bin, with no dialog of its own -
+// the app already asked.
+bool fs_trash(const char* path) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (n <= 0) return false;
+    // A list of paths, each NUL-terminated, the whole list ending in one more NUL.
+    std::wstring from((size_t)n + 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, &from[0], n);
+    for (wchar_t& c : from) if (c == L'/') c = L'\\';   // the shell will not take '/'
+    SHFILEOPSTRUCTW op;
+    memset(&op, 0, sizeof op);
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+}
+
+// Every Windows desktop has a Recycle Bin. A volume without one (a network share, a
+// USB stick formatted by something else) makes the shell delete outright, which is
+// the same thing the POSIX side does when no helper is installed.
+bool fs_trash_available(void) {
+    return true;
+}
+#else
 // Run a helper as: prog [sub] path. True only if it exited 0.
 static bool run_helper(const char* prog, const char* sub, const char* path) {
     pid_t pid = fork();
@@ -199,6 +244,7 @@ bool fs_trash_available(void) {
                         "command -v trash-put >/dev/null 2>&1") == 0 ? 1 : 0;
     return cached == 1;
 }
+#endif
 
 // Copy with an optional progress context: totals are computed up-front by the
 // caller (fs_copy_entry_progress), and each completed file reports progress.
@@ -253,7 +299,9 @@ static bool fs_copy_rec(const char* src, const char* dst, fs_copy_ctx* ctx) {
     if (!ok) return false;
 
     chmod(dst, st.st_mode & 0777);
-    struct timespec times[2] = { st.st_mtime, st.st_mtime };
+    // Both braces spelled out: { mtime, mtime } would fill the first timespec's
+    // seconds and nanoseconds and leave the modification time at zero.
+    struct timespec times[2] = { { st.st_mtime, 0 }, { st.st_mtime, 0 } };
     utimensat(AT_FDCWD, dst, times, 0);
 
     if (ctx) {
@@ -343,7 +391,8 @@ bool fs_move_entry(const char* src, const char* dst) {
 
 void format_mode(mode_t mode, char* out) {
     static const char* rwx = "rwx";
-    for (int i = 0; i < 3; i++) {
+    // Owner, group, others, in that order: the owner's triplet is the high one.
+    for (int i = 2; i >= 0; i--) {
         for (int b = 2; b >= 0; b--) {
             *out++ = (mode & (1 << (i * 3 + b))) ? rwx[2 - b] : '-';
         }
@@ -472,7 +521,7 @@ int fs_list_tree(const char* root, std::vector<FsTreeEntry>* out,
         struct dirent* de;
         while ((de = readdir(d))) {
             if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            if (!g_show_hidden && de->d_name[0] == '.') continue;
+            if (!g_show_hidden && fs_entry_hidden(de)) continue;
             char full[4100];
             snprintf(full, sizeof(full), "%s/%s", dir.c_str(), de->d_name);
             struct stat st;
