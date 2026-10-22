@@ -4,6 +4,7 @@
 // skipped rather than failed.
 
 #include "../src/archive.h"
+#include "test_os.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,8 +26,17 @@ static int checks = 0;
         }                                                                  \
     } while (0)
 
+// A member name chosen to be hostile to a shell-out: an apostrophe, a space and the
+// characters a shell would expand. Windows will not store * or ? in a name at all, so
+// there the hostility is cmd's instead: & and %.
+#ifdef _WIN32
+static const char* const kOddName = "we'ird [name] & 50%.txt";
+#else
+static const char* const kOddName = "we'ird*name?.txt";
+#endif
+
 static void sh(const std::string& cmd) {
-    int rc = system(cmd.c_str());
+    int rc = test_system(cmd);
     (void)rc;
 }
 
@@ -160,7 +170,28 @@ static void test_list_synthesizes_dirs(const std::string& root) {
     CHECK(find(v, "a file.txt") != nullptr);
     CHECK(find(v, "sub") != nullptr);
     CHECK(find(v, "sub/deep") != nullptr);
-    CHECK(S_ISDIR(find(v, "sub")->mode));
+    CHECK(find(v, "sub") && S_ISDIR(find(v, "sub")->mode));
+}
+
+// A listing is the tool's whole output, not the tail kept for an error message: an
+// archive with a few hundred members has a listing far longer than that tail, and
+// every member - the first as much as the last - has to become a row.
+static void test_list_long(const std::string& root) {
+    const std::string src = root + "/many";
+    sh("rm -rf " + q(src) + " && mkdir -p " + q(src));
+    for (int i = 0; i < 300; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "/member-%03d.txt", i);
+        write_file(src + name, "x\n");
+    }
+    sh("cd " + q(src) + " && tar cf ../many.tar member-*.txt");
+    std::vector<ArchEntry> v;
+    std::string err;
+    CHECK(arch_list((root + "/many.tar").c_str(), &v, &err));
+    CHECK(v.size() == 300);
+    CHECK(find(v, "member-000.txt") != nullptr);
+    CHECK(find(v, "member-299.txt") != nullptr);
+    sh("rm -rf " + q(src) + " " + q(root + "/many.tar"));
 }
 
 static void test_list_tar(const std::string& root) {
@@ -183,7 +214,7 @@ static void test_list_tar(const std::string& root) {
         CHECK(S_ISDIR(d->mode));
         CHECK(!strcmp(d->raw, "sub/"));
     }
-    CHECK(find(v, "sub/b.log")->mtime != 0);
+    CHECK(find(v, "sub/b.log") && find(v, "sub/b.log")->mtime != 0);
 }
 
 // tar created by packing a directory stores every member under "./". The pane
@@ -258,13 +289,13 @@ static void test_extract_members_with_tricky_names(const std::string& root) {
     std::string out = root + "/out2";
     mkdir(out.c_str(), 0755);
     std::vector<std::string> members;
-    for (const char* m : { "sub/b.log", "we'ird*name?.txt" }) members.push_back(m);
+    for (const char* m : { "sub/b.log", kOddName }) members.push_back(m);
     Prog pr;
     std::string err;
     CHECK(arch_extract_members((root + "/t.zip").c_str(), out.c_str(), members, prog_cb, &pr, &err));
     CHECK(exists(out + "/sub/b.log"));
-    CHECK(exists(out + "/we'ird*name?.txt"));
-    CHECK(filesize(out + "/we'ird*name?.txt") == 3);
+    CHECK(exists(out + "/" + kOddName));
+    CHECK(filesize(out + "/" + kOddName) == 3);
     // Only the requested members came out.
     CHECK(!exists(out + "/a file.txt"));
     sh("rm -rf '" + out + "'");
@@ -456,12 +487,21 @@ static void test_pack_options(const std::string& root) {
     // A password really encrypts: the tool cannot read the archive back without it.
     ArchPackOpts pw = arch_pack_opts_default(ARCH_ZIP);
     pw.password = "hunter2";
+#ifdef _WIN32
+    // tar writes zip on Windows and cannot encrypt one; that is said before anything
+    // is written, and points at the format that can.
+    CHECK(!arch_pack_supported(pw, &why));
+    CHECK(why.find("7z") != std::string::npos);
+    CHECK(!arch_pack_opts((src + "/p.zip").c_str(), src.c_str(), one, pw, nullptr, nullptr, &err));
+    CHECK(!exists(src + "/p.zip"));
+#else
     CHECK(arch_pack_opts((src + "/p.zip").c_str(), src.c_str(), one, pw, nullptr, nullptr, &err));
     sh("mkdir -p " + q(src + "/out"));
     CHECK(!arch_extract((src + "/p.zip").c_str(), (src + "/out").c_str(), nullptr, nullptr, &err));
     CHECK(!exists(src + "/out/f0.txt"));
     sh("cd " + q(src) + " && unzip -q -o -P hunter2 p.zip -d out > /dev/null 2>&1");
     CHECK(exists(src + "/out/f0.txt"));
+#endif
 
     // Refusals happen before anything is written.
     ArchPackOpts bad = arch_pack_opts_default(ARCH_TAR_GZ);
@@ -525,10 +565,8 @@ static void test_extract_temp(const std::string& root) {
 }
 
 int main() {
-    char tmpl[] = "/tmp/mc-clone-arch-XXXXXX";
-    const char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("cannot create temp dir\n"); return 1; }
-    std::string root(dir);
+    std::string root = test_mkdtemp("mc-clone-arch");
+    if (root.empty()) { printf("cannot create temp dir\n"); return 1; }
 
     // Fixture tree. The names are chosen to be hostile to a shell-out: a space,
     // an apostrophe and glob characters. They are written directly, not through
@@ -537,10 +575,16 @@ int main() {
     write_file(root + "/a file.txt", "hello\n");
     write_file(root + "/sub/b.log", "x\n");
     write_file(root + "/sub/deep/c.bin", "yy\n");
-    write_file(root + "/we'ird*name?.txt", "ab\n");
+    write_file(root + "/" + kOddName, "ab\n");
 
-    sh("cd " + q(root) + " && zip -qr t.zip " + q("a file.txt") + " " + q("sub") + " " + q("we'ird*name?.txt"));
+#ifdef _WIN32
+    // No zip on Windows: the zips are written by the tar that reads them there.
+    sh("cd " + q(root) + " && tar -a -cf t.zip " + q("a file.txt") + " " + q("sub") + " " + q(kOddName));
+    sh("cd " + q(root) + " && tar -a -cf files.zip " + q("a file.txt") + " " + q("sub/b.log") + " " + q("sub/deep/c.bin"));
+#else
+    sh("cd " + q(root) + " && zip -qr t.zip " + q("a file.txt") + " " + q("sub") + " " + q(kOddName));
     sh("cd " + q(root) + " && zip -q files.zip " + q("a file.txt") + " " + q("sub/b.log") + " " + q("sub/deep/c.bin"));
+#endif
     sh("cd " + q(root) + " && tar czf t.tar.gz " + q("a file.txt") + " sub");
     sh("cd " + q(root) + " && tar cf t.tar " + q("a file.txt") + " sub");
     sh("cd " + q(root) + " && 7z a -t7z -y t.7z " + q("a file.txt") + " sub >/dev/null");
@@ -553,6 +597,7 @@ int main() {
     test_list_zip(root);
     test_list_synthesizes_dirs(root);
     test_list_tar(root);
+    test_list_long(root);
     test_list_tar_dot_prefix(root);
     test_list_7z(root);
     test_extract_whole(root, "t.zip");

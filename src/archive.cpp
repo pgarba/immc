@@ -10,13 +10,10 @@
 
 #include "archive.h"
 #include "proc.h"
+#include "platform.h"
 
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <poll.h>
-#include <signal.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <dirent.h>
 #include <algorithm>
 #include <cctype>
@@ -104,24 +101,56 @@ static const char* tool_for(ArchKind k) {
     }
 }
 
+#ifdef _WIN32
+static const char kPathSep = ';';
+#else
+static const char kPathSep = ':';
+#endif
+
 static bool path_has_tool(const char* name) {
     const char* path = getenv("PATH");
     if (!path) path = "/usr/local/bin:/usr/bin:/bin";
     std::string p = path;
+#ifdef _WIN32
+    // A program on Windows is found by its name plus one of the extensions the shell
+    // runs: "7z" is 7z.exe.
+    const char* pathext = getenv("PATHEXT");
+    std::vector<std::string> exts;
+    std::string pe = (pathext && *pathext) ? pathext : ".COM;.EXE;.BAT;.CMD";
+    for (size_t a = 0; a <= pe.size();) {
+        size_t b = pe.find(';', a);
+        if (b == std::string::npos) b = pe.size();
+        if (b > a) exts.push_back(pe.substr(a, b - a));
+        a = b + 1;
+    }
+#else
+    const std::vector<std::string> exts = { "" };
+#endif
     size_t i = 0;
     while (i <= p.size()) {
-        size_t j = p.find(':', i);
+        size_t j = p.find(kPathSep, i);
         if (j == std::string::npos) j = p.size();
         std::string cand = p.substr(i, j - i);
         if (cand.empty()) cand = ".";
-        if (cand.back() != '/') cand += '/';
+        if (cand.back() != '/' && cand.back() != '\\') cand += '/';
         cand += name;
-        if (access(cand.c_str(), X_OK) == 0) return true;
+        for (const std::string& e : exts)
+            if (access((cand + e).c_str(), X_OK) == 0) return true;
         i = j + 1;
         if (j == p.size()) break;
     }
     return false;
 }
+
+// Windows has no zip or unzip, but every Windows since 10 has bsdtar in System32, and
+// libarchive under it reads and writes zip. So there a zip is listed, unpacked, packed
+// and tested by tar, with tar's command lines and tar's listing - the same tool on
+// every machine, rather than whichever unzip happened to be on PATH.
+#ifdef _WIN32
+static const bool kZipByTar = true;
+#else
+static const bool kZipByTar = false;
+#endif
 
 bool arch_tool_available(ArchKind k) {
     static std::map<ArchKind, bool> cache;
@@ -130,7 +159,7 @@ bool arch_tool_available(ArchKind k) {
 
     bool ok = false;
     switch (k) {
-    case ARCH_ZIP:     ok = path_has_tool("unzip"); break;
+    case ARCH_ZIP:     ok = path_has_tool(kZipByTar ? "tar" : "unzip"); break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
@@ -145,7 +174,7 @@ bool arch_tool_available(ArchKind k) {
 
 bool arch_can_pack(ArchKind k) {
     switch (k) {
-    case ARCH_ZIP:     return path_has_tool("zip");
+    case ARCH_ZIP:     return path_has_tool(kZipByTar ? "tar" : "zip");
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
@@ -202,7 +231,10 @@ bool arch_pack_supported(const ArchPackOpts& opts, std::string* why) {
         *why = "a plain .tar is not compressed, so a level means nothing";
         return false;
     }
-    if (!opts.password.empty() && !is_tar) {
+    if (!opts.password.empty() && opts.kind == ARCH_ZIP && kZipByTar) {
+        *why = "zip is written by tar here, which cannot encrypt; choose 7z for a password";
+        return false;
+    } else if (!opts.password.empty() && !is_tar) {
         // fine for zip/7z
     } else if (!opts.password.empty() && is_tar) {
         *why = "tar cannot encrypt; choose zip or 7z for a password";
@@ -331,28 +363,32 @@ static void feed(Progress* pr, const std::string& line) {
 }
 
 // Run a tool, streaming its output through `pr`. Returns the exit status, or
-// -1 if the process could not be started. `out` collects everything printed.
+// -1 if the process could not be started. `out` collects the tail of what was
+// printed - enough for the line that explains a failure - or, with keep_all, every
+// byte of it, which is what a listing needs.
 static int run_stream(const std::vector<std::string>& argv, const char* cwd,
                       const std::vector<std::string>& env,
-                      Progress* pr, std::string* out, std::string* err) {
+                      Progress* pr, std::string* out, std::string* err,
+                      bool keep_all = false) {
     Proc p;
+#ifdef _WIN32
+    // 7-Zip writes names it cannot put in the console's code page as '_' unless told
+    // to write UTF-8; the switch goes straight after the command letter, before any
+    // "--" that ends the switches.
+    std::vector<std::string> args = argv;
+    if (args.size() >= 2 && args[0] == "7z") args.insert(args.begin() + 2, "-sccUTF-8");
+    if (!proc_start(args, cwd, env, &p, err)) return -1;
+#else
     if (!proc_start(argv, cwd, env, &p, err)) return -1;
+#endif
 
     std::string pending;   // partial line across reads
     char buf[4096];
     bool aborted = false;
 
     for (;;) {
-        struct pollfd pf;
-        pf.fd = p.fd;
-        pf.events = POLLIN;
-        pf.revents = 0;
-        int r = poll(&pf, 1, 100);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (r == 0) {
+        long n = proc_read(&p, buf, sizeof(buf), 100);
+        if (n == -1) {
             // Nothing to read: keep the dialog alive so a long single-file
             // operation does not look like a freeze.
             unsigned long long t = now_ms();
@@ -362,33 +398,31 @@ static int run_stream(const std::vector<std::string>& argv, const char* cwd,
             }
             continue;
         }
-        ssize_t n = read(p.fd, buf, sizeof(buf));
-        if (n > 0) {
-            tail_append(out, buf, (size_t)n);
-            pending.append(buf, (size_t)n);
-            // Tools separate progress updates with '\r' as well as '\n'.
-            size_t nl;
-            while ((nl = pending.find_first_of("\r\n")) != std::string::npos) {
-                std::string line = pending.substr(0, nl);
-                pending.erase(0, nl + 1);
-                size_t a = line.find_first_not_of(" \t");
-                if (a != std::string::npos) line.erase(0, a);
-                feed(pr, line);
-            }
-            if (!pr->emit()) { aborted = true; break; }
-        } else if (n == 0) {
-            break;                      // EOF: the tool is done
-        } else {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+        if (n <= 0) break;              // EOF: the tool is done (or the pipe failed)
+        if (keep_all) out->append(buf, (size_t)n);
+        else tail_append(out, buf, (size_t)n);
+        pending.append(buf, (size_t)n);
+        // Tools separate progress updates with '\r' as well as '\n'.
+        size_t nl;
+        while ((nl = pending.find_first_of("\r\n")) != std::string::npos) {
+            std::string line = pending.substr(0, nl);
+            pending.erase(0, nl + 1);
+            size_t a = line.find_first_not_of(" \t");
+            if (a != std::string::npos) line.erase(0, a);
+            feed(pr, line);
         }
+        if (!pr->emit()) { aborted = true; break; }
     }
     if (!pending.empty()) { feed(pr, pending); pending.clear(); }
     if (!aborted) { pr->done_bytes = pr->total_bytes; pr->done_files = pr->total_files; }
-    close(p.fd);
     int st = proc_finish(&p, aborted);
     pr->aborted = aborted;
     if (aborted) *err = "aborted";
+#ifdef _WIN32
+    // Windows' tar prints member names in the ANSI code page. The names handed back
+    // to it go through its wide command line, which it turns back into that page.
+    if (argv[0] == "tar") *out = plat_from_ansi(*out);
+#endif
     return st;
 }
 
@@ -398,7 +432,7 @@ static int run_capture(const std::vector<std::string>& argv, const char* cwd,
                        std::string* out, std::string* err) {
     Progress pr;
     pr.mode = UNIT_ANY;
-    return run_stream(argv, cwd, kNoEnv, &pr, out, err);
+    return run_stream(argv, cwd, kNoEnv, &pr, out, err, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +476,9 @@ static std::vector<std::string> split_lines(const std::string& s) {
         size_t nl = s.find_first_of("\r\n", i);
         if (nl == std::string::npos) { out.push_back(s.substr(i)); break; }
         out.push_back(s.substr(i, nl - i));
-        i = nl + 1;
+        // "\r\n" is one line end, not a line end and an empty line: tools on Windows
+        // end every line that way, and an empty line means something to the 7z reader.
+        i = nl + ((s[nl] == '\r' && nl + 1 < s.size() && s[nl + 1] == '\n') ? 2 : 1);
     }
     return out;
 }
@@ -487,11 +523,81 @@ static bool parse_unzip_list(const std::string& out, std::vector<ArchEntry>* out
 // tar -tvf:
 //   drwxr-xr-x adam/adam         0 2026-10-09 08:06 sub/
 //   -rw-r--r-- adam/adam         6 2026-10-09 08:07 a file.txt
+// bsdtar -tv, which is the tar on Windows and on the BSDs, writes ls -l instead:
+//   -rw-r--r--  0 adam   staff       6 Oct  9 08:06 a file.txt
+//   drwxr-xr-x  0 adam   staff       0 Oct  9  2025 sub/
+// The time is a year for a date that is not recent. Returns false when the line is
+// not in that shape, so the GNU reading gets its turn.
+static bool parse_bsdtar_line(const std::string& line, ArchEntry* e) {
+    std::vector<std::pair<size_t, std::string>> w;   // where each word starts, and the word
+    size_t i = 0;
+    while (i < line.size() && w.size() < 8) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+        size_t start = i;
+        while (i < line.size() && line[i] != ' ' && line[i] != '\t') i++;
+        if (i > start) w.push_back({ start, line.substr(start, i - start) });
+    }
+    if (w.size() < 8) return false;
+    if (w[1].second.find_first_not_of("0123456789") != std::string::npos) return false;
+    static const char* months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    int mon = -1;
+    for (int m = 0; m < 12; m++) if (w[5].second == months[m]) mon = m;
+    if (mon < 0) return false;
+    while (i < line.size() && line[i] == ' ') i++;   // exactly the separator, not the name's own
+    if (i >= line.size()) return false;
+
+    struct tm tm{};
+    time_t now = time(nullptr);
+    struct tm now_tm{};
+    localtime_r(&now, &now_tm);
+    tm.tm_mon = mon;
+    tm.tm_mday = atoi(w[6].second.c_str());
+    tm.tm_isdst = -1;
+    const std::string& when = w[7].second;
+    if (when.find(':') != std::string::npos) {
+        // A recent date, and ls leaves the year out: it is this one, or last year's
+        // when this year's would be in the future.
+        tm.tm_year = now_tm.tm_year;
+        tm.tm_hour = atoi(when.c_str());
+        tm.tm_min = atoi(when.c_str() + when.find(':') + 1);
+        struct tm probe = tm;
+        if (mktime(&probe) > now + 86400) tm.tm_year--;
+    } else {
+        tm.tm_year = atoi(when.c_str()) - 1900;
+    }
+    time_t t = mktime(&tm);
+
+    const std::string& mode_s = w[0].second;
+    const bool dir = mode_s[0] == 'd';
+    mode_t perm = 0;
+    static const char* bits = "rwxrwxrwx";
+    for (int b = 0; b < 9 && b + 1 < (int)mode_s.size(); b++)
+        if (mode_s[b + 1] == bits[b]) perm |= (mode_t)(0400 >> b);
+    *e = ArchEntry{};
+    e->mode = (dir ? S_IFDIR : S_IFREG) | perm;
+    e->size = (off_t)atoll(w[4].second.c_str());
+    e->mtime = t < 0 ? 0 : t;
+    std::string name = line.substr(i);
+    // A link prints its target after the name; the name is what is in the archive.
+    if (mode_s[0] == 'l') {
+        size_t arrow = name.find(" -> ");
+        if (arrow != std::string::npos) name.resize(arrow);
+    }
+    set_name(e, name);
+    return true;
+}
+
 static bool parse_tar_list(const std::string& out, std::vector<ArchEntry>* out_entries) {
     for (const std::string& line : split_lines(out)) {
         if (line.size() < 12) continue;
         char kind = line[0];
         if (!strchr("-dlpcbs", kind)) continue;              // header chatter
+        ArchEntry bsd;
+        if (parse_bsdtar_line(line, &bsd)) {
+            if (bsd.rel[0]) out_entries->push_back(bsd);
+            continue;
+        }
         std::istringstream ss(line);
         std::string mode_s, owner, size_s, date, fifth;
         ss >> mode_s >> owner >> size_s >> date >> fifth;
@@ -551,6 +657,11 @@ static bool parse_7z_list(const std::string& out, std::vector<ArchEntry>* out_en
         sscanf(modified.c_str(), "%63s %63s", d, t);
         e.mtime = parse_date_time(d, t);
         set_name(&e, path);
+#ifdef _WIN32
+        // 7-Zip on Windows prints its own separator. The raw name stays the tool's
+        // spelling, which is what it is handed back as; the row uses '/'.
+        for (char* c = e.rel; *c; c++) if (*c == '\\') *c = '/';
+#endif
         if (e.rel[0]) out_entries->push_back(e);
         path.clear(); size_s.clear(); modified.clear(); attrs.clear();
         have = false;
@@ -620,7 +731,8 @@ static bool arch_list_run(const std::vector<std::string>& argv, ArchKind k,
     }
     bool parsed = false;
     switch (k) {
-    case ARCH_ZIP: parsed = parse_unzip_list(out_text, out); break;
+    case ARCH_ZIP: parsed = kZipByTar ? parse_tar_list(out_text, out)
+                                      : parse_unzip_list(out_text, out); break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
@@ -650,7 +762,8 @@ bool arch_list(const char* archive, std::vector<ArchEntry>* out, std::string* er
     std::string a(archive);
     std::vector<std::string> argv;
     switch (k) {
-    case ARCH_ZIP: argv = { "unzip", "-l", a }; break;
+    case ARCH_ZIP: argv = kZipByTar ? std::vector<std::string>{ "tar", "-tvf", a }
+                                    : std::vector<std::string>{ "unzip", "-l", a }; break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
@@ -713,7 +826,10 @@ bool arch_extract(const char* archive, const char* dest,
     std::string a(archive), d(dest);
     std::vector<std::string> argv;
     switch (k) {
-    case ARCH_ZIP: pr.mode = UNIT_ANY; argv = { "unzip", "-o", a, "-d", d }; break;
+    case ARCH_ZIP: pr.mode = UNIT_ANY;
+                   argv = kZipByTar ? std::vector<std::string>{ "tar", "-xvf", a, "-C", d }
+                                    : std::vector<std::string>{ "unzip", "-o", a, "-d", d };
+                   break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
     case ARCH_TAR_BZ2:
@@ -735,6 +851,23 @@ bool arch_extract(const char* archive, const char* dest,
         return false;
     }
     return true;
+}
+
+// A member name as tar should match it. GNU tar matches the names it is given
+// literally; bsdtar - the tar on Windows, which CreateProcess finds in System32 before
+// anything on PATH - reads every one as a pattern, so "photo [1].jpg" would be a
+// character class. A backslash makes each of its pattern characters itself again.
+static std::string tar_member(const std::string& raw) {
+#ifdef _WIN32
+    std::string out;
+    for (char c : raw) {
+        if (c == '*' || c == '?' || c == '[' || c == ']' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out;
+#else
+    return raw;
+#endif
 }
 
 bool arch_extract_members(const char* archive, const char* dest,
@@ -794,8 +927,13 @@ bool arch_extract_members(const char* archive, const char* dest,
     std::vector<std::string> argv;
     switch (k) {
     case ARCH_ZIP:
-        // unzip takes the member list between the archive and "-d dest".
         pr.mode = UNIT_ANY;
+        if (kZipByTar) {
+            argv = { "tar", "-xvf", a, "-C", d, "--" };
+            for (const std::string& n : names) argv.push_back(tar_member(n));
+            break;
+        }
+        // unzip takes the member list between the archive and "-d dest".
         argv = { "unzip", "-o", a };
         argv.insert(argv.end(), names.begin(), names.end());
         argv.push_back("-d");
@@ -807,7 +945,7 @@ bool arch_extract_members(const char* archive, const char* dest,
     case ARCH_TAR_XZ:
         pr.mode = UNIT_ANY;
         argv = { "tar", "-xvf", a, "-C", d, "--" };
-        argv.insert(argv.end(), names.begin(), names.end());
+        for (const std::string& n : names) argv.push_back(tar_member(n));
         break;
     case ARCH_7Z:
     case ARCH_RAR:
@@ -892,7 +1030,19 @@ bool arch_pack_opts(const char* archive, const char* cwd,
     std::vector<std::string> argv;
     std::vector<std::string> env;
     switch (k) {
-    case ARCH_ZIP: pr.mode = UNIT_MARKERED; pr.markers = { "adding:", "updating:", "freshening:" };
+    case ARCH_ZIP: if (kZipByTar) {
+                       // -a: the format comes from the name, and libarchive takes the
+                       // level as one of its own options rather than a flag.
+                       pr.mode = UNIT_ANY;
+                       argv = { "tar", "-a", "-cvf", a };
+                       if (opts.level >= 0) {
+                           argv.push_back("--options");
+                           argv.push_back(opts.level == 0 ? std::string("zip:compression=store")
+                                          : "zip:compression-level=" + std::to_string(opts.level));
+                       }
+                       break;
+                   }
+                   pr.mode = UNIT_MARKERED; pr.markers = { "adding:", "updating:", "freshening:" };
                    argv = { "zip", "-r", a };
                    // zip's own interactive prompt (-e) needs a terminal, which a
                    // GUI process does not have, so the password goes on the
@@ -906,12 +1056,21 @@ bool arch_pack_opts(const char* archive, const char* cwd,
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ: {
         pr.mode = UNIT_ANY;
-        argv = { "tar", "-cvf", a };
-        // tar hands the stream to gzip/bzip2/xz; those read their level from the
-        // environment, which keeps it out of the argument vector.
+        // -a: compress the way the name says. Without it a .tar.gz is written as a
+        // plain tar that only happens to be called .gz.
+        argv = { "tar", "-a", "-cvf", a };
         if (opts.level >= 0) {
+#ifdef _WIN32
+            // bsdtar compresses in-process, so the level is a libarchive option.
+            const char* filter = k == ARCH_TAR_GZ ? "gzip" : k == ARCH_TAR_BZ2 ? "bzip2" : "xz";
+            argv.push_back("--options");
+            argv.push_back(std::string(filter) + ":compression-level=" + std::to_string(opts.level));
+#else
+            // tar hands the stream to gzip/bzip2/xz; those read their level from the
+            // environment, which keeps it out of the argument vector.
             const char* var = k == ARCH_TAR_GZ ? "GZIP" : k == ARCH_TAR_BZ2 ? "BZIP2" : "XZ_OPT";
             env.push_back(std::string(var) + "=-" + std::to_string(opts.level));
+#endif
         }
         break;
     }
@@ -956,7 +1115,8 @@ bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string
     std::string a(archive);
     std::vector<std::string> argv;
     switch (k) {
-    case ARCH_ZIP: pr.mode = UNIT_MARKERED; pr.markers = { "testing:" };
+    case ARCH_ZIP: if (kZipByTar) { pr.mode = UNIT_ANY; argv = { "tar", "-tvf", a }; break; }
+                   pr.mode = UNIT_MARKERED; pr.markers = { "testing:" };
                    argv = { "unzip", "-t", a }; break;
     case ARCH_TAR:
     case ARCH_TAR_GZ:
@@ -983,14 +1143,22 @@ bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string
 bool arch_extract_temp(const char* archive, const char* raw_member,
                        char* out_path, size_t cap,
                        char* out_dir, size_t dcap, std::string* err) {
-    char tmpl[] = "/tmp/mc-clone-arch-XXXXXX";
-    const char* dir = mkdtemp(tmpl);
+    std::string tmpl_s = plat_temp_dir() + "/mc-clone-arch-XXXXXX";
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+    const char* dir = mkdtemp(tmpl.data());
     if (!dir) { *err = std::strerror(errno); return false; }
     snprintf(out_dir, dcap, "%s", dir);
     std::vector<std::string> one{ raw_member };
     if (!arch_extract_members(archive, dir, one, nullptr, nullptr, err)) {
         // Clean up the half-made directory before giving up.
+#ifdef _WIN32
+        std::string win_dir = dir;
+        for (char& c : win_dir) if (c == '/') c = '\\';
+        run_capture({ "cmd", "/d", "/c", "rd /s /q \"" + win_dir + "\"" }, nullptr, err, err);
+#else
         run_capture({ "rm", "-rf", std::string(dir) }, nullptr, err, err);
+#endif
         out_dir[0] = '\0';
         return false;
     }

@@ -22,6 +22,12 @@ int  fs_get_sort_mode();
 void fs_set_show_hidden(bool show);   // Alt+. toggles dotfiles
 bool fs_get_show_hidden();
 
+// Is this directory entry one Alt+. hides: a dotfile, and on Windows also a file the
+// system marks hidden - NTUSER.DAT, the old "Application Data" junctions - which
+// Explorer does not show either.
+struct dirent;
+bool fs_entry_hidden(const struct dirent* de);
+
 // Create a new file entry
 FileEntry* file_entry_new(const char* name, mode_t mode, off_t size, time_t mtime);
 

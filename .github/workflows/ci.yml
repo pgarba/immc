@@ -99,3 +99,83 @@ jobs:
 
       - name: test
         run: ctest --test-dir build --output-on-failure
+
+  # The same app on Windows, built with MSVC through the Visual Studio generator
+  # (no developer prompt needed, ctest takes the configuration with -C). SDL3 is
+  # built from the same pinned release; libcurl is left out, which is a supported
+  # configuration. The suites drive their fixtures with sh, which Git for Windows
+  # puts on the runner's PATH; zip archives go through the bsdtar every Windows
+  # ships in System32, and 7-Zip is preinstalled on the image.
+  windows:
+    runs-on: windows-latest
+    env:
+      SDL3_PREFIX: C:/sdl3
+      CURL_PREFIX: C:/curl
+      CURL_VERSION: 8.16.0
+      LIBSSH2_VERSION: 1.11.1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: SDL3 cache
+        id: sdl3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SDL3_PREFIX }}
+          key: sdl3-${{ runner.os }}-${{ env.SDL3_VERSION }}
+
+      - name: build SDL3
+        if: steps.sdl3.outputs.cache-hit != 'true'
+        run: |
+          base=https://github.com/libsdl-org/SDL/releases/download
+          curl -fsSLO "$base/release-$SDL3_VERSION/SDL3-$SDL3_VERSION.tar.gz"
+          tar xzf "SDL3-$SDL3_VERSION.tar.gz"
+          cmake -S "SDL3-$SDL3_VERSION" -B sdl3-build \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdl3-build --config Release
+          cmake --install sdl3-build --config Release --prefix "$SDL3_PREFIX"
+
+      # libcurl for the remote sites, over Schannel and Windows' CNG crypto so
+      # that no OpenSSL is needed; libssh2 is linked into it for SFTP.
+      - name: libcurl cache
+        id: curl
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CURL_PREFIX }}
+          key: curl-${{ runner.os }}-${{ env.CURL_VERSION }}-ssh2-${{ env.LIBSSH2_VERSION }}
+
+      - name: build libcurl
+        if: steps.curl.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSLO "https://github.com/libssh2/libssh2/releases/download/libssh2-$LIBSSH2_VERSION/libssh2-$LIBSSH2_VERSION.tar.gz"
+          curl -fsSLO "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+          tar xzf "libssh2-$LIBSSH2_VERSION.tar.gz"
+          tar xzf "curl-$CURL_VERSION.tar.gz"
+          cmake -S "libssh2-$LIBSSH2_VERSION" -B ssh2-build -DCRYPTO_BACKEND=WinCNG \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF \
+            -DENABLE_ZLIB_COMPRESSION=OFF
+          cmake --build ssh2-build --config Release
+          cmake --install ssh2-build --config Release --prefix "$CURL_PREFIX"
+          cmake -S "curl-$CURL_VERSION" -B curl-build -DCMAKE_PREFIX_PATH="$CURL_PREFIX" \
+            -DCURL_USE_SCHANNEL=ON -DCURL_USE_LIBSSH2=ON -DCURL_USE_LIBPSL=OFF \
+            -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DUSE_NGHTTP2=OFF \
+            -DUSE_LIBIDN2=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF \
+            -DCURL_DISABLE_INSTALL_DOCS=ON
+          cmake --build curl-build --config Release
+          cmake --install curl-build --config Release --prefix "$CURL_PREFIX"
+
+      - name: fetch Dear ImGui
+        run: scripts/get-deps.sh
+
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_PREFIX_PATH="$SDL3_PREFIX;$CURL_PREFIX"
+
+      - name: build
+        run: cmake --build build --config Release
+
+      - name: test
+        run: ctest --test-dir build -C Release --output-on-failure

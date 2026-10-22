@@ -6,7 +6,8 @@
 // and the About window cannot disagree.
 
 // What the user calls the app, and what the file on disk is called. They differ:
-// the repository is immc, the executable it builds is mc-clone.
+// the repository is immc, the executable it builds is mc-clone - except on Windows,
+// where it is immc.exe and the two are the same.
 #define MC_APP_NAME   "@MC_APP_NAME@"
 #define MC_APP_BINARY "@MC_APP_BINARY@"
 

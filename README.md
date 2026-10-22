@@ -8,10 +8,11 @@ Commander trained people on: `F5` copies, `F6` moves, `F7` makes a folder, `F3`
 previews, `Tab` switches panes, `Space` marks, `Insert` selects.
 
 It is not a terminal program. It opens a window and draws a table, using Dear
-ImGui over SDL3 and OpenGL 3. It runs on Linux.
+ImGui over SDL3 and OpenGL 3. It runs on Linux and on Windows 10 (1903 or newer)
+and 11.
 
-The binary it builds is still called `mc-clone`; `immc` is the project, the desktop
-entry and the window title.
+The binary it builds is still called `mc-clone` (on Windows, `immc.exe`); `immc` is
+the project, the desktop entry and the window title.
 
 ## Build
 
@@ -78,9 +79,76 @@ The URL layer, the sites file and both FTP listing parsers still compile and are
 still tested; only the transport answers that this build has no FTP support, and
 `--version` and the About window say which build you are looking at.
 
+### Windows
+
+MSVC (Visual Studio 2022 or newer, with the C++ desktop workload) and CMake. SDL3
+comes from the same release tarball, built and installed to a prefix of your
+choosing - from Git Bash or a developer prompt:
+
+    curl -fsSLO https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+    tar xzf SDL3-3.4.18.tar.gz
+    cmake -S SDL3-3.4.18 -B sdl3-build -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+    cmake --build sdl3-build --config Release
+    cmake --install sdl3-build --config Release --prefix C:/sdl3
+
+`scripts/get-deps.sh` runs unchanged in Git Bash. Then:
+
+    cmake -S . -B build -DCMAKE_PREFIX_PATH=C:/sdl3
+    cmake --build build --config Release
+    build/Release/immc.exe
+
+The executable is `immc.exe`, with the icon from `assets/immc.ico` (drawn from
+`assets/immc.svg` by `scripts/make-icon.py`) and a version block Explorer shows.
+`SDL3.dll` is copied next to every executable that needs it. libcurl and FreeType
+stay optional exactly as on Linux: the build uses them when CMake finds them.
+
+For remote sites, build libcurl the same way. Neither it nor libssh2 needs OpenSSL
+here: TLS goes through Schannel, which checks certificates against the Windows
+certificate store, and libssh2 through Windows' own CNG crypto:
+
+    curl -fsSLO https://github.com/libssh2/libssh2/releases/download/libssh2-1.11.1/libssh2-1.11.1.tar.gz
+    curl -fsSLO https://curl.se/download/curl-8.16.0.tar.gz
+    tar xzf libssh2-1.11.1.tar.gz && tar xzf curl-8.16.0.tar.gz
+    cmake -S libssh2-1.11.1 -B ssh2-build -DCRYPTO_BACKEND=WinCNG -DBUILD_SHARED_LIBS=OFF \
+          -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_ZLIB_COMPRESSION=OFF
+    cmake --build ssh2-build --config Release
+    cmake --install ssh2-build --config Release --prefix C:/curl
+    cmake -S curl-8.16.0 -B curl-build -DCMAKE_PREFIX_PATH=C:/curl \
+          -DCURL_USE_SCHANNEL=ON -DCURL_USE_LIBSSH2=ON -DCURL_USE_LIBPSL=OFF -DCURL_ZLIB=OFF \
+          -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF \
+          -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DCURL_DISABLE_INSTALL_DOCS=ON
+    cmake --build curl-build --config Release
+    cmake --install curl-build --config Release --prefix C:/curl
+
+and configure with `-DCMAKE_PREFIX_PATH="C:/sdl3;C:/curl"`. `libcurl.dll` is copied
+beside the executables like `SDL3.dll`; libssh2 is linked into it.
+
+The code is POSIX, and `src/win/posix.h` - force-included into every file of the
+app and the tests - gives the part of POSIX it uses a Windows meaning: directory
+listing, `stat` with real symbolic links, `mkdtemp`, and so on. The executables
+carry a manifest that makes the process code page UTF-8, which is why a file named
+in any script opens. What does not translate is written out for Windows where it is
+used (`src/platform.*`, `src/proc.cpp`), and is different on purpose:
+
+| | on Windows |
+| --- | --- |
+| settings, hotlist, sites | `%APPDATA%\mc-clone` |
+| paths | shown as `C:/Users/you`; `\` is accepted anywhere and becomes `/` |
+| `Alt+F1` `Alt+F2` | the drive letters, with label and file system |
+| network shares | `\\server` lists the server's shares, `\\server\share` (or `smb://server/share`) opens one |
+| `Ctrl+,` | the root of the pane's own drive |
+| `Alt+.` hidden files | dotfiles, and what Windows marks hidden (`NTUSER.DAT`, the old junctions) |
+| `F8` to trash | the Recycle Bin |
+| `Alt+F3` | the shell's "open", what a double click in Explorer would do |
+| `F4` | `%EDITOR%` (Notepad when unset) in a window of its own; no terminal is looked for, since a console program started that way gets one. `terminal =` in the config is still honoured. |
+| console | runs `cmd.exe`; output that is not UTF-8 is read in the system's OEM code page, which is what `cmd` writes |
+| zip and tar | Windows' own `tar.exe` (bsdtar) in System32 - no `zip` or `unzip` needed. It cannot encrypt, so a zip with a password is refused with a pointer to 7z. |
+| 7z, rar | 7-Zip, when `7z.exe` is on `PATH` |
+| Properties | no owner or group; of the mode, only the owner's write bit means anything - it is the read-only attribute |
+
 ## Tests
 
-    cd build && ctest
+    cd build && ctest                 # Windows: ctest -C Release
 
 Ten suites, a little over 3,100 checks between them:
 
@@ -88,7 +156,7 @@ Ten suites, a little over 3,100 checks between them:
 | --- | --- |
 | `panes` | the pane logic: marking, selection, sorting, filtering, tabs, directory history, the operation dialogs and their keyboard ring, quick view including its picture path, background transfers, config round-trips through the real file. It `#include`s `src/panes.cpp` so the file-static helpers can be exercised directly. |
 | `archive` | the archive backends, against real `zip`/`tar`/`7z` files that the test builds with the same tools the app shells out to |
-| `remote` | the URL layer, the sites file and its `0600` mode, the MLSD and LIST dialects against recorded server output, and then the transport against a real FTP server the test starts on `127.0.0.1` (`tests/ftp_server.py`) |
+| `remote` | the URL layer, the sites file and its `0600` mode, the FileZilla import, the MLSD and LIST dialects against recorded server output, and then the transport and the multi-threaded transfer queue against a real FTP server the test starts on `127.0.0.1` (`tests/ftp_server.py`) |
 | `sfv` | CRC-32 against the published check value, and the `.sfv` parser against the forms real files take: comments, names with spaces, checksum-first lines, backslash separators, broken UTF-8 |
 | `img` | picture recognition and decoding: format sniffing from bytes, PNG and BMP fixtures built in the test, all eight EXIF orientations, malformed EXIF, and the size guard that refuses a 9000x9000 header before allocating it |
 | `text` | which alphabet a preview is written in: UTF-8 validation including the forms that look wrong and are not, the CP437 table against its anchors, and the rule that tells an ANSI drawing from a Western European text file in 8 bits |
@@ -107,8 +175,10 @@ first-class build, not assumed:
     cmake --build build-nocurl -j4
     (cd build-nocurl && ctest)
 
-`.github/workflows/ci.yml` runs exactly those two configurations on every push, so
-the bootstrap script and the no-libcurl build cannot quietly rot.
+`.github/workflows/ci.yml` runs exactly those two configurations on every push, and
+a Windows build beside them, so the bootstrap script, the no-libcurl build and the
+port cannot quietly rot. On Windows the suites need Git for Windows' `sh` on `PATH` -
+their fixtures are lines of shell - and `python` for the FTP fixture.
 
 ## Keys
 
@@ -125,7 +195,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | `Alt+↓` | the list of directories this pane has been in |
 | `Alt+F11` `Alt+F12` | edit the left / right path bar |
 | `Ctrl+←` `Ctrl+→` | open the directory under the cursor in the other pane |
-| `Alt+F1` `Alt+F2` | the volumes popup, read from `/proc/mounts` |
+| `Alt+F1` `Alt+F2` | the volumes popup, read from `/proc/mounts` (drive letters on Windows). It opens on the pane's own drive; the arrows, `Home`/`End` and `PgUp`/`PgDn` move, `Enter` opens, `Esc` closes. A letter jumps to the drive it names - on Windows it opens it, as in TC - and the other `Alt+F1`/`F2` turns the popup to the other pane. Under the drives it lists your **favorites**: `Ins` in the popup (or `Alt+D` in a pane) adds the pane's folder, `Del` or the row's **remove** button takes one out. They are the hotlist (`Shift+F9`), kept in the settings folder |
 | `Shift+Tab` | toggle the split tree panel |
 
 ### Files
@@ -220,11 +290,12 @@ the panes keep answering underneath it.
 
 | | |
 | --- | --- |
-| `Ctrl+F` | the saved-site manager |
+| `Ctrl+F` | the saved-site manager; its **Import from FileZilla** lists the sites in FileZilla's `sitemanager.xml` (folders and all), each with a tick, and adds the ticked ones - `Space` ticks, `Ctrl+A` all or none, `Enter` imports |
 | `Ctrl+N` | quick connect to one host |
 | `Ctrl+D` | leave the site this pane is on, and close its connection (`Commands → Disconnect from site`) |
 | `Commands → Verify SFV` | check the focused pane's directory against the `.sfv` in it |
 | `cd ftp://…` | go there in the active pane |
+| `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux they go through GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
 | `Alt+F5` | pack the marked entries into an archive |
 | `Alt+F6` | extract an archive into the other pane |
 | `Alt+F9` | test an archive |
@@ -239,8 +310,26 @@ the panes keep answering underneath it.
 
 ## Transfers, resume and checksums
 
-A copy or move that crosses a network runs on its own thread and shows as a row in
-the strip under the panes. Aborting one leaves the row there with a **Resume** button:
+A copy or move that crosses a network runs in the background and shows as a row in
+the strip under the panes. The row is planned first - a folder becomes every file in
+it, with its size, so the bar covers the whole folder - and the files go on the
+site's transfer queue, behind whatever is already waiting for that site. Each site
+has a **transfer threads** setting in the site editor (1-10, default 2): that many
+files move at once, each over its own connection, until the queue is empty. A
+server that limits connections per user will refuse the ones over its limit.
+
+A site can also **transfer RAR volumes in order**. A RAR set then goes volume by
+volume instead of in listing order (which puts `.rar` after every `.rNN`): first
+the folder's other files (`.sfv`, `.nfo`), then `.rar`, `.r00`, `.r01` … `.r99`,
+`.s00` …, or `.part1.rar`, `.part2.rar` …, one set after the other.
+
+The strip's first line is the queue as a whole: one bar for everything the current
+burst of transfers is moving, the time left, and the sum of the threads' current
+speeds in MB/s. Hovering it lists each thread with its own speed and the file it is
+on, and how many files are still waiting.
+
+Aborting a row drops its waiting files from the queue at once and stops the ones in
+flight, and leaves the row there with a **Resume** button:
 the answer is Resume / Start over / Skip (`R / S / Esc`), and a resumed download picks
 up from the `<name>.part` beside the target rather than from the beginning.
 
@@ -325,6 +414,11 @@ and `foot` refuse a command unless `--` comes first, `wezterm` wants `launch --`
 `xfce4-terminal` and `terminator` want the whole command as one string they split
 themselves. Getting that wrong opens a window that says nothing and closes.
 
+Windows needs none of this: a console program started with a console of its own gets
+a window, so `F4` runs `%EDITOR%` - Notepad when it is unset - on its own, and an editor
+that is a script (`code` is `code.cmd`) goes through `cmd`, the one thing that runs
+those. A `terminal =` line is still used when there is one.
+
 `F4` also asks before opening a file whose bytes are not text - it says what the file
 is (`an ELF shared object`, `a PDF`, `an archive (zip)`, `not a text file`) and waits
 for Y or N, because a text editor over a library produces gibberish that a careless
@@ -350,26 +444,37 @@ preview naming the count of characters with no glyph. Pick a font that carries t
     src/archive.*        browse, extract, pack — driven by the installed zip/tar/7z
     src/proc.*           the child-process runner the archives and the console share
     src/remote.*         FTP/FTPS/SFTP through libcurl: sites file, parsers, transport
+    src/xfer.*           the transfer queue: transfers planned into files, a thread pool per site
     src/sfv.*            CRC-32 and the .sfv parser, with no dependency on zlib
     src/img.*            picture recognition, decoding, EXIF orientation, downscaling
     src/texture.*        decoded pixels to a GL texture, and back out again
     src/text.*           UTF-8 validation and the CP437 transcode the quick view reads old text in
     src/terminal.*       finding a terminal for the editor, and the command line each one wants
     src/config.*         ~/.config/mc-clone/config, and the 0600 sites file beside it
+    src/platform.*       home, settings and temp directories, and handing things to the
+                         desktop - the places Linux and Windows differ in meaning
+    src/win/             the POSIX layer for MSVC, the UTF-8 code page manifest, and
+                         the resource script with the icon and version
     src/theme.*          eight themes and the accent colours the panes draw with
     tests/               the ten suites, the FTP fixture, and the pictures the
                          picture tests build for themselves
     scripts/get-deps.sh  the pinned Dear ImGui checkout and the pinned stb_image.h
+    scripts/make-icon.py assets/immc.ico, the Windows icon, from the design in immc.svg
     FEATURES_PLAN.md     the project's own record: what landed, what was refused, and why
 
 ## Things worth knowing before you rely on it
 
 - **Archives are shelled out to, not linked in.** The app drives `zip`, `unzip`,
-  `tar` and `7z`. That buys format coverage without a new dependency and costs a
+  `tar` and `7z` (on Windows, `tar` covers zip too). That buys format coverage without a new dependency and costs a
   real caveat: a pack password is visible in the process list while the tool runs,
-  and the pack dialog says so in one line.
+  and the pack dialog says so in one line. On Windows, `tar` reads and prints member
+  names in the system's ANSI code page, so a name outside it (Japanese on a Western
+  install) cannot be listed or extracted by name, and packing one crashes Windows'
+  own `tar.exe`; 7-Zip has no such limit.
 - **Saved site passwords are cleartext**, in `~/.config/mc-clone/ftp_sites`, created
-  `0600`. The main config is written world-readable, which is why it stays
+  `0600`. That includes passwords imported from FileZilla, which keeps them as
+  base64; one FileZilla locks under its master password is not imported, and the
+  import list says so. The main config is written world-readable, which is why it stays
   password-free.
 - **The console backlog is written to that world-readable config too**, because the
   transcript is the point of the feature. A command that carried a password is in

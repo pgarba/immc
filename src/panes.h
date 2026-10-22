@@ -12,6 +12,7 @@
 #include "filesystem.h"
 #include "img.h"      // ImgFormat, for what a quick view preview turned out to be
 #include "remote.h"   // NetSite, for the site list AppPanes owns
+#include "xfer.h"     // XferJob, what a background transfer reports through
 
 static const int MAX_TABS = 8;
 static const int MAX_DIR_HISTORY = 32;
@@ -213,17 +214,16 @@ struct SfvJob {
 // joinable when it is destroyed ends the process. `error` and `ok_names` are the
 // worker's: it writes them and then stores the finishing state, and a frame that
 // reads that state is allowed to read them.
-struct BgTransfer {
+//
+// The counters - abort, done, total, files_done, files_total - are the XferJob's:
+// the row's thread plans the transfer into files and hands them to the site's
+// queue (xfer.h), and whichever queue thread moves a file reports into them.
+struct BgTransfer : XferJob {
     enum State { BG_RUNNING = 0, BG_DONE, BG_FAILED, BG_ABORTED };
 
     std::atomic<int>       state;       // one of State
-    std::atomic<bool>      abort;       // the UI's request; the worker polls it
     std::atomic<bool>      settled;     // the finish has been handled once already
     std::atomic<bool>      dismiss;     // the row's button: retire it next frame
-    std::atomic<long long> done;        // bytes moved so far
-    std::atomic<long long> total;       // bytes the transfer knows it owes
-    std::atomic<int>       files_done;
-    std::atomic<int>       files_total;
 
     // Fixed before the worker starts; the worker only reads them.
     bool   is_move;
@@ -497,6 +497,8 @@ public:
     bool console_hist_open; // Alt+F8: the console's command history
     bool volumes_open;    // Alt+F1/F2: mounted drives
     int  volumes_target;  // pane index the volumes list navigates
+    int  volumes_cursor = -1;  // the drive the arrow keys are on; -1 = not placed yet
+    bool volumes_moved = false; // the cursor moved by key: scroll its row into view
 
     // Internal file clipboard (Ctrl+C / Ctrl+X / Ctrl+V)
     FileClipboard clipboard;
@@ -573,6 +575,12 @@ public:
     // app_panes_free() asks the running ones to stop and joins them before the
     // app goes away.
     std::vector<std::unique_ptr<BgTransfer>> transfers;
+    // The queue line over those rows. A batch is the rows started since the queue
+    // was last idle, so the bar runs from empty to full once per burst of work
+    // instead of jumping back each time a row finishes. 0 = no batch running.
+    double    queue_t0 = 0.0;
+    // The speed of each queue thread over the last few seconds, fed every frame.
+    XferMeter queue_meter;
     // Quick view. `qv_cache` is the text already read, keyed by the path the pane
     // shows, so moving the cursor back onto a name costs nothing; `qv_fetches`
     // are the previews that are not on this disk and are still on their way.

@@ -5,6 +5,7 @@
 #include "sfv.h"
 #include "text.h"    // .sfv verification: CRC-32 and the parser
 #include "terminal.h" // finding a terminal to run the editor in, and its argument shape
+#include "platform.h" // home, settings, temp dir, and handing things to the desktop
 #include "img.h"     // picture previews: what a file is, and its pixels
 #include "texture.h" // and getting those pixels onto the screen
 #include "theme.h"
@@ -21,13 +22,20 @@
 #include FT_FREETYPE_H
 #endif
 #include <SDL3/SDL_opengl.h>
+#ifdef _WIN32
+// SDL_opengl.h brings in <windows.h>, and winbase.h's OpenFile flags include an
+// OF_CANCEL that would turn the dialog's enumerator below into a number.
+#undef OF_CANCEL
+#endif
 #include <string.h>
 #include <strings.h>   // strncasecmp: quick search prefix match
 #include <ctype.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#ifndef _WIN32
 #include <pwd.h>
 #include <grp.h>
+#endif
 #include <unistd.h>
 #include <cstdlib>
 #include <cstdio>
@@ -35,7 +43,6 @@
 #include <cerrno>
 #include <libgen.h>
 #include <float.h>
-#include <poll.h>
 #include <time.h>
 #include <algorithm>
 #include <map>
@@ -666,6 +673,141 @@ static void list_archive_dir(const char* archive, const char* prefix,
     *out_count = i;
 }
 
+// ---------------------------------------------------------------------------
+// Network shares (SMB). On Windows a share is a path - \\server\share - that the
+// file system opens like any other, and "\\server" on its own lists the server's
+// shares (src/win/posix.cpp). On Linux the same places are smb:// URLs, which the
+// kernel does not open; they go through GVfs, the layer the desktop's own file
+// managers use: `gio list` names a server's shares, and `gio mount` mounts one at
+// a local path under /run/user, which the pane then lists like any directory.
+// ---------------------------------------------------------------------------
+
+static bool smb_is_url(const char* s) { return strncasecmp(s, "smb://", 6) == 0; }
+
+// A line that names a place on the network and nothing else: \\server,
+// \\server\share, smb://server/share, and on Windows //server too. Typed into the
+// command line it means "go there", which is how Explorer's address bar and TC's
+// command line read it; no shell has a command by that name.
+static bool names_network_place(const char* s) {
+    if (s[0] == '\\' && s[1] == '\\' && s[2] && s[2] != '\\') return true;
+#ifdef _WIN32
+    if (s[0] == '/' && s[1] == '/' && s[2] && s[2] != '/') return true;
+#endif
+    return smb_is_url(s);
+}
+
+// \\server\share\dir in the URL form Linux needs: smb://server/share/dir.
+static std::string smb_url_from_unc(const char* s) {
+    std::string r = "smb://";
+    for (const char* p = s + 2; *p; p++) r += (*p == '\\') ? '/' : *p;
+    return r;
+}
+
+#ifndef _WIN32
+// Run gio and collect what it writes. A mount can wait on a server that does not
+// answer, so every read has a limit, and running out of it is a failure.
+static bool gio_run(const std::vector<std::string>& argv, std::string* out) {
+    Proc p;
+    std::string err;
+    if (!proc_start(argv, nullptr, kNoEnv, &p, &err)) { *out = err; return false; }
+    char buf[4096];
+    for (;;) {
+        long n = proc_read(&p, buf, sizeof buf, 30000);
+        if (n > 0) { out->append(buf, (size_t)n); continue; }
+        if (n == -1) {
+            proc_finish(&p, true);
+            *out = "no answer in 30 seconds";
+            return false;
+        }
+        break;
+    }
+    int code = proc_finish(&p, false);
+    if (code == 127) *out = "gio is not installed";
+    return code == 0;
+}
+
+// The first line of a tool's complaint, which is the one that says what went wrong.
+static std::string first_line(const std::string& s) {
+    size_t nl = s.find('\n');
+    std::string r = s.substr(0, nl);
+    while (!r.empty() && (r.back() == '\r' || r.back() == ' ')) r.pop_back();
+    return r;
+}
+
+// Where an smb:// URL is on this machine. A URL with a share comes back as the
+// local path GVfs mounted it at (`local`); a bare server comes back as its shares.
+// False with the reason in `err`, which names what to install or do.
+static bool smb_resolve(const std::string& url, std::string* local,
+                        std::vector<std::string>* shares, std::string* err) {
+    std::string rest = url.substr(6);
+    while (!rest.empty() && rest.back() == '/') rest.pop_back();
+    size_t slash = rest.find('/');
+    std::string server = rest.substr(0, slash);
+    std::string path = slash == std::string::npos ? "" : rest.substr(slash + 1);
+    if (server.empty()) { *err = "smb:// needs a server: smb://server/share"; return false; }
+    const char* hint = " - smb:// goes through GVfs: install gvfs and gvfs-smb, or mount the "
+                       "share with mount.cifs and open the mount point";
+    // gio takes a URI, so a space in a share or a folder name is %20 there.
+    std::string uri = "smb://" + server + "/" + net_url_escape(path, true);
+
+    if (path.empty()) {
+        std::string out;
+        if (!gio_run({ "gio", "list", uri }, &out)) {
+            *err = url + ": " + first_line(out) + hint;
+            return false;
+        }
+        size_t at = 0;
+        while (at < out.size()) {
+            size_t nl = out.find('\n', at);
+            std::string name = out.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+            at = nl == std::string::npos ? out.size() : nl + 1;
+            while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
+            if (name.empty() || name.back() == '$') continue;   // administrative shares
+            shares->push_back(name);
+        }
+        return true;
+    }
+
+    // Mount the share (an already mounted one says so and is not an error), then ask
+    // where its path is on this machine.
+    size_t share_end = path.find('/');
+    std::string share_uri = "smb://" + server + "/" +
+                            net_url_escape(path.substr(0, share_end), true);
+    std::string mount_out, info_out;
+    gio_run({ "gio", "mount", share_uri }, &mount_out);
+    if (gio_run({ "gio", "info", uri }, &info_out)) {
+        size_t at = info_out.find("local path: ");
+        if (at != std::string::npos) {
+            *local = first_line(info_out.substr(at + 12));
+            if (!local->empty()) return true;
+        }
+    }
+    std::string why = first_line(mount_out.empty() ? info_out : mount_out);
+    if (why.empty()) why = "not mounted";
+    *err = url + ": " + why +
+           (why.find("assword") != std::string::npos
+                ? " - a share with a password: mount it once in the file manager, or run "
+                  "`gio mount " + share_uri + "` in a terminal"
+                : std::string(hint));
+    return false;
+}
+#endif
+
+// The directory above a pane's, for "..", Backspace and Ctrl+PgUp. dirname() is the
+// answer everywhere except above an smb:// server on Linux, which is a URL with
+// nothing above it: that goes home.
+static void pane_parent(const char* dir, char* out, size_t n) {
+#ifndef _WIN32
+    if (smb_is_url(dir)) {
+        snprintf(out, n, "%s", plat_home_dir().c_str());
+        return;
+    }
+#endif
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", dir);
+    snprintf(out, n, "%s", dirname(buf));
+}
+
 // Collapse a local path to one spelling: "//home/adam//x/" becomes "/home/adam/x".
 // Worth doing rather than keeping the bytes the caller typed, for two reasons.
 //
@@ -684,19 +826,48 @@ static void list_archive_dir(const char* archive, const char* prefix,
 // a path on a server, and rewriting them changes which file is meant. An archive's
 // virtual path is collapsed like any other local path - the doubled slash always comes
 // from the filesystem half, and a member name a listing can build never contains one.
+//
+// On Windows the one spelling is "C:/Users/adam": a backslash is the same separator
+// as a slash and becomes one, the drive letter is upper case, and a drive's root keeps
+// its slash - "C:" alone names the drive's current directory, which is somewhere else.
+// A path with no drive ("/Users") is on the system drive. A UNC path keeps the two
+// slashes that make it one.
 static void normalize_pane_path(const char* in, char* out, size_t n) {
-    if (!in || !*in) { snprintf(out, n, "/"); return; }
+    if (!in || !*in) { snprintf(out, n, "%s", plat_root_of(nullptr).c_str()); return; }
     if (net_is_remote(in)) { snprintf(out, n, "%s", in); return; }
+#ifndef _WIN32
+    // An SMB URL is the network's spelling, resolved to a mount when it is listed
+    // (see smb_resolve); collapsing its "//" would make it a local path.
+    if (smb_is_url(in)) { snprintf(out, n, "%s", in); return; }
+#endif
 
     std::string s(in), r;
-    r.reserve(s.size());
+    size_t keep = 1;   // the shortest the path may get: the root it starts with
+#ifdef _WIN32
+    // smb://server/share is \\server\share by another name.
+    if (smb_is_url(in)) s = "//" + s.substr(6);
+    for (char& c : s) if (c == '\\') c = '/';
+    if (s.size() >= 2 && s[1] == ':' && isalpha((unsigned char)s[0])) {
+        s[0] = (char)toupper((unsigned char)s[0]);
+        if (s.size() == 2 || s[2] != '/') s.insert(2, "/");
+        keep = 3;
+    } else if (s.size() >= 2 && s[0] == '/' && s[1] == '/') {
+        r = "//";      // UNC: both slashes are the root, and the collapse starts after them
+        s.erase(0, 2);
+        keep = 2;
+    } else if (s[0] == '/') {
+        s = plat_root_of(nullptr).substr(0, 2) + s;
+        keep = 3;
+    }
+#endif
+    r.reserve(r.size() + s.size());
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] != '/') { r += s[i]; continue; }
         if (!r.empty() && r.back() == '/') continue;   // a run of slashes is one separator
         r += '/';
     }
-    while (r.size() > 1 && r.back() == '/') r.pop_back();   // a trailing one says nothing
-    if (r.empty()) r = "/";                                // "//" is still the root
+    while (r.size() > keep && r.back() == '/') r.pop_back();   // a trailing one says nothing
+    if (r.empty()) r = "/";                                    // "//" is still the root
     snprintf(out, n, "%s", r.c_str());
 }
 
@@ -724,7 +895,39 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->rel.clear();
     char arch[4096], prefix[1024];
     std::string nroot, nrpath;
-    if (net_split_virtual(norm, &nroot, &nrpath)) {
+    bool smb_listed = false;   // the listing is a server's shares, or a failure to reach it
+#ifndef _WIN32
+    if (smb_is_url(norm)) {
+        std::string local, err;
+        std::vector<std::string> shares;
+        if (!smb_resolve(norm, &local, &shares, &err)) {
+            g_net_note = err;
+            smb_listed = true;     // nothing to show; the status line says why
+        } else if (!local.empty()) {
+            // A share: from here on the pane is in the directory GVfs mounted it at.
+            normalize_pane_path(local.c_str(), norm, sizeof(norm));
+            snprintf(pane->current_dir, sizeof(pane->current_dir), "%s", norm);
+        } else {
+            pane->entries = (FileEntry**)calloc(shares.size() + 1, sizeof(FileEntry*));
+            if (pane->entries) {
+                int i = 0;
+                pane->entries[i++] = file_entry_new("..", S_IFDIR | 0755, 0, 0);
+                for (const std::string& name : shares)
+                    pane->entries[i++] = file_entry_new(name.c_str(), S_IFDIR | 0755, 0, 0);
+                pane->entry_count = i;
+            }
+            smb_listed = true;
+        }
+    }
+#endif
+    if (smb_listed) {
+        pane->archive_path[0] = '\0';
+        pane->archive_prefix[0] = '\0';
+        pane->remote_root[0] = '\0';
+        pane->remote_path[0] = '\0';
+        pane->remote_came_from[0] = '\0';
+        pane->list_mode = LIST_NORMAL;
+    } else if (net_split_virtual(norm, &nroot, &nrpath)) {
         const NetSite* site = net_site_for(nroot);
         std::string err;
         if (site) {
@@ -1028,8 +1231,7 @@ static void swap_panes(AppPanes* app, bool swap_tabs_too) {
 
 static const char* hotlist_file() {
     static char path[4096];
-    const char* home = getenv("HOME");
-    snprintf(path, sizeof(path), "%s/.config/mc-clone/hotlist", home ? home : ".");
+    snprintf(path, sizeof(path), "%s/hotlist", plat_config_dir().c_str());
     return path;
 }
 
@@ -1045,13 +1247,19 @@ static void hotlist_load(AppPanes* app) {
     fclose(f);
 }
 
+static void hotlist_save(AppPanes* app);
+
+// Add a folder to the hotlist - the favorites the Alt+F1/F2 picker lists under the
+// drives - unless it is there already. Returns false for a duplicate.
+static bool hotlist_add(AppPanes* app, const char* dir) {
+    for (const std::string& s : app->hotlist) if (s == dir) return false;
+    app->hotlist.push_back(dir);
+    hotlist_save(app);
+    return true;
+}
+
 static void hotlist_save(AppPanes* app) {
-    const char* home = getenv("HOME");
-    char dir[4096];
-    snprintf(dir, sizeof(dir), "%s/.config", home ? home : ".");
-    mkdir(dir, 0755);
-    snprintf(dir, sizeof(dir), "%s/.config/mc-clone", home ? home : ".");
-    mkdir(dir, 0755);
+    plat_make_config_dir();
     FILE* f = fopen(hotlist_file(), "w");
     if (!f) return;
     for (const std::string& s : app->hotlist) fprintf(f, "%s\n", s.c_str());
@@ -1081,7 +1289,7 @@ static void search_walk(const char* dir, const char* pattern, std::vector<std::s
     struct dirent* de;
     while ((de = readdir(d)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!show_hidden && de->d_name[0] == '.') continue;
+        if (!show_hidden && fs_entry_hidden(de)) continue;
         char full[4100];
         snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
         struct stat st;
@@ -1270,15 +1478,15 @@ static void console_reap(AppPanes* app) {
 
 // The worker: run the line through the shell in the directory the focused pane is
 // showing, and feed the output to the window as it arrives, which is what lets a
-// `find` that takes a minute show its results while it is still running. poll()
-// with a timeout rather than a blocking read, because a cancel has to land while
+// `find` that takes a minute show its results while it is still running. A read
+// with a timeout rather than a blocking one, because a cancel has to land while
 // the tool is silent, not only when it next writes something.
 static void console_worker(ConsoleJob* job, std::string line, std::string cwd) {
     Proc p;
     std::string err;
     // The shell, not execvp on the first word: pipes, redirection and globbing are
     // what make a console worth typing into.
-    std::vector<std::string> argv = { "/bin/sh", "-c", line };
+    std::vector<std::string> argv = proc_shell_argv(line);
     if (!proc_start(argv, cwd.c_str(), kNoEnv, &p, &err)) {
         // No pipe or no fork. There is no child to report it, so the job does.
         console_append(job, err.c_str(), err.size());
@@ -1286,20 +1494,32 @@ static void console_worker(ConsoleJob* job, std::string line, std::string cwd) {
         job->done.store(true);
         return;
     }
+    // Output goes to the window a line at a time, so a character is never split between
+    // two reads when plat_console_text() decides what encoding it is in. Whatever is
+    // waiting goes as soon as the command falls silent, which keeps a prompt that ends
+    // without a newline on screen.
+    std::string pending;
+    auto flush = [&](size_t upto) {
+        if (!upto) return;
+        const std::string text = plat_console_text(pending.data(), upto);
+        console_append(job, text.data(), text.size());
+        pending.erase(0, upto);
+    };
     char buf[4096];
     for (;;) {
-        struct pollfd pf;
-        pf.fd = p.fd; pf.events = POLLIN; pf.revents = 0;
-        int r = poll(&pf, 1, 100);
-        if (r < 0) { if (errno == EINTR) continue; break; }
-        if (r == 0) { if (job->cancel.load()) break; continue; }   // silent: check for a cancel
-        ssize_t n = read(p.fd, buf, sizeof buf);
-        if (n > 0) { console_append(job, buf, (size_t)n); continue; }
-        if (n == 0) break;                        // EOF: the command is done
-        if (errno == EINTR || errno == EAGAIN) continue;
-        break;
+        long n = proc_read(&p, buf, sizeof buf, 100);
+        if (n == -1) {                            // silent: show what is waiting, check for a cancel
+            flush(pending.size());
+            if (job->cancel.load()) break;
+            continue;
+        }
+        if (n <= 0) break;                        // EOF: the command is done
+        pending.append(buf, (size_t)n);
+        size_t nl = pending.find_last_of('\n');
+        if (nl != std::string::npos) flush(nl + 1);
+        else if (pending.size() > sizeof buf) flush(pending.size());
     }
-    close(p.fd);
+    flush(pending.size());
     // code is written before done publishes it, which is the order the frame that
     // reads `done` relies on.
     job->code = proc_finish(&p, job->cancel.load());
@@ -1315,19 +1535,30 @@ static void console_cd(AppPanes* app, const char* arg) {
     while (*arg == ' ') arg++;
     Pane& active = app->left_focus ? app->left : app->right;
     char target[4096];
-    const char* home = getenv("HOME");
+    const std::string home = plat_home_dir();
     if (!*arg) {
-        snprintf(target, sizeof(target), "%s", home ? home : "/");
-    } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\0')) {
-        snprintf(target, sizeof(target), "%s%s", home ? home : "", arg + 1);
-    } else if (net_is_remote(arg)) {
+        snprintf(target, sizeof(target), "%s",
+                 !home.empty() ? home.c_str() : plat_root_of(active.current_dir).c_str());
+    } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\\' || arg[1] == '\0')) {
+        snprintf(target, sizeof(target), "%s%s", home.c_str(), arg + 1);
+    } else if (net_is_remote(arg) || smb_is_url(arg)) {
         snprintf(target, sizeof(target), "%s", arg);
-    } else if (arg[0] == '/') {
+#ifndef _WIN32
+    } else if (arg[0] == '\\' && arg[1] == '\\') {
+        // \\server\share is what a Windows habit types; here it is an smb:// URL.
+        snprintf(target, sizeof(target), "%s", smb_url_from_unc(arg).c_str());
+#endif
+    } else if (plat_path_is_absolute(arg)) {
         snprintf(target, sizeof(target), "%s", arg);
     } else {
         snprintf(target, sizeof(target), "%s/%s", active.current_dir, arg);
     }
     if (net_is_remote(target)) { remote_open_url(app, target); return; }
+#ifndef _WIN32
+    // An smb:// URL is not something opendir knows; listing it is what finds out
+    // whether it can be reached, and the reason lands in the status line if not.
+    if (smb_is_url(target)) { navigate_to(app, &active, target); return; }
+#endif
     DIR* probe = opendir(target);
     if (probe) {
         closedir(probe);
@@ -1395,8 +1626,11 @@ static void console_run(AppPanes* app) {
         console_push(app, cwd, c, dump, 0, true);
         return;
     }
-    if (strcmp(c, "cd") == 0 || strncmp(c, "cd ", 3) == 0) {
-        console_cd(app, c + 2);
+    // A line that is only a place on the network is a cd there, the way Explorer's
+    // address bar takes \\server: cmd.exe would answer that it is not a command.
+    bool place = names_network_place(c) || net_is_remote(c);
+    if (place || strcmp(c, "cd") == 0 || strncmp(c, "cd ", 3) == 0) {
+        console_cd(app, place ? c : c + 2);
         Pane& after = app->left_focus ? app->left : app->right;
         // The transcript says where the console is now sitting, because that is the
         // thing `cd` changed. If the pane did not move, the reason is what belongs
@@ -1627,10 +1861,14 @@ bool app_panes_set_display_scale(AppPanes* app, float scale) {
 // what the window manager draws, are the two places a wrong name shows up.
 // ---------------------------------------------------------------------------
 
-// "immc 0.9.0 (mc-clone)". The About window, --version and the title bar start
-// from here, so they cannot drift apart.
+// "immc 0.9.0 (mc-clone)", or "immc 0.9.0" where the file is called immc too
+// (Windows). The About window, --version and the title bar start from here, so
+// they cannot drift apart.
 void app_identity_line(char* out, size_t n) {
-    snprintf(out, n, "%s %s (%s)", MC_APP_NAME, MC_VERSION, MC_APP_BINARY);
+    if (!strcmp(MC_APP_NAME, MC_APP_BINARY))
+        snprintf(out, n, "%s %s", MC_APP_NAME, MC_VERSION);
+    else
+        snprintf(out, n, "%s %s (%s)", MC_APP_NAME, MC_VERSION, MC_APP_BINARY);
 }
 
 // SDL reports its version as one packed integer; the About window and --version
@@ -1710,9 +1948,15 @@ void app_window_title(AppPanes* app, char* out, size_t n) {
 
 // The places fonts live. Nothing is configured: a ttf dropped into the user's
 // own font directory shows up in the picker without an edit to the config file.
+#ifdef _WIN32
+static const char* const kFontDirs[] = {
+    "C:/Windows/Fonts",
+};
+#else
 static const char* const kFontDirs[] = {
     "/usr/share/fonts", "/usr/local/share/fonts",
 };
+#endif
 
 static bool font_file_ext(const char* name) {
     const char* dot = strrchr(name, '.');
@@ -1751,6 +1995,11 @@ void app_scan_fonts(StringList& out) {
     out.clear();
     std::vector<std::string> dirs;
     for (const char* d : kFontDirs) dirs.push_back(d);
+#ifdef _WIN32
+    // Fonts installed for one user, which Windows 10 keeps out of the system folder.
+    const std::string home = plat_home_dir();
+    if (!home.empty()) dirs.push_back(home + "/AppData/Local/Microsoft/Windows/Fonts");
+#else
     const char* home = getenv("HOME");
     if (home && *home) {
         dirs.push_back(std::string(home) + "/.local/share/fonts");
@@ -1758,6 +2007,7 @@ void app_scan_fonts(StringList& out) {
     }
     const char* xdg = getenv("XDG_DATA_HOME");
     if (xdg && *xdg) dirs.push_back(std::string(xdg) + "/fonts");
+#endif
 
     for (const std::string& d : dirs) scan_font_tree(d.c_str(), out, 6, 400);
 
@@ -1889,16 +2139,21 @@ static const char* mc_hinting_note(int index) {
     return kHintingModes[index].note;
 }
 
-static unsigned int mc_freetype_loader_flags(const char* name) {
+[[maybe_unused]] static unsigned int mc_freetype_loader_flags(const char* name) {
     int i = mc_hinting_index(name);
     if (i < 0) i = 0;                       // unknown or empty: the loader's own choice
     unsigned int bits = (unsigned int)kHintingModes[i].bits;
+#ifdef MC_HAVE_FREETYPE
     unsigned int flags = 0;
     if (bits & MC_HINT_NONE)      flags |= ImGuiFreeTypeLoaderFlags_NoHinting;
     if (bits & MC_HINT_LIGHT)     flags |= ImGuiFreeTypeLoaderFlags_LightHinting;
     if (bits & MC_HINT_STRONG)    flags |= ImGuiFreeTypeLoaderFlags_MonoHinting;
     if (bits & MC_HINT_NO_SMOOTH) flags |= ImGuiFreeTypeLoaderFlags_Monochrome;
     return flags;
+#else
+    // No loader to translate them for; the app's own bits keep the modes apart.
+    return bits;
+#endif
 }
 
 // Device pixels per logical pixel, from the two sizes SDL reports for one window.
@@ -2226,6 +2481,11 @@ static void pane_real_dir(const Pane& pane, char* out, size_t cap) {
     char* slash = strrchr(out, '/');
     if (slash) *slash = '\0';
     else snprintf(out, cap, "/");
+#ifdef _WIN32
+    // "C:/x.zip" is held in "C:/", not in "C:", which names the drive's current
+    // directory rather than its root.
+    if (out[0] && out[1] == ':' && !out[2]) snprintf(out + 2, cap - 2, "/");
+#endif
 }
 
 // The rows an operation applies to, named relative to the pane: everything
@@ -3040,18 +3300,13 @@ static void refresh_for_destination(AppPanes* app, const std::string& dst) {
 // the handle cache is per thread (see remote.cpp).
 // ---------------------------------------------------------------------------
 
-// The worker's progress callback. Same contract as copy_progress_cb - the numbers
-// up, false to stop - but it publishes instead of drawing. This thread has no
-// business inside ImGui.
-static bool bg_progress_cb(long long done, long long total, int fd, int ft, void* user) {
-    BgTransfer* t = (BgTransfer*)user;
-    t->done        = done;
-    t->total       = total;
-    t->files_done  = fd;
-    t->files_total = ft;
-    // Quitting asks every transfer to stop (app_panes_free), so the request
-    // reaches the transport through the same flag the Abort button sets.
-    return !t->abort.load();
+// The callback for the parts of a transfer that move no bytes: the walk that
+// plans it and the delete that finishes a move. It reports nothing - the counters
+// belong to the files, which the queue's threads move - and its false answer is
+// what stops either of them after an Abort. Quitting asks every transfer to stop
+// (app_panes_free), so the request arrives through the same flag.
+static bool bg_abort_cb(long long, long long, int, int, void* user) {
+    return !((BgTransfer*)user)->abort.load();
 }
 
 // Seconds as a clock. An ETA of "3720s" is a number the user has to do
@@ -3149,58 +3404,88 @@ static void bg_run_remote(BgTransfer* t) {
     std::string droot, drpath;
     net_split_virtual(plan.dst_dir.c_str(), &droot, &drpath);
 
+    // First the plan: every name becomes the files it holds, with their sizes, so
+    // the row knows its whole total before a byte moves, and the queue's threads
+    // can share the files out. Each name is a group, which is how the end of the
+    // run knows which names arrived whole.
+    const int n = (int)plan.names.size();
+    t->begin(n);
     std::string err;
-    int ok = 0;
     int skipped = 0;
     std::set<std::string> remote_names;   // the upload's destination, as the server lists it
     bool have_listing = false;
-    for (size_t i = 0; i < plan.names.size(); i++) {
+    std::vector<char> planned((size_t)n, 0);
+    std::vector<std::string> sources((size_t)n);
+    std::vector<XferItem> items;
+    for (int i = 0; i < n && !t->abort.load(); i++) {
         std::string base = plan.name_override.empty() ? plan.names[i] : plan.name_override;
+        std::string perr;
         bool r;
-            if (t->download) {
-                std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
-                std::string local = plan.dst_dir + "/" + base;
-                // The destination of a download is a directory on this disk, so the
-                // collision is asked of this disk.
-                if (fs_exists(local.c_str())) {
-                    if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
-                    if (plan.overwrite == OpPlan::OW_RENAME)
-                        local = rename_beside(local, nullptr);
-                }
-                // A resume is per entry: the file with a `.part` continues from it and
-                // the ones without are fetched whole. A restart clears the sidecars.
-                r = net_download_tree(site, src, local.c_str(), bg_progress_cb, t, &err, t->resume);
-                if (r && plan.is_move) net_remove_tree(site, src, bg_progress_cb, t, &err);
-            } else {
-                std::string local = plan.src_dir + "/" + plan.names[i];
-                std::string dst = drpath.empty() ? base : drpath + "/" + base;
-                // The destination of an upload is on the server, and the server is the
-                // only thing that knows what is already there. One listing covers every
-                // name in the plan, which is what a per-name lookup cannot do.
-                if (plan.overwrite != OpPlan::OW_OVERWRITE && !have_listing) {
-                    have_listing = true;
-                    std::vector<FileEntry> rows;
-                    std::string lerr;
-                    if (net_list(site, drpath, &rows, &lerr))
-                        for (const FileEntry& fe : rows) remote_names.insert(fe.name);
-                }
-                if (have_listing && remote_names.count(base)) {
-                    if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
-                    if (plan.overwrite == OpPlan::OW_RENAME) {
-                        std::string beside = rename_beside(dst, &remote_names);
-                        remote_names.insert(beside.substr(beside.find_last_of('/') + 1));
-                        dst = beside;
-                    }
-                }
-                std::string rdst = dst;
-                std::string lsrc = local;
-                // Here the offset is the size the server already holds, which is what a
-                // stopped upload left behind on the far side.
-                r = net_upload_tree(site, lsrc.c_str(), rdst, bg_progress_cb, t, &err, t->resume);
-                if (r && plan.is_move) fs_delete_entry_progress(lsrc.c_str(), bg_progress_cb, t);
+        if (t->download) {
+            std::string src = net_join_remote(plan.remote_prefix, plan.names[i]);
+            std::string local = plan.dst_dir + "/" + base;
+            // The destination of a download is a directory on this disk, so the
+            // collision is asked of this disk.
+            if (fs_exists(local.c_str())) {
+                if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
+                if (plan.overwrite == OpPlan::OW_RENAME)
+                    local = rename_beside(local, nullptr);
             }
-        if (r) ok++;
-        if (t->abort) break;
+            sources[i] = src;
+            // A resume is per file: the one with a `.part` continues from it and the
+            // ones without are fetched whole. A restart clears the sidecars.
+            r = xfer_plan_download(site, src, local, t, i, t->resume, &items, &perr);
+        } else {
+            std::string local = plan.src_dir + "/" + plan.names[i];
+            std::string dst = drpath.empty() ? base : drpath + "/" + base;
+            // The destination of an upload is on the server, and the server is the
+            // only thing that knows what is already there. One listing covers every
+            // name in the plan, which is what a per-name lookup cannot do.
+            if (plan.overwrite != OpPlan::OW_OVERWRITE && !have_listing) {
+                have_listing = true;
+                std::vector<FileEntry> rows;
+                std::string lerr;
+                if (net_list(site, drpath, &rows, &lerr))
+                    for (const FileEntry& fe : rows) remote_names.insert(fe.name);
+            }
+            if (have_listing && remote_names.count(base)) {
+                if (plan.overwrite == OpPlan::OW_SKIP) { skipped++; continue; }
+                if (plan.overwrite == OpPlan::OW_RENAME) {
+                    std::string beside = rename_beside(dst, &remote_names);
+                    remote_names.insert(beside.substr(beside.find_last_of('/') + 1));
+                    dst = beside;
+                }
+            }
+            sources[i] = local;
+            // Here the offset is the size the server already holds, which is what a
+            // stopped upload left behind on the far side.
+            r = xfer_plan_upload(site, local, dst, t, i, t->resume, &items, &perr);
+        }
+        if (r) planned[i] = 1;
+        else if (err.empty()) err = perr;
+    }
+
+    // The connection the plan was made over is not needed while the queue runs -
+    // each of the queue's threads has its own - and a server that counts
+    // connections per user should see only those.
+    net_forget(&site);
+    if (site.rar_order) xfer_order_rar(&items);
+    if (!t->abort.load()) xfer_run(t, site, site.threads, std::move(items));
+
+    // A name counts once every file it held has arrived, and only then is the
+    // source of a move removed: the same order as before, now per name.
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        if (!planned[i] || !t->group_ok(i)) continue;
+        ok++;
+        if (plan.is_move && !t->abort.load()) {
+            if (t->download) net_remove_tree(site, sources[i], bg_abort_cb, t, &err);
+            else fs_delete_entry_progress(sources[i].c_str(), bg_abort_cb, t);
+        }
+    }
+    if (err.empty()) {
+        std::lock_guard<std::mutex> lk(t->mu);
+        err = t->first_err;
     }
     t->ok_names = ok;
     t->skipped_names = skipped;
@@ -3702,6 +3987,68 @@ static void bg_stop_all(AppPanes* app) {
         if (t->worker.joinable()) t->worker.join();
     }
     app->transfers.clear();
+    // Every row has returned from the queue, so what is left there are threads
+    // lingering for more work. They hold connections, and the library they belong
+    // to is about to be released.
+    xfer_shutdown();
+}
+
+// The queue as a whole, for the line over the rows: the bar, what is left, and
+// with the threads' speed, when it will be done.
+struct QueueSummary {
+    long long done = 0;    // bytes the batch's rows have
+    long long total = 0;   // bytes the batch adds up to
+    long long left = 0;    // bytes the running rows still owe
+    int running = 0;       // rows still running
+};
+
+// Which rows are in the batch is decided here, and so is when a batch starts and
+// ends: it starts with the first row running after an idle queue and ends when no
+// row runs. A finished row counts what it moved and nothing more, so a row that
+// failed halfway does not hold the bar short of the end forever.
+static QueueSummary bg_queue_summary(AppPanes* app) {
+    QueueSummary q;
+    double first = 0.0;
+    for (const std::unique_ptr<BgTransfer>& t : app->transfers) {
+        if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) continue;
+        q.running++;
+        if (first == 0.0 || t->t0 < first) first = t->t0;
+    }
+    if (!q.running) { app->queue_t0 = 0.0; return q; }
+    if (app->queue_t0 == 0.0 || first < app->queue_t0) app->queue_t0 = first;
+    for (const std::unique_ptr<BgTransfer>& t : app->transfers) {
+        bool running = t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
+        if (!running && t->t0 < app->queue_t0) continue;   // from an earlier batch
+        long long done = t->done.load(), total = t->total.load();
+        q.done += done;
+        if (running) {
+            q.total += total > done ? total : done;
+            q.left += total > done ? total - done : 0;
+        } else {
+            q.total += done;
+        }
+    }
+    return q;
+}
+
+// Bytes per second in the unit transfer windows use, and in the same decimal
+// megabytes human_size() writes sizes in, so "3.0M of 9.0M at 2.0 MB/s" adds up.
+static void fmt_rate(double bps, char* out, size_t n) {
+    if (!(bps > 0.0)) bps = 0.0;
+    snprintf(out, n, "%.1f MB/s", bps / 1e6);
+}
+
+// The line beside the queue's bar: how much of the batch has moved, when the rest
+// will have, and the speed of the threads moving it - the sum of what each one is
+// doing now, which is the number a stall shows up in at once.
+static void bg_queue_line(const QueueSummary& q, double rate, int busy, char* out, size_t n) {
+    char done_s[32], total_s[32], rate_s[32], eta[32] = "";
+    human_size_trim((off_t)q.done, done_s, sizeof(done_s));
+    human_size_trim((off_t)q.total, total_s, sizeof(total_s));
+    fmt_rate(rate, rate_s, sizeof(rate_s));
+    if (rate > 1.0 && q.left > 0) fmt_secs((double)q.left / rate, eta, sizeof(eta));
+    snprintf(out, n, "%s of %s  eta %s  %s  %d thread%s", done_s, total_s,
+             eta[0] ? eta : "-", rate_s, busy, busy == 1 ? "" : "s");
 }
 
 // How much room the transfer strip needs, so the panes can be given what is left
@@ -3711,6 +4058,9 @@ static float bg_strip_height(const AppPanes* app, float frame) {
     if (app->transfers.empty()) return 0.0f;
     int rows = 1 + (int)app->transfers.size();
     if (rows > 7) rows = 7;
+    // The queue's own line over the table, while anything is running.
+    for (const std::unique_ptr<BgTransfer>& t : app->transfers)
+        if (t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) { rows++; break; }
     return 6.0f + (float)rows * frame;
 }
 
@@ -3719,14 +4069,57 @@ static float bg_strip_height(const AppPanes* app, float frame) {
 static void render_transfers(AppPanes* app, float h) {
     if (app->transfers.empty() && app->sfv_jobs.empty()) return;
     ImGui::Spacing();
+    // The queue: one bar for everything this burst of work is moving, and the
+    // speed of the threads moving it. It is a line of its own over the table, as
+    // wide as the strip: in a table column it was cut off at the buttons. Sampled
+    // every frame so the meter has the history a "current" speed is measured over.
+    std::vector<XferThreadStat> threads;
+    int queued = 0;
+    xfer_snapshot(&threads, &queued);
+    double rate = app->queue_meter.update(SDL_GetTicks() / 1000.0, threads);
+    QueueSummary q = bg_queue_summary(app);
+    if (q.running) {
+        float frac = q.total > 0 ? (float)((double)q.done / (double)q.total) : 0.0f;
+        char overlay[32];
+        snprintf(overlay, sizeof(overlay), "queue %d%%", (int)(frac * 100.0f + 0.5f));
+        ImGui::ProgressBar(frac, ImVec2(150.0f, 0.0f), overlay);
+        ImGui::SameLine();
+        int busy = 0;
+        for (const XferThreadStat& s : threads) busy += s.file.empty() ? 0 : 1;
+        char line[256];
+        bg_queue_line(q, rate, busy, line, sizeof(line));
+        ImGui::TextUnformatted(elide_middle(line, ImGui::GetContentRegionAvail().x).c_str());
+        // Each thread's own share of the sum, and what it is moving.
+        if (ImGui::IsItemHovered()) {
+            char head[64];
+            snprintf(head, sizeof(head), "%d file%s waiting in the queue", queued,
+                     queued == 1 ? "" : "s");
+            std::string tip = head;
+            for (size_t i = 0; i < threads.size(); i++) {
+                const XferThreadStat& s = threads[i];
+                char r[32];
+                fmt_rate(app->queue_meter.rate[s.id], r, sizeof(r));
+                char row[512];
+                snprintf(row, sizeof(row), "\nthread %d  %-12s %s", (int)i + 1, r,
+                         s.file.empty() ? "(waiting for work)" : s.file.c_str());
+                tip += row;
+            }
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
     ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
     if (app->transfers.size() > 6) flags |= ImGuiTableFlags_ScrollY;
-    if (!ImGui::BeginTable("bg_transfers", 5, flags, ImVec2(0, h - 6.0f))) return;
+    float table_h = h - 6.0f - (q.running ? ImGui::GetFrameHeightWithSpacing() : 0.0f);
+    if (!ImGui::BeginTable("bg_transfers", 5, flags, ImVec2(0, table_h))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 40.0f);   // get / put
     ImGui::TableSetupColumn("Transfer", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 150.0f);  // the bar
-    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 330.0f);  // the numbers
+    // The numbers column is as wide as the longest line bg_line() writes in the
+    // font in use, so a larger font widens it instead of cutting it off.
+    float numbers_w = ImGui::CalcTextSize("999.9M of 999.9M   999.9M left   999.9M/s   eta 59m59s").x +
+                      ImGui::GetStyle().CellPadding.x * 2.0f;
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, numbers_w);  // the numbers
     ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 140.0f);  // the buttons
 
     // Header: how many, and one place to clear the finished rows, which
@@ -3742,6 +4135,7 @@ static void render_transfers(AppPanes* app, float h) {
     if (any_finished && ImGui::SmallButton("clear finished"))
         for (std::unique_ptr<BgTransfer>& t : app->transfers)
             if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) t->dismiss = true;
+
     ImGui::TableNextColumn();
     ImGui::TableNextColumn();
     ImGui::TableNextColumn();
@@ -4129,7 +4523,7 @@ static void do_paste_archive_now(AppPanes* app, OpPlan::Overwrite ow) {
     app->prog_active = false;
     if (ok) {
         snprintf(app->status_msg, sizeof(app->status_msg),
-                 "Extracted %d member%s into %s%s", raws.size(), raws.size() == 1 ? "" : "s",
+                 "Extracted %d member%s into %s%s", (int)raws.size(), raws.size() == 1 ? "" : "s",
                  active.current_dir, skipped ? "  (extracted over what was there)" : "");
         app->clipboard.paths.clear();
         app->clipboard.archive[0] = '\0';
@@ -4337,10 +4731,9 @@ static bool  viewer_dirty = false;
 static void close_viewer(AppPanes* app) {
     app->viewer_open = false;
     if (app->viewer_tmp_dir[0]) {
-        char cmd[4200];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", app->viewer_tmp_dir);
-        int rc = system(cmd);
-        (void)rc;
+        // Removed here rather than by `rm -rf` through a shell: there is no rm behind
+        // Windows' system(), and no quoting to get wrong this way.
+        fs_delete_entry(app->viewer_tmp_dir);
         app->viewer_tmp_dir[0] = '\0';
     }
 }
@@ -4482,10 +4875,8 @@ static std::string member_raw(const Pane& pane, const char* rel) {
 // as an extracted archive member is.
 static bool remote_fetch_temp(AppPanes* app, const NetSite& site, const std::string& rpath,
                               char* out_path, size_t npath, char* out_dir, size_t ndir) {
-    const char* tmp = getenv("TMPDIR");
-    if (!tmp || !*tmp) tmp = "/tmp";
     char tmpl[4096];
-    snprintf(tmpl, sizeof(tmpl), "%s/mc-clone-ftp-XXXXXX", tmp);
+    snprintf(tmpl, sizeof(tmpl), "%s/mc-clone-ftp-XXXXXX", plat_temp_dir().c_str());
     if (!mkdtemp(tmpl)) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Cannot make a temporary directory: %s",
                  strerror(errno));
@@ -4562,9 +4953,8 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
             }
             return;
         }
-        char parentbuf[4096];
-        snprintf(parentbuf, sizeof(parentbuf), "%s", pane.current_dir);
-        char* parent = dirname(parentbuf);
+        char parent[4096];
+        pane_parent(pane.current_dir, parent, sizeof(parent));
         navigate_to(app, &pane, parent);
     } else if (is_directory(e->name, e->mode)) {
         char path[4100];
@@ -4608,17 +4998,11 @@ static void spawn_terminal_editor(AppPanes* app, const char* fullpath) {
         snprintf(app->status_msg, sizeof(app->status_msg), "%s", launch.note.c_str());
         return;
     }
-    pid_t pid = fork();
-    if (pid == 0) {
-        std::vector<char*> argv;
-        for (std::string& a : launch.argv) argv.push_back(const_cast<char*>(a.c_str()));
-        argv.push_back(nullptr);
-        execvp(argv[0], argv.data());
-        // Found a moment ago and still unrunnable: a name on PATH that went away, or a
-        // file that is not really executable. Say which one, on stderr, where a
-        // forked child is allowed to say things.
-        fprintf(stderr, "immc: cannot run %s: %s\n", argv[0], strerror(errno));
-        _exit(127);
+    std::string err;
+    if (!plat_spawn_detached(launch.argv, &err)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot run %s: %s",
+                 launch.argv[0].c_str(), err.c_str());
+        return;
     }
     snprintf(app->status_msg, sizeof(app->status_msg), "Editing %s with %s in %s",
              fullpath, term_editor_name(), launch.name.c_str());
@@ -4626,14 +5010,10 @@ static void spawn_terminal_editor(AppPanes* app, const char* fullpath) {
 
 // Alt+F3: hand the entry to the desktop's default handler.
 static void open_with_default(AppPanes* app, const char* fullpath) {
-    if (system("command -v xdg-open >/dev/null 2>&1") != 0) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "No xdg-open for %s", fullpath);
+    std::string err;
+    if (!plat_open_default(fullpath, &err)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s: %s", fullpath, err.c_str());
         return;
-    }
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("xdg-open", "xdg-open", fullpath, (char*)nullptr);
-        _exit(127);
     }
     snprintf(app->status_msg, sizeof(app->status_msg), "Open with default: %s", fullpath);
 }
@@ -4921,8 +5301,8 @@ static void render_tree(AppPanes* app) {
 // ---------------------------------------------------------------------------
 
 static const char* tab_label(const char* dir, char* buf, size_t n) {
-    const char* home = getenv("HOME");
-    if (home && strcmp(dir, home) == 0) { snprintf(buf, n, "~"); return buf; }
+    const std::string home = plat_home_dir();
+    if (!home.empty() && strcmp(dir, home.c_str()) == 0) { snprintf(buf, n, "~"); return buf; }
     const char* base = strrchr(dir, '/');
     snprintf(buf, n, "%s", (base && base[1]) ? base + 1 : dir);
     return buf;
@@ -5291,12 +5671,7 @@ static void qv_run_fetch(QvFetch* f, QvJob job) {
             else qv_read_file(file, &body, &err);
         }
     }
-    if (tmpdir[0]) {
-        char cmd[4200];
-        snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
-        int rc = system(cmd);
-        (void)rc;
-    }
+    if (tmpdir[0]) fs_delete_entry(tmpdir);   // no shell: see close_viewer
 
     // A picture is settled here, on the worker: it is the only place the whole file
     // is in hand, and the only place a 12-megapixel decode is allowed to happen.
@@ -6197,6 +6572,12 @@ static void render_dirhist(AppPanes* app) {
 // Alt+F8 lives inside the console window now (render_console_hist), so there is no
 // history window of its own to draw.
 
+#ifdef _WIN32
+// Drives for the Alt+F1/F2 picker: every drive letter, from platform.cpp.
+static void list_mounts(StringList* mnts, StringList* labels) {
+    plat_list_drives(mnts, labels);
+}
+#else
 // Mounted drives for the Alt+F1/F2 picker. /proc/mounts holds
 // "device mountpoint fstype options dump pass"; pseudo filesystems are skipped.
 static void list_mounts(StringList* mnts, StringList* labels) {
@@ -6223,38 +6604,133 @@ static void list_mounts(StringList* mnts, StringList* labels) {
     }
     fclose(f);
 }
+#endif
+
+// The picker's rows: the drives, then the favorites (the hotlist). One list to the
+// arrow keys and to Enter; `drives` says where the favorites begin.
+static void volumes_rows(const AppPanes* app, StringList* paths, StringList* labels, int* drives) {
+    list_mounts(paths, labels);
+    *drives = (int)paths->size();
+    for (const std::string& f : app->hotlist) {
+        paths->push_back(f);
+        labels->push_back(f);
+    }
+}
+
+// Take favorite row `row` out of the hotlist, keeping the cursor on the list.
+static void volumes_remove_favorite(AppPanes* app, int row, int drives) {
+    int f = row - drives;
+    if (f < 0 || f >= (int)app->hotlist.size()) return;
+    snprintf(app->status_msg, sizeof(app->status_msg), "Removed from favorites: %s",
+             app->hotlist[f].c_str());
+    app->hotlist.erase(app->hotlist.begin() + f);
+    hotlist_save(app);
+    int count = drives + (int)app->hotlist.size();
+    if (app->volumes_cursor >= count) app->volumes_cursor = count - 1;
+    app->volumes_moved = true;
+}
+
+// Open drive `i` of the list in the pane the picker is for, and close the picker.
+// The mouse and Enter both come here, so they cannot disagree about what a pick does.
+static void volumes_pick(AppPanes* app, const StringList& mnt, int i) {
+    if (i < 0 || i >= (int)mnt.size()) return;
+    Pane& pane = app->volumes_target == 0 ? app->left : app->right;
+    DIR* probe = opendir(mnt[i].c_str());
+    if (probe) {
+        closedir(probe);
+        navigate_to(app, &pane, mnt[i].c_str());
+        app->left_focus = app->volumes_target == 0;
+    } else {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s", mnt[i].c_str());
+    }
+    app->volumes_open = false;
+    app->volumes_cursor = -1;
+}
+
+// Where the cursor starts: on the drive the pane is on now - the mount whose path is
+// the longest prefix of the pane's directory - so Enter alone changes nothing and
+// one arrow press is the drive next to it.
+static int volumes_home_row(const AppPanes* app, const StringList& mnt) {
+    const Pane& pane = app->volumes_target == 0 ? app->left : app->right;
+    int best = mnt.empty() ? -1 : 0;
+    size_t best_len = 0;
+    for (int i = 0; i < (int)mnt.size(); i++) {
+        const std::string& m = mnt[i];
+        if (m.size() <= best_len) continue;
+#ifdef _WIN32
+        bool prefix = !strncasecmp(pane.current_dir, m.c_str(), m.size());
+#else
+        bool prefix = !strncmp(pane.current_dir, m.c_str(), m.size()) &&
+                      (m == "/" || pane.current_dir[m.size()] == '/' ||
+                       pane.current_dir[m.size()] == '\0');
+#endif
+        if (prefix) { best = i; best_len = m.size(); }
+    }
+    return best;
+}
+
+// The row a typed letter means: the next drive after the cursor whose name starts
+// with it - "D" is D:/ on Windows, and on Linux the first mount whose last part does
+// (/media/data for "d"). -1 when none does.
+static int volumes_letter_row(const StringList& mnt, int cur, char letter) {
+    int n = (int)mnt.size();
+    for (int step = 1; step <= n; step++) {
+        int i = ((cur < 0 ? -1 : cur) + step) % n;
+        const std::string& m = mnt[i];
+        size_t slash = m.find_last_of('/', m.size() > 1 ? m.size() - 2 : 0);
+        char first = m.size() > 1 && m[1] == ':' ? m[0]
+                   : (slash != std::string::npos && slash + 1 < m.size() ? m[slash + 1] : m[0]);
+        if (tolower((unsigned char)first) == tolower((unsigned char)letter)) return i;
+    }
+    return -1;
+}
 
 // Alt+F1 / Alt+F2: choose the drive shown in the left/right pane.
 static void render_volumes(AppPanes* app) {
     if (!app->volumes_open) return;
     StringList mnt, label;
-    list_mounts(&mnt, &label);
+    int drives = 0;
+    volumes_rows(app, &mnt, &label, &drives);
+    if (app->volumes_cursor < 0 || app->volumes_cursor >= (int)mnt.size()) {
+        app->volumes_cursor = volumes_home_row(app, StringList(mnt.begin(), mnt.begin() + drives));
+        app->volumes_moved = true;
+    }
     ImGui::SetNextWindowSize(ImVec2(640, 320), ImGuiCond_FirstUseEver);
     bool open = true;
     char title[80];
     snprintf(title, sizeof(title), "Drives for the %s pane (Alt+F1/F2)",
              app->volumes_target == 0 ? "left" : "right");
     ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse);
-    if (mnt.empty()) ImGui::TextUnformatted("(no mounted drives found)");
+    if (drives == 0) ImGui::TextUnformatted("(no mounted drives found)");
+    else ImGui::TextDisabled("arrows and Enter, or the drive's letter; Esc closes");
+    int remove_row = -1;
     for (int i = 0; i < (int)mnt.size(); i++) {
+        if (i == drives) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Favorites   Ins or Alt+D adds the pane's folder, Del removes one");
+        }
         ImGui::PushID(i);
-        if (ImGui::Selectable(label[i].c_str(), false)) {
-            Pane& pane = app->volumes_target == 0 ? app->left : app->right;
-            DIR* probe = opendir(mnt[i].c_str());
-            if (probe) {
-                closedir(probe);
-                navigate_to(app, &pane, mnt[i].c_str());
-                app->left_focus = app->volumes_target == 0;
-            } else {
-                snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s", mnt[i].c_str());
-            }
-            app->volumes_open = false;
-            ImGui::PopID();
-            break;
+        bool fav = i >= drives;
+        // A favorite's row stops where its button begins, or the row would take the
+        // button's click.
+        float w = fav ? ImGui::GetContentRegionAvail().x - 70.0f : 0.0f;
+        bool clicked = ImGui::Selectable(label[i].c_str(), app->volumes_cursor == i, 0,
+                                         ImVec2(w > 40.0f || !fav ? w : 40.0f, 0));
+        if (app->volumes_moved && app->volumes_cursor == i) ImGui::SetScrollHereY(0.5f);
+        if (fav) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("remove")) remove_row = i;
         }
         ImGui::PopID();
+        if (clicked) { volumes_pick(app, mnt, i); break; }
     }
-    if (!open) app->volumes_open = false;
+    if (drives > 0 && app->hotlist.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("No favorites yet: Ins here, or Alt+D in a pane, adds the folder");
+    }
+    if (remove_row >= 0) volumes_remove_favorite(app, remove_row, drives);
+    app->volumes_moved = false;
+    if (!open) { app->volumes_open = false; app->volumes_cursor = -1; }
     ImGui::End();
 }
 
@@ -6439,7 +6915,7 @@ static void render_about(AppPanes* app) {
         "Alt+Down dir history   Alt+F8 command history   Alt+F1/F2 choose drive\n"
         "Alt+F11/F12 keyboard-focus the left / right path bar\n"
         "Alt+Enter properties               Ctrl+R refresh     Ctrl+O view mode\n"
-        "Alt+. hidden files Alt+D add to hotlist  Shift+F9 hotlist  Alt+F7 search\n"
+        "Alt+. hidden files Alt+D add favorite   Shift+F9 hotlist  Alt+F7 search\n"
         "Ctrl+S quick filter  Ctrl+Shift+S re-apply  Ctrl+F10 clear filter\n"
         "Ctrl+F11 executables only  Ctrl+F12 filter preset from the config\n"
         "Shift+F10 / Menu local menu   Shift+Esc minimize window   F1 hides this help\n"
@@ -6477,6 +6953,25 @@ static void render_about(AppPanes* app) {
 // "adam (1000)", or just "1000" when the id has no entry. A file owned by a uid the
 // passwd database does not know is still owned by that uid - an LDAP or container
 // system is full of them - and a blank would read as nobody owning it.
+#ifdef _WIN32
+// Windows files are owned by a security identifier, not a uid, and the numbers a stat
+// call makes up for it are always 0. Saying so beats naming a user who does not exist.
+static void props_id_names(uid_t, gid_t, char* owner, size_t owner_n,
+                           char* group_name, size_t group_n) {
+    snprintf(owner, owner_n, "(not used on Windows)");
+    snprintf(group_name, group_n, "(not used on Windows)");
+}
+
+static bool props_parse_id(const char*, bool, unsigned long*, std::string* why) {
+    *why = "ownership is not set from here on Windows";
+    return false;
+}
+
+static int lchown(const char*, uid_t, gid_t) {
+    errno = ENOSYS;
+    return -1;
+}
+#else
 static void props_id_names(uid_t uid, gid_t gid, char* owner, size_t owner_n,
                            char* group_name, size_t group_n) {
     struct passwd* pw = getpwuid(uid);
@@ -6512,6 +7007,7 @@ static bool props_parse_id(const char* text, bool group, unsigned long* out, std
     *out = (unsigned long)pw->pw_uid;
     return true;
 }
+#endif
 
 // Four octal digits, which is what the boxes show and what a person used to chmod
 // will type. A leading 0 is allowed because that is how mode is written everywhere
@@ -7020,8 +7516,11 @@ static void render_options(AppPanes* app) {
     } else {
         char raster[64];
         mc_font_rasterizer(raster, sizeof(raster));
+        // Wrapped like the rest of the dialog: on one line this is wider than the window.
+        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("Hinting is not offered: this build rasterizes text with %s, which does no "
                             "hinting at all. Build against freetype2 and the choice appears here.", raster);
+        ImGui::PopTextWrapPos();
     }
 
     ImGui::Spacing();
@@ -7098,6 +7597,8 @@ struct NetForm {
     bool remember;
     bool verify_tls;
     bool passive;
+    int  threads;              // files a copy moves at once
+    bool rar_order;            // RAR volumes in the order they are read
     bool open;                 // the editor is showing below the list
 };
 static NetForm g_net_form;
@@ -7113,6 +7614,8 @@ static void remote_form_blank(void) {
     g_net_form.remember = false;
     g_net_form.verify_tls = true;
     g_net_form.passive = true;
+    g_net_form.threads = NetSite().threads;
+    g_net_form.rar_order = NetSite().rar_order;
     g_net_form.open = true;
 }
 
@@ -7127,6 +7630,8 @@ static void remote_form_fill(const NetSite& s) {
     g_net_form.remember = s.remember;
     g_net_form.verify_tls = s.verify_tls;
     g_net_form.passive = s.passive;
+    g_net_form.threads = s.threads;
+    g_net_form.rar_order = s.rar_order;
     g_net_form.open = true;
 }
 
@@ -7146,6 +7651,8 @@ static bool remote_form_site(AppPanes* app, NetSite* out, const NetSite* base) {
     out->remember = g_net_form.remember;
     out->verify_tls = g_net_form.verify_tls;
     out->passive = g_net_form.passive;
+    out->threads = xfer_clamp_threads(g_net_form.threads);
+    out->rar_order = g_net_form.rar_order;
     if (strchr(out->host.c_str(), ':') || strstr(out->host.c_str(), "/")) {
         NetSite parsed;
         std::string err;
@@ -7243,8 +7750,8 @@ static void remote_disconnect(AppPanes* app) {
     else {
         // A pane opened straight onto a site has no local directory of its own to
         // go back to, so it goes to the one a pane always has.
-        const char* home = getenv("HOME");
-        snprintf(back, sizeof(back), "%s", (home && *home) ? home : "/");
+        const std::string home = plat_home_dir();
+        snprintf(back, sizeof(back), "%s", !home.empty() ? home.c_str() : plat_root_of(nullptr).c_str());
     }
     navigate_to(app, &active, back);
     snprintf(app->status_msg, sizeof(app->status_msg), "Disconnected from %s", root.c_str());
@@ -7264,6 +7771,8 @@ static void remote_open_url(AppPanes* app, const char* url) {
         site.remember = known->remember;
         site.verify_tls = known->verify_tls;
         site.passive = known->passive;
+        site.threads = known->threads;
+        site.rar_order = known->rar_order;
     }
     remote_open(app, site);
 }
@@ -7284,6 +7793,8 @@ static void remote_quick_commit(AppPanes* app) {
         site.remember = saved->remember;
         site.verify_tls = saved->verify_tls;
         site.passive = saved->passive;
+        site.threads = saved->threads;
+        site.rar_order = saved->rar_order;
     }
     app->remote_quick_open = false;
     app->remote_quick[0] = '\0';
@@ -7354,6 +7865,79 @@ static int net_cursor_step(int cur, int count, SDL_Keycode key) {
     default:
         return cur;
     }
+}
+
+// ---- importing FileZilla's site manager ----
+//
+// The manager's "Import from FileZilla" reads FileZilla's sitemanager.xml and
+// lists every site in it with a tick, so the ones worth keeping are chosen
+// before anything is written. A site already in the list starts unticked;
+// ticking it replaces the saved entry with FileZilla's.
+struct FzImport {
+    bool open = false;
+    char path[1024] = "";
+    std::vector<NetImported> sites;
+    std::vector<char> pick;    // one per site: import it
+    std::vector<char> known;   // one per site: its URL is already a saved site
+    int skipped = 0;           // sites in protocols this program does not speak
+    int cursor = -1;           // the row the keyboard is on
+    bool cursor_moved = false; // scroll the cursor's row into view
+    bool field_active = false; // the path field has the caret
+    std::string err;
+};
+static FzImport g_fz;
+
+static void fz_import_load(AppPanes* app) {
+    g_fz.sites.clear();
+    g_fz.pick.clear();
+    g_fz.known.clear();
+    g_fz.cursor = -1;
+    net_filezilla_load(g_fz.path, &g_fz.sites, &g_fz.skipped, &g_fz.err);
+    for (const NetImported& imp : g_fz.sites) {
+        bool known = net_sites_find(app->remote_sites, net_site_root(imp.site)) != nullptr;
+        g_fz.known.push_back(known);
+        g_fz.pick.push_back(!known);
+    }
+    if (!g_fz.sites.empty()) g_fz.cursor = 0;
+}
+
+static void fz_import_open(AppPanes* app) {
+    g_fz.open = true;
+    snprintf(g_fz.path, sizeof(g_fz.path), "%s", net_filezilla_path().c_str());
+    fz_import_load(app);
+}
+
+static int fz_import_picked(void) {
+    int n = 0;
+    for (char p : g_fz.pick) n += p ? 1 : 0;
+    return n;
+}
+
+// Add the ticked sites to the list and write the sites file once. Returns how
+// many were taken; with none ticked nothing is written and the window stays.
+static int fz_import_commit(AppPanes* app) {
+    int n = 0;
+    for (size_t i = 0; i < g_fz.sites.size(); i++) {
+        if (!g_fz.pick[i]) continue;
+        const NetSite& site = g_fz.sites[i].site;
+        std::string root = net_site_root(site);
+        bool replaced = false;
+        for (NetSite& s : app->remote_sites) {
+            if (net_site_root(s) != root) continue;
+            net_forget(&s);            // an old login must not be reused after an edit
+            s = site;
+            replaced = true;
+            break;
+        }
+        if (!replaced) app->remote_sites.push_back(site);
+        n++;
+    }
+    if (n == 0) return 0;
+    remote_sites_write(app);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Imported %d site%s from FileZilla",
+             n, n == 1 ? "" : "s");
+    g_fz = FzImport();
+    return n;
 }
 
 static void render_remote_manager(AppPanes* app) {
@@ -7470,6 +8054,8 @@ static void render_remote_manager(AppPanes* app) {
             app->remote_quick_open = true;
             app->remote_focus_request = true;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Import from FileZilla")) fz_import_open(app);
     } else {
         ImGui::TextUnformatted(app->remote_edit >= 0 ? "Edit site" : "New site");
         ImGui::SetNextItemWidth(300);
@@ -7493,6 +8079,18 @@ static void render_remote_manager(AppPanes* app) {
                                       "FTPS (implicit, port 990)", "SFTP (SSH)" };
         ImGui::SetNextItemWidth(300);
         ImGui::Combo("protocol", &g_net_form.proto, proto_names, IM_ARRAYSIZE(proto_names));
+        ImGui::SetNextItemWidth(200);
+        ImGui::SliderInt("transfer threads", &g_net_form.threads, XFER_MIN_THREADS,
+                         XFER_MAX_THREADS);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How many files a copy to or from this site moves at once, each "
+                              "over its own connection.\nA server that limits connections per "
+                              "user refuses the ones over its limit.");
+        ImGui::Checkbox("transfer RAR volumes in order", &g_net_form.rar_order);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("A RAR set goes volume by volume - .rar, .r00, .r01 ... .s00, or "
+                              ".part1.rar, .part2.rar - after the folder's other files, "
+                              "instead of in the order the listing gives.");
         ImGui::Checkbox("passive mode", &g_net_form.passive);
         if (g_net_form.proto != NET_SFTP) {
             ImGui::SameLine();
@@ -7525,6 +8123,83 @@ static void render_remote_manager(AppPanes* app) {
         ImGui::TextDisabled("%s", app->remote_note);
     }
     if (!open) app->remote_mgr_open = false;
+    ImGui::End();
+}
+
+static void render_fz_import(AppPanes* app) {
+    if (!g_fz.open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 360, io.DisplaySize.y * 0.5f - 240),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Import from FileZilla", &open, ImGuiWindowFlags_NoCollapse);
+
+    ImGui::SetNextItemWidth(-90);
+    ImGui::InputText("##fzpath", g_fz.path, sizeof(g_fz.path));
+    g_fz.field_active = ImGui::IsItemActive();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("FileZilla's sitemanager.xml - a portable FileZilla keeps it beside "
+                          "FileZilla.exe");
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) fz_import_load(app);
+
+    if (!g_fz.err.empty()) {
+        ImGui::TextWrapped("%s", g_fz.err.c_str());
+    } else if (g_fz.sites.empty()) {
+        ImGui::TextUnformatted("(no FTP, FTPS or SFTP sites in this file)");
+    }
+    if (g_fz.skipped > 0)
+        ImGui::TextDisabled("%d site%s in other protocols (S3, WebDAV, ...) left out",
+                            g_fz.skipped, g_fz.skipped == 1 ? "" : "s");
+
+    float buttons_h = ImGui::GetFrameHeightWithSpacing() * 2.0f;
+    ImGui::BeginChild("##fzlist", ImVec2(0, -buttons_h), ImGuiChildFlags_Borders);
+    for (int i = 0; i < (int)g_fz.sites.size(); i++) {
+        const NetImported& imp = g_fz.sites[i];
+        ImGui::PushID(i);
+        bool pick = g_fz.pick[i] != 0;
+        if (ImGui::Checkbox("##pick", &pick)) { g_fz.pick[i] = pick; g_fz.cursor = i; }
+        ImGui::SameLine();
+        std::string root = net_site_root(imp.site);
+        char label[1024];
+        snprintf(label, sizeof(label), "%s  %s%s", imp.site.name.c_str(), root.c_str(),
+                 imp.site.path.c_str());
+        if (ImGui::Selectable(label, g_fz.cursor == i)) {
+            g_fz.cursor = i;
+            g_fz.pick[i] = !g_fz.pick[i];
+        }
+        if (g_fz.cursor_moved && g_fz.cursor == i) ImGui::SetScrollHereY(0.5f);
+        std::string note = imp.note;
+        if (g_fz.known[i]) note = note.empty() ? "already saved: importing replaces it"
+                                               : "already saved: importing replaces it; " + note;
+        if (!note.empty()) {
+            ImGui::Indent(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
+            ImGui::TextDisabled("%s", note.c_str());
+            ImGui::Unindent(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
+        }
+        ImGui::PopID();
+    }
+    g_fz.cursor_moved = false;
+    ImGui::EndChild();
+
+    if (ImGui::Button("All")) for (char& p : g_fz.pick) p = 1;
+    ImGui::SameLine();
+    if (ImGui::Button("None")) for (char& p : g_fz.pick) p = 0;
+    ImGui::SameLine();
+    int picked = fz_import_picked();
+    char import_label[64];
+    snprintf(import_label, sizeof(import_label), "Import %d site%s###fzimport", picked,
+             picked == 1 ? "" : "s");
+    ImGui::BeginDisabled(picked == 0);
+    if (ImGui::Button(import_label)) fz_import_commit(app);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) open = false;
+    ImGui::TextDisabled("Space ticks a row, Ctrl+A all or none, Enter imports. A password "
+                        "comes across as a remembered one.");
+
+    if (!open) g_fz = FzImport();
     ImGui::End();
 }
 
@@ -7713,9 +8388,7 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Count marked", "Ctrl+L")) count_marked_sizes(app);
     if (ImGui::MenuItem("Fill directory sizes", "Alt+Shift+Enter")) app->pending_op = DEFER_FILL_SIZES;
     if (ImGui::MenuItem("Add to hotlist", "Alt+D")) {
-        bool dup = false;
-        for (const std::string& s : app->hotlist) if (s == active.current_dir) { dup = true; break; }
-        if (!dup) { app->hotlist.push_back(active.current_dir); hotlist_save(app); }
+        hotlist_add(app, active.current_dir);
     }
     ImGui::Separator();
     if (ImGui::MenuItem("Mark all", "Ctrl+Num+")) select_all_marks(active);
@@ -7726,7 +8399,8 @@ static void render_commands_items(AppPanes* app) {
     if (ImGui::MenuItem("Swap panes", "Ctrl+U")) swap_panes(app, false);
     if (ImGui::MenuItem("Branch view", "Ctrl+B")) branch_toggle(app, active, false);
     if (ImGui::MenuItem("Branch marked dirs", "Ctrl+Shift+B")) branch_toggle(app, active, true);
-    if (ImGui::MenuItem("Go to root", "Ctrl+,")) navigate_to(app, &active, "/");
+    if (ImGui::MenuItem("Go to root", "Ctrl+,"))
+        navigate_to(app, &active, plat_root_of(active.current_dir).c_str());
     if (ImGui::MenuItem("Other pane to cursor dir", "Ctrl+Left")) open_cursor_in_other_pane(app, &active, &other);
     ImGui::Separator();
     if (ImGui::MenuItem("Cycle view mode", "Ctrl+O"))
@@ -7764,6 +8438,11 @@ void app_panes_render(AppPanes* app) {
     // is filed under the path it was asked for here, and its thread is joined
     // here, where waiting for a finished thread costs nothing.
     qv_reap(app);
+
+    // And for the console: a command that has finished stops saying "running" now,
+    // not when the next one is typed - before, Esc on a finished command still
+    // "cancelled" it, and the transcript said it was interrupted.
+    console_reap(app);
 
     // ImGui answers one keyboard-focus request per frame, and the last one
     // submitted wins. Any field that wants the caret has to claim it here and be
@@ -7998,6 +8677,7 @@ void app_panes_render(AppPanes* app) {
     render_properties(app);
     render_options(app);
     render_remote_manager(app);
+    render_fz_import(app);
     render_remote_quick(app);
 
     // The close request is a one-frame signal and every popup above has had its
@@ -8009,8 +8689,9 @@ void app_panes_render(AppPanes* app) {
 
 AppPanes* app_panes_init() {
     AppPanes* app = new AppPanes();
-    const char* home = getenv("HOME");
-    if (!home || !*home) home = "/";
+    std::string home_dir = plat_home_dir();
+    if (home_dir.empty()) home_dir = plat_root_of(nullptr);
+    const char* home = home_dir.c_str();
 
     // Before the first refresh: a pane that navigates to a site needs the login,
     // and refresh_pane() reaches the site list through these bindings.
@@ -8687,6 +9368,9 @@ static bool is_archive_key(SDL_Keycode key, SDL_Keymod mod) {
 // Keys the app handles itself (never forwarded to ImGui text input).
 // Everything else (printable characters) goes to the command line.
 bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
+    // The drive picker has no text field, and its letters pick a drive: typed into
+    // the command line behind it they would be text nobody meant.
+    if (app && app->volumes_open) return true;
     // True while a pane's quick filter field holds the keyboard: typing then
     // belongs to the filter, not to the marks or the command line.
     auto filter_focused = [app]() {
@@ -8713,11 +9397,24 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
         default: break;
         }
     }
+    // The FileZilla import's path field holds a path, and a Windows one has spaces
+    // in it. Away from the field the arrows and Space are the list's, even with
+    // the manager's site form open underneath.
+    if (app && g_fz.open && g_fz.field_active) {
+        switch (key) {
+        case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
+        case SDLK_SPACE:
+            return false;
+        default: break;
+        }
+    }
     // And for the remote dialogs. The site form and the quick-connect line are
     // text fields, so arrows, Home, End and Delete belong to the caret inside
     // them; without this the caret never moves and the pane behind the dialog
     // walks instead, which reads as the dialog ignoring what was typed.
-    if (app && (app->remote_quick_open || (app->remote_mgr_open && g_net_form.open))) {
+    if (app && (app->remote_quick_open ||
+                (app->remote_mgr_open && g_net_form.open && !g_fz.open))) {
         switch (key) {
         case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
         case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
@@ -8871,6 +9568,31 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         // is the one exception, because pressing it again is also the way out.
         if (!(key == SDLK_N && (mod & SDL_KMOD_CTRL))) return;
     }
+    // The FileZilla import sits over the manager and takes the keys before it:
+    // the arrows walk its rows, Space ticks one, Enter imports what is ticked.
+    // While the path field has the caret the keys are its text, and Enter reads
+    // the file that was typed.
+    if (g_fz.open) {
+        if (key == SDLK_ESCAPE) { g_fz = FzImport(); return; }
+        if (g_fz.field_active) {
+            if (key == SDLK_RETURN || key == SDLK_KP_ENTER) fz_import_load(app);
+            return;
+        }
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { fz_import_commit(app); return; }
+        if (key == SDLK_SPACE || key == SDLK_INSERT) {
+            if (g_fz.cursor >= 0 && g_fz.cursor < (int)g_fz.pick.size())
+                g_fz.pick[g_fz.cursor] = !g_fz.pick[g_fz.cursor];
+            return;
+        }
+        if (key == SDLK_A && (mod & SDL_KMOD_CTRL)) {
+            bool all = fz_import_picked() == (int)g_fz.pick.size();
+            for (char& p : g_fz.pick) p = !all;
+            return;
+        }
+        int next = net_cursor_step(g_fz.cursor, (int)g_fz.sites.size(), key);
+        if (next != g_fz.cursor) { g_fz.cursor = next; g_fz.cursor_moved = true; }
+        return;
+    }
     if (app->remote_mgr_open) {
         if (key == SDLK_ESCAPE) {
             if (g_net_form.open) { g_net_form.open = false; app->remote_edit = -1; }
@@ -8927,6 +9649,60 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // TC Shift+Esc: minimize the window.
     if (key == SDLK_ESCAPE && shift && app->sdl_window) {
         SDL_MinimizeWindow((SDL_Window*)app->sdl_window);
+        return;
+    }
+
+    // ---- Alt+F1/F2 drive picker: the arrows walk it, Enter opens the drive, a
+    //      letter jumps to the drive it names, Esc closes. It is a window over the
+    //      panes, so no other key reaches them; Alt+F1/F2 still go through, to close
+    //      it or to turn it to the other pane. ----
+    if (app->volumes_open && !((key == SDLK_F1 || key == SDLK_F2) && (mod & SDL_KMOD_ALT))) {
+        StringList mnt, label;
+        int drives = 0;
+        volumes_rows(app, &mnt, &label, &drives);
+        StringList drive_paths(mnt.begin(), mnt.begin() + drives);
+        if (app->volumes_cursor < 0 || app->volumes_cursor >= (int)mnt.size())
+            app->volumes_cursor = volumes_home_row(app, drive_paths);
+        if (key == SDLK_ESCAPE) { app->volumes_open = false; app->volumes_cursor = -1; return; }
+        // Ins adds the folder the picker's pane is in; Del takes out the favorite
+        // under the cursor. A drive has nothing to remove.
+        if (key == SDLK_INSERT) {
+            const Pane& pane = app->volumes_target == 0 ? app->left : app->right;
+            if (hotlist_add(app, pane.current_dir)) {
+                app->volumes_cursor = (int)mnt.size();   // the new last row
+                app->volumes_moved = true;
+                snprintf(app->status_msg, sizeof(app->status_msg), "Added to favorites: %s",
+                         pane.current_dir);
+            } else {
+                snprintf(app->status_msg, sizeof(app->status_msg), "Already a favorite: %s",
+                         pane.current_dir);
+            }
+            return;
+        }
+        if (key == SDLK_DELETE) {
+            volumes_remove_favorite(app, app->volumes_cursor, drives);
+            return;
+        }
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+            volumes_pick(app, mnt, app->volumes_cursor);
+            return;
+        }
+        if (key >= SDLK_A && key <= SDLK_Z && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            // A letter names a drive, never a favorite that happens to start with it.
+            int cur = app->volumes_cursor < drives ? app->volumes_cursor : -1;
+            int row = volumes_letter_row(drive_paths, cur, (char)('a' + (key - SDLK_A)));
+            if (row >= 0) {
+                app->volumes_cursor = row;
+                app->volumes_moved = true;
+#ifdef _WIN32
+                // A drive letter is one drive: the letter is the pick, as in TC.
+                volumes_pick(app, mnt, row);
+#endif
+            }
+            return;
+        }
+        int next = net_cursor_step(app->volumes_cursor, (int)mnt.size(), key);
+        if (next != app->volumes_cursor) { app->volumes_cursor = next; app->volumes_moved = true; }
         return;
     }
 
@@ -9080,14 +9856,13 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     // ---- TC Alt+F1/F2: choose the left/right drive ----
-    if (key == SDLK_F1 && (mod & SDL_KMOD_ALT)) {
-        app->volumes_open = !app->volumes_open;
-        app->volumes_target = 0;
-        return;
-    }
-    if (key == SDLK_F2 && (mod & SDL_KMOD_ALT)) {
-        app->volumes_open = !app->volumes_open;
-        app->volumes_target = 1;
+    // Pressed again it closes; pressed for the other pane it turns the picker to that
+    // pane, with the cursor on that pane's drive.
+    if ((key == SDLK_F1 || key == SDLK_F2) && (mod & SDL_KMOD_ALT)) {
+        int target = key == SDLK_F1 ? 0 : 1;
+        app->volumes_open = !(app->volumes_open && app->volumes_target == target);
+        app->volumes_target = target;
+        app->volumes_cursor = -1;
         return;
     }
 
@@ -9107,9 +9882,9 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
 
     // ---- TC Ctrl+PgUp = parent directory, Ctrl+PgDn = open entry under cursor ----
     if ((mod & SDL_KMOD_CTRL) && key == SDLK_PAGEUP) {
-        char parentbuf[4096];
-        snprintf(parentbuf, sizeof(parentbuf), "%s", active.current_dir);
-        navigate_to(app, &active, dirname(parentbuf));
+        char parent[4096];
+        pane_parent(active.current_dir, parent, sizeof(parent));
+        navigate_to(app, &active, parent);
         return;
     }
     if ((mod & SDL_KMOD_CTRL) && key == SDLK_PAGEDOWN) {
@@ -9133,7 +9908,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
 
     // ---- Ctrl+, to the filesystem root (Shift: the other pane) ----
     if (key == SDLK_COMMA && (mod & SDL_KMOD_CTRL)) {
-        navigate_to(app, shift ? &other : &active, "/");
+        Pane& target = shift ? other : active;
+        navigate_to(app, &target, plat_root_of(target.current_dir).c_str());
         return;
     }
 
@@ -9161,13 +9937,10 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // ---- hotlist ----
     if (key == SDLK_F9 && shift) { app->hotlist_open = !app->hotlist_open; return; }
     if (key == SDLK_D && (mod & SDL_KMOD_ALT)) {
-        bool dup = false;
-        for (const std::string& s : app->hotlist) if (s == active.current_dir) { dup = true; break; }
-        if (!dup) {
-            app->hotlist.push_back(active.current_dir);
-            hotlist_save(app);
-            snprintf(app->status_msg, sizeof(app->status_msg), "Added to hotlist: %s", active.current_dir);
-        }
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 hotlist_add(app, active.current_dir) ? "Added to favorites: %s"
+                                                      : "Already a favorite: %s",
+                 active.current_dir);
         return;
     }
 
@@ -9432,8 +10205,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
     if (key == SDLK_HOME) {
         if (shift) {
-            const char* home = getenv("HOME");
-            if (home && *home) navigate_to(app, &active, home);
+            const std::string home = plat_home_dir();
+            if (!home.empty()) navigate_to(app, &active, home.c_str());
         } else {
             int n = first_visible(active);
             if (n >= 0) { active.selected = n; active.scroll_request = true; }
@@ -9451,9 +10224,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_TAB && shift) { tree_mode_toggle(app, active, TREE_SPLIT); return; }
     if (key == SDLK_TAB) { app->left_focus = !app->left_focus; return; }
     if (key == SDLK_BACKSPACE) {
-        char parentbuf[4096];
-        snprintf(parentbuf, sizeof(parentbuf), "%s", active.current_dir);
-        char* parent = dirname(parentbuf);
+        char parent[4096];
+        pane_parent(active.current_dir, parent, sizeof(parent));
         navigate_to(app, &active, parent);
         return;
     }

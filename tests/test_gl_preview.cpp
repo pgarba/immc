@@ -17,6 +17,7 @@
 #include "../src/panes.cpp"
 
 #include "image_fixtures.h"
+#include "test_os.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
@@ -49,16 +50,14 @@ static int idx_of(const Pane& pane, const char* name) {
 }
 
 static void sh(const std::string& cmd) {
-    int rc = system(cmd.c_str());
+    int rc = test_system(cmd);
     (void)rc;
 }
 
 // A scratch directory holding one solid magenta PNG.
 static std::string scratch_dir(void) {
-    char tmpl[] = "/tmp/mc-gl-preview-XXXXXX";
-    const char* d = mkdtemp(tmpl);
-    if (!d) return std::string();
-    std::string root(d);
+    std::string root = test_mkdtemp("mc-gl-preview");
+    if (root.empty()) return std::string();
     std::string png = fx_png_solid(24, 24, 255, 0, 255);
     FILE* f = fopen((root + "/preview.png").c_str(), "wb");
     if (f) { fwrite(png.data(), 1, png.size(), f); fclose(f); }

@@ -81,7 +81,11 @@ const KnownTerm* known(const std::string& name) {
 
 const char* term_editor_name() {
     const char* e = getenv("EDITOR");
+#ifdef _WIN32
+    if (!e || trim(e).empty()) return "notepad";   // the one every Windows machine has
+#else
     if (!e || trim(e).empty()) return "vim";   // the name everyone expects
+#endif
     return e;
 }
 
@@ -94,13 +98,38 @@ static bool exec_file(const std::string& p) {
     return access(p.c_str(), X_OK) == 0;
 }
 
+#ifdef _WIN32
+static const char kPathListSep = ';';
+// "wt" is wt.exe: a name is tried as written and then with each extension the shell
+// would add, in PATHEXT's order.
+static std::vector<std::string> exec_names(const std::string& prog) {
+    std::vector<std::string> out = { prog };
+    const char* pe = getenv("PATHEXT");
+    std::string exts = (pe && *pe) ? pe : ".COM;.EXE;.BAT;.CMD";
+    for (char& c : exts) if (c == ';') c = ' ';
+    for (const std::string& e : words(exts)) out.push_back(prog + e);
+    return out;
+}
+static bool names_a_path(const std::string& prog) {
+    return prog.find_first_of("/\\:") != std::string::npos;
+}
+#else
+static const char kPathListSep = ':';
+static std::vector<std::string> exec_names(const std::string& prog) { return { prog }; }
+static bool names_a_path(const std::string& prog) {
+    return prog.find('/') != std::string::npos;
+}
+#endif
+
 bool term_which(const std::string& prog, std::string* resolved) {
     if (prog.empty()) return false;
-    if (prog.find('/') != std::string::npos) {
+    if (names_a_path(prog)) {
         // A path was written in the config: it means that path.
-        if (exec_file(prog)) {
-            if (resolved) *resolved = prog;
-            return true;
+        for (const std::string& cand : exec_names(prog)) {
+            if (exec_file(cand)) {
+                if (resolved) *resolved = cand;
+                return true;
+            }
         }
         return false;
     }
@@ -109,14 +138,15 @@ bool term_which(const std::string& prog, std::string* resolved) {
     const std::string p(path);
     size_t start = 0;
     while (start <= p.size()) {
-        size_t end = p.find(':', start);
+        size_t end = p.find(kPathListSep, start);
         if (end == std::string::npos) end = p.size();
         const std::string dir = p.substr(start, end - start);
         if (!dir.empty()) {
-            const std::string cand = dir + "/" + prog;
-            if (exec_file(cand)) {
-                if (resolved) *resolved = cand;
-                return true;
+            for (const std::string& cand : exec_names(dir + "/" + prog)) {
+                if (exec_file(cand)) {
+                    if (resolved) *resolved = cand;
+                    return true;
+                }
             }
         }
         if (end == p.size()) break;
@@ -149,10 +179,34 @@ std::vector<std::string> term_launch_argv(const char* name, const char* editor,
 
 const std::vector<std::string>& term_candidates() {
     static std::vector<std::string> v;
+#ifndef _WIN32
+    // Windows has no list to walk: every console program gets a window of its own.
     if (v.empty())
         for (const KnownTerm& k : kKnown) v.push_back(k.name);
+#endif
     return v;
 }
+
+#ifdef _WIN32
+// The editor on its own, in a console window of its own. A console program started
+// that way gets a console - which Windows 11 opens in whatever its default terminal
+// app is - and a GUI editor like Notepad ignores it. A .cmd or .bat editor (VS Code's
+// `code` is code.cmd) is a script that only cmd can run.
+static bool editor_argv(const char* editor, const std::string& path,
+                        std::vector<std::string>* argv) {
+    std::string resolved;
+    if (!term_which(editor, &resolved)) return false;
+    const size_t dot = resolved.find_last_of('.');
+    const std::string ext = dot == std::string::npos ? "" : resolved.substr(dot);
+    if (!_stricmp(ext.c_str(), ".cmd") || !_stricmp(ext.c_str(), ".bat")) {
+        // cmd /s strips the outer pair of quotes and runs the rest as it stands.
+        *argv = { "cmd", "/d", "/s", "/c", "\"\"" + resolved + "\" \"" + path + "\"\"" };
+    } else {
+        *argv = { editor, path };
+    }
+    return true;
+}
+#endif
 
 TermLaunch term_find_launch(const char* preferred, const std::string& path) {
     TermLaunch out;
@@ -202,6 +256,16 @@ TermLaunch term_find_launch(const char* preferred, const std::string& path) {
     const char* env = getenv("TERMINAL");
     if (env && !trim(env).empty() && try_one(trim(env), &out)) return out;
 
+#ifdef _WIN32
+    if (editor_argv(editor, path, &out.argv)) {
+        out.name = "a window of its own";
+        return out;
+    }
+    out.note = std::string(editor) + " is not on this machine. Set EDITOR to an editor that is,"
+               " or terminal = in the config file to run it in a terminal of your choosing.";
+    (void)list;
+    return out;
+#else
     for (const std::string& c : term_candidates()) {
         std::string resolved;
         if (!term_which(c, &resolved)) continue;
@@ -213,4 +277,5 @@ TermLaunch term_find_launch(const char* preferred, const std::string& path) {
     out.note = "No terminal emulator found. Looked for: " + list() +
                ". Set terminal = in the config file, or $TERMINAL.";
     return out;
+#endif
 }

@@ -41,6 +41,14 @@ struct NetSite {
     std::string path;       // the directory to open on connect
     bool verify_tls = true; // false = "accept the certificate anyway", shown in the UI
     bool passive = true;    // false = active mode, PORT instead of PASV
+    // How many files a copy to or from this site moves at once, each over its own
+    // connection (see xfer.h). Two is FileZilla's default, and what most servers
+    // allow without complaint.
+    int threads = 2;
+    // Send a RAR set volume by volume - .rar, .r00, .r01 ... .s00, or .part1.rar,
+    // .part2.rar - instead of in listing order, so the volumes arrive in the order
+    // an unpacker reads them (see xfer_order_rar).
+    bool rar_order = false;
 
     bool valid() const { return !host.empty(); }
 };
@@ -102,6 +110,24 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err);
 // Find the saved site a pane's root URL belongs to, so a restart can put the
 // password back. Null when nothing is saved for that host.
 const NetSite* net_sites_find(const std::vector<NetSite>& sites, const std::string& root);
+
+// FileZilla's site manager (sitemanager.xml), read so its sites can be imported.
+// Each site comes with a note - empty, or what did not come across, such as a
+// password FileZilla keeps encrypted under its master password. A site in a
+// protocol this program does not speak (S3, WebDAV, ...) is left out and counted
+// in `skipped`. A site inside FileZilla's folders is named "Folder/Site".
+struct NetImported {
+    NetSite site;
+    std::string note;
+};
+// Where FileZilla keeps the file on this system: %APPDATA%\FileZilla on Windows,
+// $XDG_CONFIG_HOME/filezilla (or ~/.config/filezilla) elsewhere, falling back to
+// the ~/.filezilla of older versions when only that exists.
+std::string net_filezilla_path();
+bool net_filezilla_parse(const std::string& xml, std::vector<NetImported>* out,
+                         int* skipped, std::string* err);
+bool net_filezilla_load(const std::string& path, std::vector<NetImported>* out,
+                        int* skipped, std::string* err);
 
 // Transport. net_available() is false in a build without libcurl; net_what()
 // is the line About and --version print.

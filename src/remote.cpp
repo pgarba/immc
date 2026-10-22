@@ -10,6 +10,7 @@
 // and only the transport says "this build has no FTP support".
 
 #include "remote.h"
+#include "platform.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -330,20 +331,11 @@ bool net_parse_url(const char* text, NetSite* out, std::string* err) {
 // The sites file
 // ---------------------------------------------------------------------------
 
-static std::string sites_dir() {
-    const char* home = getenv("HOME");
-    if (!home || !*home) return ".mc-clone";
-    return std::string(home) + "/.config/mc-clone";
-}
+static std::string sites_dir() { return plat_config_dir(); }
 
 std::string net_sites_path() { return sites_dir() + "/ftp_sites"; }
 
-static void ensure_sites_dir(void) {
-    std::string dir = sites_dir();
-    std::string parent = dir.substr(0, dir.find_last_of('/'));
-    mkdir(parent.c_str(), 0755);
-    mkdir(dir.c_str(), 0755);
-}
+static void ensure_sites_dir(void) { plat_make_config_dir(); }
 
 static char* sites_trim(char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -387,6 +379,11 @@ bool net_sites_load(std::vector<NetSite>* out, std::string* err) {
         else if (!strcmp(key, "path"))     site.path = val;
         else if (!strcmp(key, "verify_tls")) site.verify_tls = atoi(val) != 0;
         else if (!strcmp(key, "passive"))    site.passive = atoi(val) != 0;
+        else if (!strcmp(key, "rar_order"))  site.rar_order = atoi(val) != 0;
+        else if (!strcmp(key, "threads")) {
+            int n = atoi(val);
+            site.threads = n < 1 ? 1 : (n > 10 ? 10 : n);   // xfer.h's limits
+        }
         // An unknown key is ignored rather than fatal: a newer version's file
         // still opens.
     }
@@ -413,7 +410,11 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err) {
     // already existed with the wrong mode.
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { if (err) *err = std::string("cannot write ") + path + ": " + strerror(errno); return false; }
+#ifndef _WIN32
+    // On Windows the file inherits the ACL of %APPDATA%, which is the user's own, and
+    // there are no group or world bits to take away.
     fchmod(fd, 0600);
+#endif
     FILE* f = fdopen(fd, "w");
     if (!f) {
         close(fd);
@@ -427,7 +428,8 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err) {
         "# One [site] block per site. proto is one of ftp, ftps, ftps-implicit,\n"
         "# sftp. port 0 means the protocol's own default. verify_tls 0 connects to a\n"
         "# server whose certificate cannot be checked, and the UI says so while it\n"
-        "# is in effect.\n"
+        "# is in effect. threads is how many files a copy moves at once (1-10).\n"
+        "# rar_order 1 sends RAR sets volume by volume (.rar .r00 .r01 ... .s00).\n"
         "#\n"
         "# A password is stored in cleartext, and only for a site with remember = 1.\n"
         "# This file is created 0600 so only the owner can read it; the main config\n"
@@ -446,6 +448,8 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err) {
         fprintf(f, "path = %s\n", s.path.c_str());
         fprintf(f, "verify_tls = %d\n", s.verify_tls ? 1 : 0);
         fprintf(f, "passive = %d\n", s.passive ? 1 : 0);
+        fprintf(f, "threads = %d\n", s.threads);
+        fprintf(f, "rar_order = %d\n", s.rar_order ? 1 : 0);
     }
 
     fclose(f);
@@ -456,6 +460,364 @@ const NetSite* net_sites_find(const std::vector<NetSite>& sites, const std::stri
     for (const NetSite& s : sites)
         if (net_site_root(s) == root) return &s;
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Importing FileZilla's site manager
+// ---------------------------------------------------------------------------
+//
+// sitemanager.xml is small and FileZilla writes it the same way every time, so
+// a reader for the XML it actually contains - elements, attributes, text, the
+// five named entities and numeric ones - is enough, and it keeps an XML library
+// out of the build for one dialog. What it does not understand it reports as a
+// malformed file rather than guessing at.
+
+namespace {
+
+struct XNode {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> attrs;
+    std::string text;               // this element's own text, not its children's
+    std::vector<XNode> children;
+
+    const XNode* child(const char* n) const {
+        for (const XNode& c : children)
+            if (c.name == n) return &c;
+        return nullptr;
+    }
+    std::string attr(const char* n) const {
+        for (const auto& a : attrs)
+            if (a.first == n) return a.second;
+        return "";
+    }
+};
+
+void utf8_append(std::string* out, unsigned long cp) {
+    if (cp < 0x80) {
+        out->push_back((char)cp);
+    } else if (cp < 0x800) {
+        out->push_back((char)(0xC0 | (cp >> 6)));
+        out->push_back((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out->push_back((char)(0xE0 | (cp >> 12)));
+        out->push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out->push_back((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x110000) {
+        out->push_back((char)(0xF0 | (cp >> 18)));
+        out->push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+        out->push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out->push_back((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+std::string xml_unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '&') { out.push_back(s[i]); continue; }
+        size_t semi = s.find(';', i);
+        if (semi == std::string::npos || semi - i > 10) { out.push_back('&'); continue; }
+        std::string ent = s.substr(i + 1, semi - i - 1);
+        if      (ent == "amp")  out.push_back('&');
+        else if (ent == "lt")   out.push_back('<');
+        else if (ent == "gt")   out.push_back('>');
+        else if (ent == "quot") out.push_back('"');
+        else if (ent == "apos") out.push_back('\'');
+        else if (ent.size() > 1 && ent[0] == '#') {
+            bool hex = ent[1] == 'x' || ent[1] == 'X';
+            utf8_append(&out, strtoul(ent.c_str() + (hex ? 2 : 1), nullptr, hex ? 16 : 10));
+        } else {
+            out.append(s, i, semi - i + 1);   // not ours to interpret: keep it as written
+        }
+        i = semi;
+    }
+    return out;
+}
+
+bool xml_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+std::string xml_trim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && xml_space(s[a])) a++;
+    while (b > a && xml_space(s[b - 1])) b--;
+    return s.substr(a, b - a);
+}
+
+bool xml_parse(const std::string& s, XNode* root, std::string* err) {
+    // Only the innermost open element ever gains children, so the pointers to
+    // its ancestors on this stack stay valid while it grows.
+    std::vector<XNode*> stack{ root };
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        if (s[i] != '<') {
+            size_t j = s.find('<', i);
+            if (j == std::string::npos) j = n;
+            stack.back()->text += xml_unescape(s.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        if (!s.compare(i, 4, "<!--")) {
+            size_t j = s.find("-->", i + 4);
+            if (j == std::string::npos) { *err = "an unterminated comment"; return false; }
+            i = j + 3;
+            continue;
+        }
+        if (!s.compare(i, 9, "<![CDATA[")) {
+            size_t j = s.find("]]>", i + 9);
+            if (j == std::string::npos) { *err = "an unterminated CDATA section"; return false; }
+            stack.back()->text += s.substr(i + 9, j - i - 9);
+            i = j + 3;
+            continue;
+        }
+        if (!s.compare(i, 2, "<?") || !s.compare(i, 2, "<!")) {
+            size_t j = s.find('>', i);
+            if (j == std::string::npos) { *err = "an unterminated declaration"; return false; }
+            i = j + 1;
+            continue;
+        }
+        // The end of the tag is the first '>' outside a quoted attribute value.
+        size_t j = i + 1;
+        char quote = 0;
+        for (; j < n; j++) {
+            if (quote) { if (s[j] == quote) quote = 0; }
+            else if (s[j] == '"' || s[j] == '\'') quote = s[j];
+            else if (s[j] == '>') break;
+        }
+        if (j >= n) { *err = "an unterminated tag"; return false; }
+        std::string tag = s.substr(i + 1, j - i - 1);
+        i = j + 1;
+
+        if (!tag.empty() && tag[0] == '/') {
+            std::string name = xml_trim(tag.substr(1));
+            if (stack.size() < 2 || stack.back()->name != name) {
+                *err = "</" + name + "> closes an element that is not open";
+                return false;
+            }
+            stack.pop_back();
+            continue;
+        }
+        bool self_closing = !tag.empty() && tag.back() == '/';
+        if (self_closing) tag.pop_back();
+
+        XNode node;
+        size_t k = 0;
+        while (k < tag.size() && !xml_space(tag[k])) k++;
+        node.name = tag.substr(0, k);
+        if (node.name.empty()) { *err = "a tag with no name"; return false; }
+        while (k < tag.size()) {
+            while (k < tag.size() && xml_space(tag[k])) k++;
+            if (k >= tag.size()) break;
+            size_t key_start = k;
+            while (k < tag.size() && tag[k] != '=' && !xml_space(tag[k])) k++;
+            std::string key = tag.substr(key_start, k - key_start);
+            while (k < tag.size() && xml_space(tag[k])) k++;
+            if (k >= tag.size() || tag[k] != '=') { *err = "attribute " + key + " has no value"; return false; }
+            k++;
+            while (k < tag.size() && xml_space(tag[k])) k++;
+            if (k >= tag.size() || (tag[k] != '"' && tag[k] != '\'')) {
+                *err = "attribute " + key + " is not quoted";
+                return false;
+            }
+            char q = tag[k++];
+            size_t end = tag.find(q, k);
+            if (end == std::string::npos) { *err = "attribute " + key + " is not closed"; return false; }
+            node.attrs.emplace_back(key, xml_unescape(tag.substr(k, end - k)));
+            k = end + 1;
+        }
+        stack.back()->children.push_back(std::move(node));
+        if (!self_closing) stack.push_back(&stack.back()->children.back());
+    }
+    if (stack.size() != 1) { *err = "<" + stack.back()->name + "> is never closed"; return false; }
+    return true;
+}
+
+std::string base64_decode(const std::string& in) {
+    std::string out;
+    unsigned int acc = 0;
+    int bits = 0;
+    for (char c : in) {
+        int v;
+        if      (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+') v = 62;
+        else if (c == '/') v = 63;
+        else continue;                  // padding and line breaks
+        acc = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char)((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// FileZilla's own spelling of a server path: "<type> <prefix length> [prefix]"
+// and then each segment as "<length> <segment>", so a segment may hold spaces.
+// "1 0 4 home 3 bob" is /home/bob. The server type only matters to FileZilla's
+// display, and every server this program reaches takes '/'.
+std::string fz_remote_dir(const std::string& s) {
+    const char* p = s.c_str();
+    char* e;
+    strtol(p, &e, 10);                  // server type
+    if (e == p) return "";
+    p = e;
+    long prefix_len = strtol(p, &e, 10);
+    if (e == p || prefix_len < 0) return "";
+    p = e;
+    if (prefix_len > 0) {
+        if (*p == ' ') p++;
+        if ((long)strlen(p) < prefix_len) return "";
+        p += prefix_len;
+    }
+    std::string out;
+    while (*p) {
+        long len = strtol(p, &e, 10);
+        if (e == p || *e != ' ' || len <= 0) break;
+        p = e + 1;
+        if ((long)strlen(p) < len) break;
+        out += "/" + std::string(p, (size_t)len);
+        p += len;
+    }
+    return out;
+}
+
+// One <Server> element. False when it is in a protocol this program cannot open.
+bool fz_server(const XNode& x, const std::string& folder, NetImported* out) {
+    auto field = [&](const char* name) {
+        const XNode* c = x.child(name);
+        return c ? xml_trim(c->text) : std::string();
+    };
+    NetSite& site = out->site;
+    // FileZilla's numbering: 0 FTP that upgrades when it can, 1 SFTP, 3 implicit
+    // FTPS, 4 explicit FTPS, 6 plain FTP only. The rest - HTTP, S3, WebDAV,
+    // cloud drives - are not FTP.
+    std::string proto = field("Protocol");
+    switch (proto.empty() ? 0 : atoi(proto.c_str())) {
+    case 0: case 6: site.proto = NET_FTP; break;
+    case 1:         site.proto = NET_SFTP; break;
+    case 3:         site.proto = NET_FTPS_IMPLICIT; break;
+    case 4:         site.proto = NET_FTPS; break;
+    default:        return false;
+    }
+    site.host = field("Host");
+    int port = atoi(field("Port").c_str());
+    // The protocol's own port is left implicit, as the dialog does, so the
+    // imported site's URL reads the way a typed one would.
+    site.port = port == net_proto_port(site.proto) ? 0 : port;
+
+    // 0 anonymous, 1 normal, 2 ask for the password, 3 interactive, 4 account,
+    // 5 key file. Only 1 and 4 keep a password in the file.
+    int logon = atoi(field("Logontype").c_str());
+    if (logon != 0) site.user = field("User");
+    const XNode* pass = x.child("Pass");
+    if ((logon == 1 || logon == 4) && pass) {
+        std::string enc = pass->attr("encoding");
+        if (enc == "base64") {
+            site.password = base64_decode(pass->text);
+        } else if (enc.empty()) {
+            site.password = pass->text;     // older versions wrote it as it is
+        } else {
+            out->note = "the password is locked by FileZilla's master password";
+        }
+        site.remember = !site.password.empty();
+    } else if (logon == 2 || logon == 3) {
+        out->note = "FileZilla asks for this password each time";
+    } else if (logon == 5) {
+        out->note = "the key file is not imported";
+    }
+    site.passive = field("PasvMode") != "MODE_ACTIVE";
+    // The site's own "limit number of simultaneous connections"; 0 means FileZilla's
+    // global setting, which is not in this file, so the default stays.
+    int conns = atoi(field("MaximumMultipleConnections").c_str());
+    if (conns > 0) site.threads = conns < 10 ? conns : 10;
+    site.path = fz_remote_dir(field("RemoteDir"));
+
+    // The name is <Name>; versions before it put the name in the element's text.
+    std::string name = field("Name");
+    if (name.empty()) name = xml_trim(x.text);
+    site.name = folder.empty() ? name : folder + "/" + name;
+    return true;
+}
+
+void fz_walk(const XNode& x, const std::string& folder, std::vector<NetImported>* out,
+             int* skipped) {
+    for (const XNode& c : x.children) {
+        if (c.name == "Folder") {
+            std::string name = xml_trim(c.text);
+            fz_walk(c, folder.empty() ? name : folder + "/" + name, out, skipped);
+        } else if (c.name == "Server") {
+            NetImported imp;
+            if (!fz_server(c, folder, &imp)) { (*skipped)++; continue; }
+            if (imp.site.valid()) out->push_back(imp);
+        }
+    }
+}
+
+} // namespace
+
+std::string net_filezilla_path() {
+    std::string home = plat_home_dir();
+#ifdef _WIN32
+    const char* a = getenv("APPDATA");
+    std::string base = (a && *a) ? std::string(a) : home + "/AppData/Roaming";
+    for (char& c : base) if (c == '\\') c = '/';
+    return base + "/FileZilla/sitemanager.xml";
+#else
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    std::string path = std::string((xdg && *xdg) ? xdg : (home + "/.config").c_str()) +
+                       "/filezilla/sitemanager.xml";
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        std::string old = home + "/.filezilla/sitemanager.xml";
+        if (stat(old.c_str(), &st) == 0) return old;
+    }
+    return path;
+#endif
+}
+
+bool net_filezilla_parse(const std::string& xml, std::vector<NetImported>* out,
+                         int* skipped, std::string* err) {
+    out->clear();
+    *skipped = 0;
+    if (err) err->clear();
+    std::string why;
+    XNode doc;
+    if (!xml_parse(xml, &doc, &why)) {
+        if (err) *err = "not a readable FileZilla file: " + why;
+        return false;
+    }
+    const XNode* fz = doc.child("FileZilla3");
+    const XNode* servers = fz ? fz->child("Servers") : nullptr;
+    if (!servers) {
+        if (err) *err = "not a FileZilla site manager file";
+        return false;
+    }
+    fz_walk(*servers, "", out, skipped);
+    return true;
+}
+
+bool net_filezilla_load(const std::string& path, std::vector<NetImported>* out,
+                        int* skipped, std::string* err) {
+    out->clear();
+    *skipped = 0;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        if (err) *err = "no FileZilla site manager at " + path;
+        return false;
+    }
+    std::string xml;
+    char buf[8192];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) xml.append(buf, got);
+    fclose(f);
+    if (!xml.compare(0, 3, "\xEF\xBB\xBF")) xml.erase(0, 3);
+    if (!net_filezilla_parse(xml, out, skipped, err)) {
+        if (err) *err = path + ": " + *err;
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

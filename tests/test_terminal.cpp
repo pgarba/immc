@@ -7,6 +7,7 @@
 // opens a window that says nothing.
 
 #include "terminal.h"
+#include "test_os.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,14 +37,20 @@ static void make_fake(const std::string& name) {
 
 static void use_path(const std::string& path) { setenv("PATH", path.c_str(), 1); }
 
+#ifdef _WIN32
+static const char* const kDefaultEditor = "notepad";   // the one every Windows has
+#else
+static const char* const kDefaultEditor = "vim";
+#endif
+
 static void test_editor_name(void) {
     unsetenv("EDITOR");
-    CHECK(!strcmp(term_editor_name(), "vim"));
+    CHECK(!strcmp(term_editor_name(), kDefaultEditor));
     setenv("EDITOR", "nano", 1);
     CHECK(!strcmp(term_editor_name(), "nano"));
     // An EDITOR that is set but empty is not an editor.
     setenv("EDITOR", "   ", 1);
-    CHECK(!strcmp(term_editor_name(), "vim"));
+    CHECK(!strcmp(term_editor_name(), kDefaultEditor));
     unsetenv("EDITOR");
 }
 
@@ -103,6 +110,7 @@ static void test_shapes(void) {
     CHECK(is(term_launch_argv("foot", "nvim", "/x"), {"foot", "--", "nvim", "/x"}));
 }
 
+#ifndef _WIN32
 static void test_which(void) {
     make_fake("alacritty");
     use_path(tmp_root);
@@ -226,16 +234,98 @@ static void test_lookup(void) {
     CHECK(has_xterm);
 }
 
+#else
+// Windows runs a program by its extension, and has no terminal to look for: every
+// console program started with a console of its own gets a window.
+static void touch(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (f) { fputs("x\n", f); fclose(f); }
+}
+
+static void test_which(void) {
+    touch(tmp_root + "/alacritty.exe");
+    use_path(tmp_root);
+
+    std::string resolved;
+    CHECK(term_which("alacritty", &resolved));          // the extension is PATHEXT's
+    // As PATHEXT spells the extension; the file system does not mind which case.
+    CHECK(!_stricmp(resolved.c_str(), (tmp_root + "/alacritty.exe").c_str()));
+    CHECK(term_which("alacritty.exe", &resolved));
+    CHECK(!term_which("definitely-not-here", &resolved));
+
+    // Without an extension the shell would run, a file is not a program.
+    touch(tmp_root + "/plain");
+    CHECK(!term_which("plain", &resolved));
+    mkdir((tmp_root + "/adir.exe").c_str(), 0755);      // nor is a directory
+    CHECK(!term_which("adir", &resolved));
+
+    // A path written out in the config means that path, in either separator.
+    CHECK(term_which(tmp_root + "/alacritty.exe", &resolved));
+    std::string back = tmp_root + "/alacritty";
+    for (char& c : back) if (c == '/') c = '\\';
+    CHECK(term_which(back, &resolved));
+    CHECK(!term_which(tmp_root + "/plain", &resolved));
+
+    CHECK(!term_which("", &resolved));
+    use_path("C:/nonexistent-dir-xyz;C:/also-missing");
+    CHECK(!term_which("alacritty", &resolved));
+}
+
+static void test_lookup(void) {
+    const std::string p = "C:/Users/someone/file.txt";
+    unsetenv("TERMINAL");
+    unsetenv("EDITOR");
+
+    // No terminal to find: the editor itself, in a window of its own.
+    touch(tmp_root + "/notepad.exe");
+    use_path(tmp_root);
+    TermLaunch l = term_find_launch("", p);
+    CHECK(is(l.argv, {"notepad", p}));
+    CHECK(!l.name.empty());
+    CHECK(l.note.empty());
+    CHECK(term_candidates().empty());
+
+    // An editor that is a script goes through cmd, the only thing that runs one, with
+    // the line quoted the way cmd /s reads it.
+    touch(tmp_root + "/code.cmd");
+    setenv("EDITOR", "code", 1);
+    l = term_find_launch("", p);
+    CHECK(l.argv.size() == 5 && l.argv[0] == "cmd" && l.argv[3] == "/c");
+    if (l.argv.size() == 5)
+        CHECK(!_stricmp(l.argv[4].c_str(),
+                        ("\"\"" + tmp_root + "/code.cmd\" \"" + p + "\"\"").c_str()));
+    unsetenv("EDITOR");
+
+    // A terminal named in the config is still honoured, in its known shape.
+    touch(tmp_root + "/alacritty.exe");
+    l = term_find_launch("alacritty", p);
+    CHECK(l.name == "alacritty");
+    CHECK(is(l.argv, {"alacritty", "-e", "notepad", p}));
+    l = term_find_launch("wt new-tab --", p);
+    CHECK(l.argv.empty());                               // not on this PATH: said so
+    CHECK(l.note.find("config") != std::string::npos);
+
+    // No editor at all: the message names it and says what to set.
+    use_path("C:/nonexistent-dir-xyz");
+    l = term_find_launch("", p);
+    CHECK(l.argv.empty());
+    CHECK(l.note.find("notepad") != std::string::npos);
+    CHECK(l.note.find("EDITOR") != std::string::npos);
+}
+#endif
+
 int main() {
-    char tmpl[] = "/tmp/mc-term-test-XXXXXX";
-    const char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("cannot create temp dir\n"); return 1; }
-    tmp_root = dir;
+    tmp_root = test_mkdtemp("mc-term-test");
+    if (tmp_root.empty()) { printf("cannot create temp dir\n"); return 1; }
+    const char* path = getenv("PATH");
+    const std::string saved_path = path ? path : "";
 
     test_editor_name();
     test_shapes();
     test_which();
     test_lookup();
+    use_path(saved_path);
+    test_system("rm -rf '" + tmp_root + "'");
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
