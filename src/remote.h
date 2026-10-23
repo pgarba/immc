@@ -1,6 +1,8 @@
 #ifndef REMOTE_H
 #define REMOTE_H
 
+#include <stdint.h>
+#include <time.h>
 #include <string>
 #include <vector>
 #include "filesystem.h"   // FileEntry, fs_progress_fn
@@ -146,14 +148,49 @@ void net_forget_root(const char* root);
 // joined before this runs.
 void net_shutdown();
 
+// The connection log: what was said to each server and what it answered, so a
+// connect that takes half a minute shows where it is waiting - the DNS lookup,
+// the TCP connect, the TLS handshake, the PASV that never gets a reply - instead
+// of just being slow. Every handle on every thread writes here; curl's verbose
+// text, the commands sent and the replies received each become lines. A PASS
+// command is written with its argument blanked, so the log can be shown and
+// copied without leaking a login.
+enum NetLogKind {
+    NETLOG_INFO = 0,   // curl's own narration: "Trying 1.2.3.4:21...", "Connected to"
+    NETLOG_SENT,       // a command this side sent
+    NETLOG_RECV,       // a reply the server sent
+    NETLOG_ERROR,      // a failure, as the caller reported it
+};
+struct NetLogLine {
+    uint64_t    seq = 0;     // grows by one per line; a reader asks for what is newer
+    time_t      when = 0;
+    int         thread = 0;  // small per-thread number, so parallel transfers can be told apart
+    NetLogKind  kind = NETLOG_INFO;
+    std::string site;        // the site root the line belongs to
+    std::string text;
+};
+// The log keeps the most recent lines only (a few thousand): it is for watching
+// a connection, not an audit trail.
+void net_log_add(const std::string& site, NetLogKind kind, const std::string& text);
+// Copy the lines newer than `after_seq` into `out` (appended), and return the
+// newest seq there is. Cheap to call every frame when nothing changed.
+uint64_t net_log_since(uint64_t after_seq, std::vector<NetLogLine>* out);
+void net_log_clear();
+
 // List one directory on the server. MLSD is tried first because it is
 // machine-readable and carries type, size, modify time and unix.mode; a server
 // without it gets a LIST, whose unix and DOS dialects are parsed here. Both
 // fill FileEntry, so the pane sorts and formats a remote row exactly like a
 // local one. Dotfiles are not filtered here: the pane does that, the same way
 // it does for archive members.
+//
+// `cb`, when given, is asked about once a second while the listing waits on the
+// server - during the connect and the login too - and the listing stops when it
+// returns false. That is what lets a pane that moved on abandon a listing that
+// is stuck on a dead host, instead of waiting out the timeouts.
 bool net_list(const NetSite& site, const std::string& rpath,
-              std::vector<FileEntry>* out, std::string* err);
+              std::vector<FileEntry>* out, std::string* err,
+              fs_progress_fn cb = nullptr, void* user = nullptr);
 
 // One entry, by listing its parent and matching the basename. A bare "MLST"
 // would be the obvious way and is not available: curl ignores CURLOPT_CUSTOMREQUEST

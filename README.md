@@ -282,6 +282,7 @@ the panes keep answering underneath it.
 | `Shift+F1` `Ctrl+F1` | the columns view · the brief one |
 | `Shift+F2` | compare the two directories, read-only |
 | `Alt+.` | show hidden files |
+| `Options → Show file icons` | the small icon in front of each name, as in Total Commander: Windows' own icons on Windows, drawn ones elsewhere (`show_icons` in the config) |
 | `F9` | the per-pane user menu |
 | `F10` `Shift+F10` | the menu bar · the context menu for the cursor |
 | `F1` | About |
@@ -293,6 +294,8 @@ the panes keep answering underneath it.
 | `Ctrl+F` | the saved-site manager; its **Import from FileZilla** lists the sites in FileZilla's `sitemanager.xml` (folders and all), each with a tick, and adds the ticked ones - `Space` ticks, `Ctrl+A` all or none, `Enter` imports |
 | `Ctrl+N` | quick connect to one host |
 | `Ctrl+D` | leave the site this pane is on, and close its connection (`Commands → Disconnect from site`) |
+| `Esc` | while a pane is waiting for a server, stop waiting. Listings run in the background, so the rest of the window keeps working meanwhile |
+| `Commands → Connection log` | every command sent to a server and every reply, with passwords blanked; it opens by itself on a connect |
 | `Commands → Verify SFV` | check the focused pane's directory against the `.sfv` in it |
 | `cd ftp://…` | go there in the active pane |
 | `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux they go through GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
@@ -455,7 +458,7 @@ preview naming the count of characters with no glyph. Pick a font that carries t
                          desktop - the places Linux and Windows differ in meaning
     src/win/             the POSIX layer for MSVC, the UTF-8 code page manifest, and
                          the resource script with the icon and version
-    src/theme.*          eight themes and the accent colours the panes draw with
+    src/theme.*          nine themes and the accent colours the panes draw with
     tests/               the ten suites, the FTP fixture, and the pictures the
                          picture tests build for themselves
     scripts/get-deps.sh  the pinned Dear ImGui checkout and the pinned stb_image.h

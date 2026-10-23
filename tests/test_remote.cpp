@@ -1548,6 +1548,88 @@ static void test_ftp_bad_login(FtpFixture& fx) {
     CHECK(!err.empty());
 }
 
+// The connection log holds the conversation - the commands and the replies - and
+// never the password, which is the one thing a log someone pastes into a bug
+// report must not carry.
+static void test_ftp_log(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    site.password = "s3cret-do-not-log";
+    net_forget(nullptr);   // a fresh login, so USER and PASS are said again
+    uint64_t before = net_log_since(0, nullptr);
+    std::string err;
+    std::vector<FileEntry> rows;
+    net_list(site, "/", &rows, &err);
+
+    std::vector<NetLogLine> lines;
+    net_log_since(before, &lines);
+    bool sent_user = false, sent_pass = false, got_reply = false, leaked = false;
+    for (const NetLogLine& l : lines) {
+        if (l.kind == NETLOG_SENT && !strncmp(l.text.c_str(), "USER ", 5)) sent_user = true;
+        if (l.kind == NETLOG_SENT && l.text == "PASS ****") sent_pass = true;
+        if (l.kind == NETLOG_RECV) got_reply = true;
+        if (l.text.find("s3cret") != std::string::npos) leaked = true;
+        CHECK(l.site == net_site_root(site));
+    }
+    CHECK(sent_user);
+    CHECK(sent_pass);
+    CHECK(got_reply);
+    CHECK(!leaked);
+
+    // A reader that has seen everything gets nothing more.
+    std::vector<NetLogLine> none;
+    uint64_t now = net_log_since(0, nullptr);
+    net_log_since(now, &none);
+    CHECK(none.empty());
+    net_forget(nullptr);
+}
+
+// A listing asked to stop stops, says so, and leaves the next listing working:
+// that is what lets a pane walk away from a server that is not answering.
+static bool stop_now_cb(long long, long long, int, int, void* user) {
+    (*(int*)user)++;
+    return false;
+}
+
+static void test_ftp_list_cancel(FtpFixture& fx) {
+    NetSite site = fixture_site(fx);
+    std::string err;
+    std::vector<FileEntry> rows;
+    int asked = 0;
+    CHECK(!net_list(site, "/", &rows, &err, stop_now_cb, &asked));
+    CHECK(asked >= 1);
+    CHECK(err == "cancelled");
+
+    err.clear();
+    CHECK(net_list(site, "/", &rows, &err));
+    CHECK(find_row(rows, "hello.txt") != nullptr);
+}
+
+// A server that cannot be reached is asked once. The retry is for a cached
+// connection the server dropped, and LIST is for a server that does not know
+// MLSD; neither helps a port nothing listens on, and each used to add a full
+// connect timeout to the wait.
+static void test_unreachable_asks_once(void) {
+    NetSite site;
+    site.host = "127.0.0.1";
+    site.port = 1;
+    site.user = "someone";
+    net_forget(nullptr);
+    uint64_t before = net_log_since(0, nullptr);
+    std::string err;
+    std::vector<FileEntry> rows;
+    CHECK(!net_list(site, "/", &rows, &err));
+    CHECK(!err.empty());
+    std::vector<NetLogLine> lines;
+    net_log_since(before, &lines);
+    int attempts = 0, errors = 0;
+    for (const NetLogLine& l : lines) {
+        if (l.kind == NETLOG_INFO && !strncmp(l.text.c_str(), "Listing ", 8)) attempts++;
+        if (l.kind == NETLOG_ERROR) errors++;
+    }
+    CHECK(attempts == 1);
+    CHECK(errors == 1);
+}
+
 // ---------------------------------------------------------------------------
 // a build without libcurl
 // ---------------------------------------------------------------------------
@@ -1614,6 +1696,7 @@ int main(void) {
         printf("%d checks, %d failures\n", checks, failures);
         return failures ? 1 : 0;
     }
+    test_unreachable_asks_once();
     if (!have_python()) {
         printf("python3 is not installed: the transport tests are skipped\n");
         printf("%d checks, %d failures\n", checks, failures);
@@ -1642,6 +1725,8 @@ int main(void) {
         test_ftp_listing(fx);
         test_ftp_escaped_names(fx);
         test_ftp_bad_login(fx);
+        test_ftp_log(fx);
+        test_ftp_list_cancel(fx);
         test_ftp_transfer(fx);
         test_ftp_prefix(fx);
         test_ftp_partial(fx);

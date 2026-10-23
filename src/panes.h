@@ -124,6 +124,11 @@ struct Pane {
     // The local directory the pane walked into the site from. ".." at the site
     // root uses it to leave, because a remote pane has no parent of its own.
     char remote_came_from[4096];
+    // The listing this pane is waiting for from the background worker, 0 when it
+    // is not waiting, and when it asked (SDL ticks) so the status line can say
+    // how long the server has been quiet.
+    uint64_t remote_req = 0;
+    uint64_t remote_req_ms = 0;
 
     // Directory history (Alt+Left / Alt+Right)
     char history[MAX_DIR_HISTORY][4096];
@@ -493,6 +498,23 @@ public:
     // keyboard. -1 = nothing highlighted.
     int  remote_cursor;
     bool remote_focus_request; // the quick-connect field wants the caret
+    // A connect whose first listing has not come back yet. The listing runs on a
+    // worker, so whether the connect worked is only known a few frames later:
+    // then the dialogs close, or the pane goes back to `remote_connect_back`.
+    uint64_t remote_connect_req = 0;
+    char remote_connect_back[4096] = "";
+    std::string remote_connect_target;
+    // The connection log window, and the lines it has copied out of remote.cpp's
+    // log so far (it asks only for newer ones each frame).
+    bool netlog_open = false;
+    bool netlog_follow = true;          // keep scrolled to the newest line
+    uint64_t netlog_seq = 0;
+    std::vector<NetLogLine> netlog;
+    // Each line as drawn: a server reply in CP437 (an .nfo-style banner) is
+    // transcoded once, when it arrives, not every frame. `netlog_page` is the
+    // preview_codepage that was in force, so changing it redraws the lot.
+    std::vector<std::string> netlog_shown;
+    int netlog_page = -1;
     bool dirhist_open;    // Alt+Down: visited directories
     bool console_hist_open; // Alt+F8: the console's command history
     bool volumes_open;    // Alt+F1/F2: mounted drives
@@ -708,6 +730,7 @@ public:
 
     int view_mode;      // AppViewMode, Ctrl+O cycles
     bool show_hidden;   // Alt+. toggles
+    bool show_icons = true;  // the small icon in front of each name (Options menu)
     char filter_preset[256];  // Ctrl+F12 user filter, from the config
     // Shift+F1 column set for the long view: comma-separated, always starting
     // with "name". Vocabulary: name, ext, size, date, perms, type.

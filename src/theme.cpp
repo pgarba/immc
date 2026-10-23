@@ -243,10 +243,82 @@ static void theme_solarized_light(void) {
     g_colors.window_bg         = ImVec4(0.992f, 0.965f, 0.890f, 1.0f);
 }
 
+// ---------------------------------------------------------------- windows
+// Windows 10/11's own look: black text on white, the light grey of its menus and
+// buttons, the system accent blue behind the focused path, and Explorer's pale
+// blue selection, which black text stays readable on. Folders are the navy of
+// the classic Windows title bar rather than a bright blue, so a list still reads
+// as black text and the folders still stand out.
+static void theme_windows(void) {
+    ImGui::StyleColorsLight();
+    ImGuiStyle& s = ImGui::GetStyle();
+    C(ImGuiCol_Text,                  0.000f, 0.000f, 0.000f, 1.00f); // 000000
+    C(ImGuiCol_TextDisabled,          0.427f, 0.427f, 0.427f, 1.00f); // 6d6d6d
+    C(ImGuiCol_WindowBg,              1.000f, 1.000f, 1.000f, 1.00f); // ffffff
+    C(ImGuiCol_ChildBg,               1.000f, 1.000f, 1.000f, 1.00f);
+    C(ImGuiCol_PopupBg,               0.976f, 0.976f, 0.976f, 1.00f); // f9f9f9
+    C(ImGuiCol_Border,                0.851f, 0.851f, 0.851f, 1.00f); // d9d9d9
+    C(ImGuiCol_BorderShadow,          0.000f, 0.000f, 0.000f, 0.00f);
+    C(ImGuiCol_FrameBg,               0.961f, 0.961f, 0.961f, 1.00f); // f5f5f5
+    C(ImGuiCol_FrameBgHovered,        0.898f, 0.945f, 0.984f, 1.00f); // e5f1fb
+    C(ImGuiCol_FrameBgActive,         0.800f, 0.894f, 0.969f, 1.00f); // cce4f7
+    C(ImGuiCol_TitleBg,               0.941f, 0.941f, 0.941f, 1.00f); // f0f0f0
+    C(ImGuiCol_TitleBgActive,         0.898f, 0.945f, 0.984f, 1.00f); // e5f1fb
+    C(ImGuiCol_TitleBgCollapsed,      0.941f, 0.941f, 0.941f, 1.00f);
+    C(ImGuiCol_MenuBarBg,             0.941f, 0.941f, 0.941f, 1.00f); // f0f0f0
+    C(ImGuiCol_ScrollbarBg,           0.941f, 0.941f, 0.941f, 1.00f);
+    C(ImGuiCol_ScrollbarGrab,         0.761f, 0.761f, 0.761f, 1.00f); // c2c2c2
+    C(ImGuiCol_ScrollbarGrabHovered,  0.651f, 0.651f, 0.651f, 1.00f); // a6a6a6
+    C(ImGuiCol_ScrollbarGrabActive,   0.545f, 0.545f, 0.545f, 1.00f); // 8b8b8b
+    C(ImGuiCol_CheckMark,             0.000f, 0.471f, 0.831f, 1.00f); // 0078d4
+    C(ImGuiCol_SliderGrab,            0.000f, 0.471f, 0.831f, 1.00f);
+    C(ImGuiCol_SliderGrabActive,      0.000f, 0.353f, 0.620f, 1.00f); // 005a9e
+    C(ImGuiCol_Button,                0.882f, 0.882f, 0.882f, 1.00f); // e1e1e1
+    C(ImGuiCol_ButtonHovered,         0.898f, 0.945f, 0.984f, 1.00f); // e5f1fb
+    C(ImGuiCol_ButtonActive,          0.800f, 0.894f, 0.969f, 1.00f); // cce4f7
+    C(ImGuiCol_Header,                0.800f, 0.910f, 1.000f, 1.00f); // cce8ff
+    C(ImGuiCol_HeaderHovered,         0.898f, 0.953f, 1.000f, 1.00f); // e5f3ff
+    C(ImGuiCol_HeaderActive,          0.800f, 0.910f, 1.000f, 1.00f);
+    C(ImGuiCol_Separator,             0.851f, 0.851f, 0.851f, 1.00f);
+    C(ImGuiCol_SeparatorHovered,      0.000f, 0.471f, 0.831f, 0.78f);
+    C(ImGuiCol_SeparatorActive,       0.000f, 0.471f, 0.831f, 1.00f);
+    C(ImGuiCol_ResizeGrip,            0.761f, 0.761f, 0.761f, 0.40f);
+    C(ImGuiCol_ResizeGripHovered,     0.000f, 0.471f, 0.831f, 0.67f);
+    C(ImGuiCol_ResizeGripActive,      0.000f, 0.471f, 0.831f, 0.95f);
+    C(ImGuiCol_Tab,                   0.882f, 0.882f, 0.882f, 1.00f);
+    C(ImGuiCol_TabHovered,            0.898f, 0.945f, 0.984f, 1.00f);
+    C(ImGuiCol_TabSelected,           1.000f, 1.000f, 1.000f, 1.00f);
+    C(ImGuiCol_TabDimmed,             0.941f, 0.941f, 0.941f, 1.00f);
+    C(ImGuiCol_TabDimmedSelected,     1.000f, 1.000f, 1.000f, 1.00f);
+    C(ImGuiCol_PlotHistogram,         0.024f, 0.690f, 0.145f, 1.00f); // 06b025, its progress bar
+    C(ImGuiCol_PlotHistogramHovered,  0.024f, 0.600f, 0.125f, 1.00f);
+    C(ImGuiCol_TableHeaderBg,         0.941f, 0.941f, 0.941f, 1.00f);
+    C(ImGuiCol_TableBorderStrong,     0.851f, 0.851f, 0.851f, 1.00f);
+    C(ImGuiCol_TableBorderLight,      0.906f, 0.906f, 0.906f, 1.00f);
+    C(ImGuiCol_TableRowBg,            1.000f, 1.000f, 1.000f, 0.00f);
+    C(ImGuiCol_TableRowBgAlt,         0.969f, 0.969f, 0.969f, 1.00f); // f7f7f7
+    C(ImGuiCol_TextSelectedBg,        0.000f, 0.471f, 0.831f, 0.30f);
+    C(ImGuiCol_NavCursor,             0.000f, 0.471f, 0.831f, 1.00f);
+    C(ImGuiCol_ModalWindowDimBg,      0.000f, 0.000f, 0.000f, 0.25f);
+
+    g_colors.title_focused     = ImVec4(0.000f, 0.471f, 0.831f, 1.0f); // 0078d4, white text on it
+    g_colors.title_focused_hov = ImVec4(0.063f, 0.533f, 0.890f, 1.0f);
+    g_colors.title_unfocused   = ImVec4(0.941f, 0.941f, 0.941f, 1.0f); // f0f0f0
+    g_colors.dir               = ImVec4(0.039f, 0.141f, 0.416f, 1.0f); // 0a246a
+    g_colors.exec              = ImVec4(0.000f, 0.392f, 0.000f, 1.0f); // 006400
+    g_colors.diff_missing      = ImVec4(0.769f, 0.000f, 0.000f, 1.0f); // c40000
+    g_colors.diff_differ       = ImVec4(0.616f, 0.365f, 0.000f, 1.0f); // 9d5d00
+    g_colors.marked_bg         = IM_COL32(200, 230, 201, 255);         // c8e6c9
+    g_colors.cursor_bg         = IM_COL32(204, 232, 255, 255);         // cce8ff, Explorer's selection
+    g_colors.cursor_outline    = IM_COL32(0, 120, 212, 255);           // 0078d4
+    g_colors.window_bg         = ImVec4(1.000f, 1.000f, 1.000f, 1.0f);
+}
+
 #undef C
 
 void mc_apply_theme(const char* name) {
     if      (!strcmp(name, "light"))          theme_light();
+    else if (!strcmp(name, "windows"))        theme_windows();
     else if (!strcmp(name, "classic"))        theme_classic();
     else if (!strcmp(name, "gruvbox"))        theme_gruvbox_dark();
     else if (!strcmp(name, "gruvbox-light"))  theme_gruvbox_light();
@@ -263,7 +335,7 @@ const MCThemeColors* mc_theme_colors() {
 // "solarized" is accepted by mc_apply_theme as an alias but is not offered here:
 // a picker that lists the same palette twice reads like a bug.
 static const char* const kThemeNames[] = {
-    "dark", "light", "classic", "gruvbox", "gruvbox-light",
+    "dark", "light", "windows", "classic", "gruvbox", "gruvbox-light",
     "solarized-dark", "solarized-light",
 };
 
