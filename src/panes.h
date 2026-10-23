@@ -590,6 +590,10 @@ public:
     // The progress dialog's "Run in background" button: stop watching, leave the
     // transfer running, and let the list under the panes carry it from here.
     bool      prog_handoff;
+    // Which progress-dialog button the keyboard is on: PROG_FOCUS_* in panes.cpp.
+    // It starts on "Run in background" and never on Abort, so a stray Enter
+    // cannot stop a transfer.
+    int       prog_focus = -1;
 
     // Copy/move transfers running on their own thread instead of blocking the
     // panes, oldest first. The frame draws them; bg_reap() settles the finished
@@ -731,6 +735,18 @@ public:
     int view_mode;      // AppViewMode, Ctrl+O cycles
     bool show_hidden;   // Alt+. toggles
     bool show_icons = true;  // the small icon in front of each name (Options menu)
+    // The launch bar under the menu, Total Commander's button bar: one button per
+    // program, folder or file, kept in <settings>/launchbar. A click starts it.
+    bool show_launchbar = true;
+    struct LaunchItem {
+        std::string path;      // '/'-separated, as the panes write paths
+        bool is_dir = false;   // looked up once, when the button is added or loaded
+        bool is_exec = false;
+    };
+    std::vector<LaunchItem> launch_items;
+    float launch_bar_min_y = 0, launch_bar_max_y = -1;  // where it was last frame, for drops
+    bool  os_drag_active = false;   // something is being dragged in from Explorer
+    float os_drag_x = 0, os_drag_y = 0;
     char filter_preset[256];  // Ctrl+F12 user filter, from the config
     // Shift+F1 column set for the long view: comma-separated, always starting
     // with "name". Vocabulary: name, ext, size, date, perms, type.
@@ -754,6 +770,10 @@ void app_panes_commit_op(AppPanes* app);   // carry out the op the dialog is sho
 void app_panes_cancel_op(AppPanes* app);   // cancel a pending op
 void app_panes_run_pending(AppPanes* app); // run deferred menu/dialog actions
 void app_panes_set_sdl_window(AppPanes* app, void* window);
+// Files dragged in from the desktop or Explorer. x/y are window coordinates, the
+// ones ImGui draws in. A drop on the launch bar adds a button for each file.
+void app_panes_drag_over(AppPanes* app, bool active, float x, float y);
+void app_panes_drop_file(AppPanes* app, const char* path, float x, float y);
 // Tell the panes the window's framebuffer scale. Returns true when it changed,
 // which means the glyphs are being drawn at the wrong density and the atlas has
 // to be rebuilt - the caller does that between frames, as it does a font pick.

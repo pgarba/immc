@@ -1462,6 +1462,105 @@ static void hotlist_save(AppPanes* app) {
 }
 
 // ---------------------------------------------------------------------------
+// Launch bar buttons, persisted one path per line under <settings>/launchbar
+// ---------------------------------------------------------------------------
+
+static std::string launchbar_file() {
+    return plat_config_dir() + "/launchbar";
+}
+
+static AppPanes::LaunchItem launch_item_for(const std::string& path) {
+    AppPanes::LaunchItem it;
+    it.path = path;
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        it.is_dir = S_ISDIR(st.st_mode);
+        size_t slash = path.find_last_of('/');
+        it.is_exec = !it.is_dir &&
+                     is_executable(path.c_str() + (slash == std::string::npos ? 0 : slash + 1), st.st_mode);
+    }
+    return it;
+}
+
+static void launchbar_load(AppPanes* app) {
+    app->launch_items.clear();
+    FILE* f = fopen(launchbar_file().c_str(), "r");
+    if (!f) return;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
+        if (n) app->launch_items.push_back(launch_item_for(line));
+    }
+    fclose(f);
+}
+
+static void launchbar_save(AppPanes* app) {
+    plat_make_config_dir();
+    FILE* f = fopen(launchbar_file().c_str(), "w");
+    if (!f) return;
+    for (const AppPanes::LaunchItem& it : app->launch_items) fprintf(f, "%s\n", it.path.c_str());
+    fclose(f);
+}
+
+// The name a button goes by: the file name without the extension that only says
+// it is a program or a shortcut.
+static std::string launch_label(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    std::string base = (slash == std::string::npos || slash + 1 == path.size())
+                           ? path : path.substr(slash + 1);
+    size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) {
+        std::string ext = base.substr(dot + 1);
+        for (char& c : ext) c = (char)tolower((unsigned char)c);
+        if (ext == "exe" || ext == "lnk" || ext == "bat" || ext == "cmd" ||
+            ext == "desktop" || ext == "appref-ms" || ext == "url")
+            base.erase(dot);
+    }
+    return base;
+}
+
+// Add a button at `at` (the end when out of range). A path that already has one
+// is not added twice. Paths are kept the way the panes write them: forward
+// slashes, no slash at the end.
+static bool launchbar_add(AppPanes* app, const char* path, int at = -1) {
+    std::string p = path;
+    for (char& c : p) if (c == '\\') c = '/';
+    while (p.size() > 1 && p.back() == '/' && !(p.size() == 3 && p[1] == ':')) p.pop_back();
+    if (p.empty()) return false;
+    for (const AppPanes::LaunchItem& it : app->launch_items)
+        if (it.path == p) {
+            snprintf(app->status_msg, sizeof(app->status_msg), "%s is on the launch bar already",
+                     launch_label(p).c_str());
+            return false;
+        }
+    if (at < 0 || at > (int)app->launch_items.size()) at = (int)app->launch_items.size();
+    app->launch_items.insert(app->launch_items.begin() + at, launch_item_for(p));
+    launchbar_save(app);
+    snprintf(app->status_msg, sizeof(app->status_msg), "Added %s to the launch bar",
+             launch_label(p).c_str());
+    return true;
+}
+
+static void launchbar_remove(AppPanes* app, int i) {
+    if (i < 0 || i >= (int)app->launch_items.size()) return;
+    app->launch_items.erase(app->launch_items.begin() + i);
+    launchbar_save(app);
+}
+
+// Move button `from` so that it lands in front of the one now at `to` (the end
+// when `to` is the count).
+static void launchbar_move(AppPanes* app, int from, int to) {
+    int n = (int)app->launch_items.size();
+    if (from < 0 || from >= n || to < 0 || to > n || to == from || to == from + 1) return;
+    AppPanes::LaunchItem it = app->launch_items[from];
+    app->launch_items.erase(app->launch_items.begin() + from);
+    if (to > from) to--;
+    app->launch_items.insert(app->launch_items.begin() + to, it);
+    launchbar_save(app);
+}
+
+// ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
 
@@ -2451,6 +2550,38 @@ void app_panes_apply_font(AppPanes* app) {
 // stays responsive and shows live numbers.
 // ---------------------------------------------------------------------------
 
+// The progress dialog's keyboard ring: Abort, and "Run in background" when the
+// dialog is watching a transfer on its own thread. NONE is where a dialog with
+// only Abort starts, so the first Enter after starting a copy does nothing.
+enum { PROG_FOCUS_NONE = -1, PROG_FOCUS_ABORT = 0, PROG_FOCUS_BG = 1 };
+
+static void op_focus_ring();
+
+// Keys while the progress dialog is up. It runs inside its own event pump, not the
+// app's key handler, so this is the whole of its keyboard: Tab, Shift+Tab and the
+// arrows move between the buttons, Enter and Space press the one the ring is on.
+// A held key's repeats are dropped by the caller.
+static void prog_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
+    (void)mod;
+    const bool two = app->prog_watch != nullptr;
+    switch (key) {
+    case SDLK_TAB: case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+        if (!two) app->prog_focus = PROG_FOCUS_ABORT;
+        else app->prog_focus = app->prog_focus == PROG_FOCUS_BG ? PROG_FOCUS_ABORT : PROG_FOCUS_BG;
+        break;
+    case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE:
+        if (app->prog_focus == PROG_FOCUS_BG && two) {
+            app->prog_handoff = true;
+        } else if (app->prog_focus == PROG_FOCUS_ABORT) {
+            app->prog_abort = true;
+            if (app->prog_watch) app->prog_watch->abort = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void render_progress_dialog(AppPanes* app) {
     if (!app->prog_active) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -2525,6 +2656,7 @@ static void render_progress_dialog(AppPanes* app) {
         app->prog_abort = true;
         if (app->prog_watch) app->prog_watch->abort = true;
     }
+    if (app->prog_focus == PROG_FOCUS_ABORT) op_focus_ring();
     // Only a transfer that is already on a thread of its own can be handed over,
     // and the handover asks nothing of the transfer: the row under the panes has
     // the numbers, the Abort button and the finish already. That is why this can
@@ -2534,6 +2666,7 @@ static void render_progress_dialog(AppPanes* app) {
     if (app->prog_watch) {
         ImGui::SameLine();
         if (ImGui::Button("Run in background")) app->prog_handoff = true;
+        if (app->prog_focus == PROG_FOCUS_BG) op_focus_ring();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The transfer goes on, and the list under the panes carries it.\n"
                               "Nothing about the transfer itself changes.");
@@ -2543,6 +2676,8 @@ static void render_progress_dialog(AppPanes* app) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "stopping after the current file...");
     } else {
         ImGui::TextDisabled("Abort stops the operation. What is already transferred stays.");
+        ImGui::TextDisabled(app->prog_watch ? "Tab or the arrows move between the buttons, Enter presses one."
+                                            : "Tab puts the keyboard on Abort, Enter presses it.");
     }
     ImGui::End();
 }
@@ -2554,6 +2689,9 @@ static void pump_progress_ui(AppPanes* app) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) app->quit_request = true;
+        // A held Enter from the dialog that started the copy repeats into this
+        // one; only a fresh press counts.
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) prog_key(app, e.key.key, e.key.mod);
         ImGui_ImplSDL3_ProcessEvent(&e);
     }
     ImGui_ImplOpenGL3_NewFrame();
@@ -2601,6 +2739,7 @@ static void prog_begin(AppPanes* app, const char* src, const char* dst, bool is_
     app->prog_files_total = 0;
     app->prog_t0 = SDL_GetTicks() / 1000.0;
     app->prog_last_pump = 0.0;
+    app->prog_focus = PROG_FOCUS_NONE;
 }
 
 // A copy that crosses a network is on its own thread whether or not the user
@@ -2612,6 +2751,7 @@ static void prog_begin_watch(AppPanes* app, BgTransfer* t) {
     prog_begin(app, t->src.c_str(), t->dst.c_str(), t->is_move);
     app->prog_watch   = t;
     app->prog_handoff = false;
+    app->prog_focus   = PROG_FOCUS_BG;   // Enter sends it to the background
     app->prog_t0      = t->t0;   // the transfer started before this dialog did
 }
 
@@ -2713,6 +2853,7 @@ static void arch_prog_begin(AppPanes* app, const char* src, const char* dst) {
     app->prog_files_total = 0;
     app->prog_t0 = SDL_GetTicks() / 1000.0;
     app->prog_last_pump = 0.0;
+    app->prog_focus = PROG_FOCUS_NONE;
 }
 
 // TC Alt+F5 / Alt+Shift+F5. Packing gets a dialog rather than a name in the op
@@ -3214,7 +3355,7 @@ static void render_op_dialog(AppPanes* app) {
     if (ImGui::Button("Cancel")) app_panes_cancel_op(app);
     if (app->op_focus == OF_CANCEL) op_focus_ring();
     ImGui::SameLine();
-    text_wrap_disabled("Tab moves between these, Enter runs what it is on, Esc cancels.%s",
+    text_wrap_disabled("Tab (then the arrows) moves between these, Enter runs what it is on, Esc cancels.%s",
                        network ? "  Shift+Enter runs it in the background." : "");
     if (!open) app_panes_cancel_op(app);
     ImGui::End();
@@ -5127,6 +5268,19 @@ static void view_entry(AppPanes* app, Pane& pane, int idx) {
     open_viewer(app, full);
 }
 
+// Enter and Alt+F3: hand the entry to the desktop's default handler. Through a
+// pointer so the tests can see what would have been opened without starting it.
+static bool (*g_open_default)(const char*, std::string*) = plat_open_default;
+
+static void open_with_default(AppPanes* app, const char* fullpath) {
+    std::string err;
+    if (!g_open_default(fullpath, &err)) {
+        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s: %s", fullpath, err.c_str());
+        return;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "Open with default: %s", fullpath);
+}
+
 static void activate_entry(AppPanes* app, Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count) return;
     FileEntry* e = pane.entries[idx];
@@ -5176,6 +5330,11 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
         // with it, and it no longer does - it runs on the console's worker.
         console_show(app, false);
         console_start(app, full);
+    } else if (!in_remote(pane)) {
+        // Any other file opens in the program the desktop has for it, as a double
+        // click in Explorer or Total Commander does: a .png in the image viewer, a
+        // .mkv in the video player. F3 and Shift+F3 are the built-in viewer.
+        open_with_default(app, full);
     } else {
         view_entry(app, pane, idx);
     }
@@ -5201,16 +5360,6 @@ static void spawn_terminal_editor(AppPanes* app, const char* fullpath) {
     }
     snprintf(app->status_msg, sizeof(app->status_msg), "Editing %s with %s in %s",
              fullpath, term_editor_name(), launch.name.c_str());
-}
-
-// Alt+F3: hand the entry to the desktop's default handler.
-static void open_with_default(AppPanes* app, const char* fullpath) {
-    std::string err;
-    if (!plat_open_default(fullpath, &err)) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Cannot open %s: %s", fullpath, err.c_str());
-        return;
-    }
-    snprintf(app->status_msg, sizeof(app->status_msg), "Open with default: %s", fullpath);
 }
 
 // The cursor-bound actions, shared by the key handler and the File menu. A menu
@@ -5513,6 +5662,12 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     }
     if (ImGui::MenuItem("Open")) activate_entry(app, pane, pane.selected);
     if (ImGui::MenuItem("View")) view_entry(app, pane, pane.selected);
+    if (!in_remote(pane) && !in_archive(pane) && ImGui::MenuItem("Add to launch bar")) {
+        char full[4300];
+        snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, pane.selected));
+        launchbar_add(app, full);
+        app->show_launchbar = true;
+    }
     if (ImGui::MenuItem("Rename")) open_name_dialog(app, OP_RENAME, e->name);
     bool marked = pane.selected < (int)pane.marked.size() && pane.marked[pane.selected];
     if (ImGui::MenuItem(marked ? "Unmark" : "Mark")) toggle_mark(pane, pane.selected);
@@ -6287,6 +6442,24 @@ static float draw_row_icon(const AppPanes* app, const Pane& pane, int i, bool is
     return s + gap;
 }
 
+// Drag-and-drop payloads: a local file or folder picked up from a pane row (its
+// full path, NUL-terminated), and a launch bar button being moved (its index).
+static const char* const k_dnd_path   = "IMMC_PATH";
+static const char* const k_dnd_launch = "IMMC_LAUNCH";
+
+// Lets the row just drawn be dragged, onto the launch bar for now. Only a local
+// one: a file on a site or in an archive is not something a button can start.
+static void pane_row_drag_source(const Pane& pane, int i) {
+    if (in_remote(pane) || in_archive(pane) || !strcmp(pane.entries[i]->name, "..")) return;
+    if (!ImGui::BeginDragDropSource()) return;
+    char full[4300];
+    snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, i));
+    ImGui::SetDragDropPayload(k_dnd_path, full, strlen(full) + 1);
+    ImGui::Text("%s", entry_rel(pane, i));
+    ImGui::TextDisabled("drop on the launch bar to add a button");
+    ImGui::EndDragDropSource();
+}
+
 static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
     float row_h = ImGui::GetTextLineHeightWithSpacing();
     pane.page_size = row_h > 0 ? (int)(ImGui::GetWindowSize().y / row_h) : PAGE_SIZE;
@@ -6392,6 +6565,7 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                 if (float iw = draw_row_icon(app, pane, i, is_dir, is_exec))
                     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + iw);
                 bool clicked = ImGui::Selectable(entry_rel(pane, i), selected, ImGuiSelectableFlags_SpanAllColumns);
+                pane_row_drag_source(pane, i);
                 if (selected) {
                     ImVec2 rp = ImGui::GetCursorScreenPos();
                     pane.cursor_screen_x = rp.x;
@@ -6501,6 +6675,7 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
             if (float iw = draw_row_icon(app, pane, i, is_dir, is_exec))
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + iw);
             bool clicked = ImGui::Selectable(entry_rel(pane, i), selected);
+            pane_row_drag_source(pane, i);
             if (selected) {
                 ImVec2 rp = ImGui::GetCursorScreenPos();
                 pane.cursor_screen_x = rp.x;
@@ -8793,6 +8968,8 @@ static void render_options_items(AppPanes* app) {
     }
     if (ImGui::MenuItem("Show file icons", nullptr, app->show_icons))
         app->show_icons = !app->show_icons;
+    if (ImGui::MenuItem("Show launch bar", nullptr, app->show_launchbar))
+        app->show_launchbar = !app->show_launchbar;
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
 
     if (ImGui::BeginMenu("Sort by")) {
@@ -8922,6 +9099,192 @@ static void render_commands_items(AppPanes* app) {
         app->left_focus ? app_panes_refresh_left(app) : app_panes_refresh_right(app);
 }
 
+// ---------------------------------------------------------------------------
+// Launch bar
+// ---------------------------------------------------------------------------
+
+#ifndef _WIN32
+// Through a pointer for the same reason as g_open_default: a test can see what
+// would have been started.
+static bool (*g_spawn_detached)(const std::vector<std::string>&, std::string*) = plat_spawn_detached;
+#endif
+
+// A button was clicked. A folder opens in the focused pane, as TC's folder
+// buttons do. Anything else goes to the desktop, which starts a program or a
+// shortcut and opens a document in its program - except a Linux binary, which
+// xdg-open would open as a document, so that one is started directly.
+static void launch_item(AppPanes* app, int i) {
+    if (i < 0 || i >= (int)app->launch_items.size()) return;
+    const std::string path = app->launch_items[i].path;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "%s is not there any more (right-click the button to remove it)", path.c_str());
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        Pane& active = app->left_focus ? app->left : app->right;
+        navigate_to(app, &active, path.c_str());
+        return;
+    }
+#ifndef _WIN32
+    size_t slash = path.find_last_of('/');
+    const char* base = path.c_str() + (slash == std::string::npos ? 0 : slash + 1);
+    if (is_executable(base, st.st_mode)) {
+        std::string err;
+        if (!g_spawn_detached({ path }, &err))
+            snprintf(app->status_msg, sizeof(app->status_msg), "Cannot run %s: %s", path.c_str(), err.c_str());
+        else
+            snprintf(app->status_msg, sizeof(app->status_msg), "Started %s", launch_label(path).c_str());
+        return;
+    }
+#endif
+    open_with_default(app, path.c_str());
+}
+
+// Point the focused pane at the folder a button's file is in, cursor on it.
+static void launch_show_in_pane(AppPanes* app, int i) {
+    if (i < 0 || i >= (int)app->launch_items.size()) return;
+    const std::string& path = app->launch_items[i].path;
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return;
+    std::string dir = slash == 0 ? "/" : path.substr(0, slash);
+    if (dir.size() == 2 && dir[1] == ':') dir += "/";
+    Pane& active = app->left_focus ? app->left : app->right;
+    navigate_to(app, &active, dir.c_str());
+    const std::string base = path.substr(slash + 1);
+    for (int j = 0; j < active.entry_count; j++)
+        if (strcmp(active.entries[j]->name, base.c_str()) == 0) {
+            active.selected = j;
+            active.scroll_request = true;
+            break;
+        }
+}
+
+// The bar: one icon button per item, under the menu. A click starts the item,
+// dragging a button moves it, and a file dragged onto the bar - from a pane or
+// from Explorer - becomes a new button where it is dropped.
+static void render_launch_bar(AppPanes* app) {
+    if (!app->show_launchbar) { app->launch_bar_max_y = -1; return; }
+    const float s = floorf(ImGui::GetTextLineHeight() * 2.0f);   // the icon, TC's 24-32 px
+    const float pad = 3.0f;
+    const float bw = s + 2 * pad;                                 // the button
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 2.0f));
+    ImGui::BeginChild("##launchbar", ImVec2(0, bw + 4.0f), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    dl = ImGui::GetWindowDrawList();   // the bar's own, not the main window's
+    ImVec2 bar_min = ImGui::GetWindowPos();
+    ImVec2 bar_max = ImVec2(bar_min.x + ImGui::GetWindowWidth(), bar_min.y + ImGui::GetWindowHeight());
+    app->launch_bar_min_y = bar_min.y;
+    app->launch_bar_max_y = bar_max.y;
+
+    int launch = -1, remove = -1, show = -1, move_from = -1, move_to = -1, add_at = -1;
+    std::string add_path;
+    const int n = (int)app->launch_items.size();
+    if (n == 0) {
+        ImGui::SetCursorPosY((bw + 4.0f - ImGui::GetTextLineHeight()) * 0.5f);
+        ImGui::TextDisabled("Launch bar: drag programs, folders or files here, from a pane or from Explorer");
+    }
+    for (int i = 0; i < n; i++) {
+        const AppPanes::LaunchItem& it = app->launch_items[i];
+        ImGui::PushID(i);
+        if (i) ImGui::SameLine(0.0f, 4.0f);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        if (ImGui::InvisibleButton("b", ImVec2(bw, bw))) launch = i;
+        bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+        if (hovered || held)
+            dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + bw),
+                              ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered), 3.0f);
+
+        size_t slash = it.path.find_last_of('/');
+        std::string dir  = slash == std::string::npos ? "" : it.path.substr(0, slash);
+        std::string name = slash == std::string::npos ? it.path : it.path.substr(slash + 1);
+        ImVec2 ip(floorf(p.x + pad), floorf(p.y + pad));
+        unsigned long long tex = icon_shell_large(dir.c_str(), name.c_str(), it.is_dir);
+        if (tex)
+            dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)tex), ip, ImVec2(ip.x + s, ip.y + s));
+        else
+            draw_kind_icon(dl, icon_kind(name.c_str(), it.is_dir, it.is_exec), ip, s);
+        ImGui::SetItemTooltip("%s\n%s", launch_label(it.path).c_str(), it.path.c_str());
+
+        if (ImGui::BeginDragDropSource()) {
+            ImGui::SetDragDropPayload(k_dnd_launch, &i, sizeof(i));
+            ImGui::Text("%s", launch_label(it.path).c_str());
+            ImGui::EndDragDropSource();
+        }
+        // Dropped on a button: the dropped thing goes in front of it.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(k_dnd_launch)) {
+                move_from = *(const int*)pl->Data;
+                move_to = i;
+            }
+            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(k_dnd_path)) {
+                add_path = (const char*)pl->Data;
+                add_at = i;
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (ImGui::BeginPopupContextItem("ctx")) {
+            ImGui::TextDisabled("%s", launch_label(it.path).c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem(it.is_dir ? "Open in pane" : "Start")) launch = i;
+            if (!it.is_dir && ImGui::MenuItem("Show in pane")) show = i;
+            if (ImGui::MenuItem("Move left", nullptr, false, i > 0)) { move_from = i; move_to = i - 1; }
+            if (ImGui::MenuItem("Move right", nullptr, false, i + 1 < n)) { move_from = i; move_to = i + 2; }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Remove from launch bar")) remove = i;
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    // Dropped on the bar but not on a button: at the end.
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(k_dnd_launch)) {
+            move_from = *(const int*)pl->Data;
+            move_to = n;
+        }
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(k_dnd_path)) {
+            add_path = (const char*)pl->Data;
+            add_at = n;
+        }
+        ImGui::EndDragDropTarget();
+    }
+    // Something from Explorer over the bar: outline it, as ImGui does for its own.
+    if (app->os_drag_active && app->os_drag_y >= bar_min.y && app->os_drag_y < bar_max.y)
+        ImGui::GetWindowDrawList()->AddRect(bar_min, bar_max, ImGui::GetColorU32(ImGuiCol_DragDropTarget),
+                                            0.0f, 0, 2.0f);
+    ImGui::Separator();
+
+    // Acted on after the loop, which reads the list it would otherwise change.
+    if (!add_path.empty()) launchbar_add(app, add_path.c_str(), add_at);
+    if (move_from >= 0) launchbar_move(app, move_from, move_to);
+    if (remove >= 0) launchbar_remove(app, remove);
+    if (show >= 0) launch_show_in_pane(app, show);
+    if (launch >= 0) launch_item(app, launch);
+}
+
+void app_panes_drag_over(AppPanes* app, bool active, float x, float y) {
+    app->os_drag_active = active;
+    app->os_drag_x = x;
+    app->os_drag_y = y;
+}
+
+void app_panes_drop_file(AppPanes* app, const char* path, float x, float y) {
+    (void)x;
+    if (app->show_launchbar && y >= app->launch_bar_min_y && y < app->launch_bar_max_y) {
+        launchbar_add(app, path);
+        return;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg),
+             app->show_launchbar ? "Drop it on the launch bar to add a button for it"
+                                 : "Turn on Options > Show launch bar to add buttons by dropping files");
+}
+
 void app_panes_render(AppPanes* app) {
     ImGuiIO& io = ImGui::GetIO();
     bool& left_focus = app->left_focus;
@@ -9010,6 +9373,9 @@ void app_panes_render(AppPanes* app) {
         render_commands_items(app);
         ImGui::EndPopup();
     }
+
+    // Under the menu; the panes below measure their height from where it ends.
+    render_launch_bar(app);
 
     // Dual pane layout: 2-column table guarantees a 50/50 split.
     // Vertical budget comes from the window height and cursor position
@@ -9220,6 +9586,7 @@ AppPanes* app_panes_init() {
     }
 
     hotlist_load(app);
+    launchbar_load(app);
     return app;
 }
 
@@ -9235,6 +9602,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     snprintf(cfg->hinting, sizeof(cfg->hinting), "%s", app->hinting);
     cfg->show_hidden = app->show_hidden ? 1 : 0;
     cfg->show_icons = app->show_icons ? 1 : 0;
+    cfg->show_launchbar = app->show_launchbar ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
@@ -9317,6 +9685,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
         snprintf(app->hinting, sizeof(app->hinting), "%s", cfg->hinting);
     app->show_hidden = cfg->show_hidden != 0;
     app->show_icons = cfg->show_icons != 0;
+    app->show_launchbar = cfg->show_launchbar != 0;
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
@@ -9894,9 +10263,12 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     // While the op dialog is up its field owns the text keys: arrows, Home, End
     // and Delete move the caret inside a long typed path instead of walking the
     // file list.
+    // Once Tab has put the keyboard on one of the buttons, the arrows move between
+    // the buttons instead.
     if (app && app->op != OP_NONE) {
         switch (key) {
         case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+            return app->op_focus != OF_FIELD;
         case SDLK_HOME: case SDLK_END: case SDLK_DELETE: case SDLK_BACKSPACE:
             return false;
         default: break;
@@ -10044,6 +10416,12 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // while the ring is on a button, and a space is a character in a path.
     if (app->op != OP_NONE) {
         if (key == SDLK_TAB) { op_tab(app, shift); return; }
+        // On a button the arrows step the same ring; in the field they never get
+        // here, because the caret has them (see app_key_is_special).
+        if (app->op_focus != OF_FIELD) {
+            if (key == SDLK_LEFT || key == SDLK_UP)    { op_tab(app, true);  return; }
+            if (key == SDLK_RIGHT || key == SDLK_DOWN) { op_tab(app, false); return; }
+        }
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
             // Shift+Enter is the keyboard half of the dialog's "Run in
             // background" button. It is raised for any copy or move and honoured

@@ -50,6 +50,7 @@ struct MCConfig {
     int   sort_mode;      // FsSortMode in filesystem.h
     int   show_hidden;    // 1 = list dotfiles
     int   show_icons;     // 1 = a small icon in front of each name, as in TC
+    int   show_launchbar; // 1 = the launch bar under the menu
     int   trash;          // 1 = Del/F8 goes to the trash, Shift always direct
 
     // Column set of the long view (Shift+F1). Comma-separated; "name" is always
