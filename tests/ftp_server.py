@@ -157,9 +157,17 @@ class Session:
         conn, _ = srv.accept()
         srv.close()
         conn.settimeout(20)
-        if self.tls:
-            conn = self.tls_ctx.wrap_socket(conn, server_side=True)
         return conn
+
+    def secure_data(self, conn):
+        """TLS on the data connection, once the 150 has gone out.
+
+        The handshake comes after the 150, as vsftpd and other servers do it:
+        libcurl before 8 waits for that reply before it starts the handshake, so
+        a server that handshakes first and replies after waits for a client that
+        is waiting for it, until the timeout ends both with a 425.
+        """
+        return self.tls_ctx.wrap_socket(conn, server_side=True) if self.tls else conn
 
     def close_data(self, data):
         """Close a data connection the way TLS expects to be closed.
@@ -409,6 +417,7 @@ class Session:
         resume = self.resume
         self.resume = 0
         try:
+            data = self.secure_data(data)
             if cmd in ("LIST", "MLSD", "NLST"):
                 body = self.listing(path, ls_line if cmd == "LIST" else mlsd_line)
                 if cmd == "NLST":
