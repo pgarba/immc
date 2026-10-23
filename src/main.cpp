@@ -233,6 +233,16 @@ int main(int argc, char** argv)
                 }
             }
 
+            // Files dragged in from Explorer or the desktop. POSITION follows the
+            // pointer so the launch bar can light up under it; the paths arrive one
+            // FILE event each, and COMPLETE ends it, dropped or not.
+            if (event.type == SDL_EVENT_DROP_BEGIN || event.type == SDL_EVENT_DROP_POSITION)
+                app_panes_drag_over(panes, true, event.drop.x, event.drop.y);
+            if (event.type == SDL_EVENT_DROP_FILE && event.drop.data)
+                app_panes_drop_file(panes, event.drop.data, event.drop.x, event.drop.y);
+            if (event.type == SDL_EVENT_DROP_COMPLETE)
+                app_panes_drag_over(panes, false, 0, 0);
+
             if (event.type == SDL_EVENT_KEY_DOWN) {
                 SDL_Keycode k = event.key.key;
                 SDL_Keymod m = event.key.mod;
@@ -251,10 +261,13 @@ int main(int argc, char** argv)
                 }
 
                 // An operation dialog is up (F5/F6/F7/F2/Shift+F4): Enter runs what
-                // the keyboard ring is on, Tab moves the ring, Esc cancels. Everything
-                // else (typing, caret keys) goes to ImGui, which owns the text field.
+                // the keyboard ring is on, Tab moves the ring, Esc cancels, and the
+                // arrows move it too once it is on a button. Everything else (typing,
+                // caret keys) goes to ImGui, which owns the text field.
                 if (panes->op != OP_NONE) {
-                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE || k == SDLK_TAB)
+                    const bool arrow = k == SDLK_LEFT || k == SDLK_RIGHT || k == SDLK_UP || k == SDLK_DOWN;
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_ESCAPE || k == SDLK_TAB ||
+                        (arrow && app_key_is_special(k, m, panes)))
                         app_panes_handle_key(panes, k, m);
                     else
                         ImGui_ImplSDL3_ProcessEvent(&event);

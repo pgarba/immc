@@ -100,7 +100,8 @@ static unsigned long long hicon_texture(HICON h) {
     return tex;
 }
 
-unsigned long long icon_shell(const char* dir, const char* name, bool is_dir, bool local) {
+static unsigned long long icon_lookup(const char* dir, const char* name, bool is_dir, bool local,
+                                      bool large) {
     if (!strcmp(name, "..")) return 0;   // the pane draws its own "up"
     if (!tex_available()) return 0;
 
@@ -116,29 +117,31 @@ unsigned long long icon_shell(const char* dir, const char* name, bool is_dir, bo
     // A network share answers slowly, so its files get their extension's icon.
     bool own = !is_dir && local && ext_is(ext, k_own_icon_ext) &&
                !(dir[0] && strchr("/\\", dir[0]) && strchr("/\\", dir[1]));
-    std::string key;
+    std::string what;
     if (is_dir) {
-        key = "<dir>";
+        what = "<dir>";
     } else if (own) {
-        key = std::string(dir) + "/" + name;
+        what = std::string(dir) + "/" + name;
     } else {
-        key = ".";
-        for (const char* p = ext; *p; p++) key += (char)tolower((unsigned char)*p);
+        what = ".";
+        for (const char* p = ext; *p; p++) what += (char)tolower((unsigned char)*p);
     }
+    // The two sizes are different pictures of the same thing, cached side by side.
+    std::string key = (large ? "L" : "S") + what;
 
     std::map<std::string, int>::iterator it = g_by_key.find(key);
     if (it == g_by_key.end()) {
         if (own && g_budget <= 0) {
             // Not this frame: show the extension's icon until its turn comes.
-            return icon_shell(dir, name, is_dir, false);
+            return icon_lookup(dir, name, is_dir, false, large);
         }
         SHFILEINFOW fi = {};
-        UINT flags = SHGFI_ICON | SHGFI_SMALLICON;
+        UINT flags = SHGFI_ICON | (large ? SHGFI_LARGEICON : SHGFI_SMALLICON);
         std::wstring path;
         DWORD attr = FILE_ATTRIBUTE_NORMAL;
         if (own) {
             g_budget--;
-            path = icon_widen(key);
+            path = icon_widen(what);
             for (wchar_t& c : path) if (c == L'/') c = L'\\';
             if (!strcasecmp(ext, "lnk")) flags |= SHGFI_LINKOVERLAY;
         } else {
@@ -146,22 +149,31 @@ unsigned long long icon_shell(const char* dir, const char* name, bool is_dir, bo
             // and never touches the disk.
             flags |= SHGFI_USEFILEATTRIBUTES;
             if (is_dir) { path = L"folder"; attr = FILE_ATTRIBUTE_DIRECTORY; }
-            else path = L"file" + icon_widen(key == "." ? "" : key);
+            else path = L"file" + icon_widen(what == "." ? "" : what);
         }
         int index = -1;
         if (SHGetFileInfoW(path.c_str(), attr, &fi, sizeof(fi), flags) && fi.hIcon) {
             // A shortcut's arrow is drawn on top of its target's icon, so it is not
-            // the same picture as that index.
-            index = fi.iIcon | ((flags & SHGFI_LINKOVERLAY) ? 0x40000000 : 0);
+            // the same picture as that index; nor is the large one.
+            index = fi.iIcon | ((flags & SHGFI_LINKOVERLAY) ? 0x40000000 : 0) |
+                    (large ? 0x20000000 : 0);
             if (!g_by_index.count(index)) g_by_index[index] = hicon_texture(fi.hIcon);
             DestroyIcon(fi.hIcon);
         }
         it = g_by_key.insert(std::make_pair(key, index)).first;
     }
-    if (it->second < 0) return own ? icon_shell(dir, name, is_dir, false) : 0;
+    if (it->second < 0) return own ? icon_lookup(dir, name, is_dir, false, large) : 0;
     unsigned long long tex = g_by_index[it->second];
-    if (!tex && own) return icon_shell(dir, name, is_dir, false);
+    if (!tex && own) return icon_lookup(dir, name, is_dir, false, large);
     return tex;
+}
+
+unsigned long long icon_shell(const char* dir, const char* name, bool is_dir, bool local) {
+    return icon_lookup(dir, name, is_dir, local, false);
+}
+
+unsigned long long icon_shell_large(const char* dir, const char* name, bool is_dir) {
+    return icon_lookup(dir, name, is_dir, true, true);
 }
 
 void icon_free_all(void) {
@@ -174,6 +186,7 @@ void icon_free_all(void) {
 #else
 
 unsigned long long icon_shell(const char*, const char*, bool, bool) { return 0; }
+unsigned long long icon_shell_large(const char*, const char*, bool) { return 0; }
 void icon_frame(void) {}
 void icon_free_all(void) {}
 

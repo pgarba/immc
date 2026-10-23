@@ -572,6 +572,153 @@ static bool dir_exists(const std::string& p) {
 
 // Enter on an archive opens it as a pane, exactly like a directory: rows, a
 // virtual path the rest of the pane can carry, and folders inside it to walk.
+// What Enter or Alt+F3 handed to the desktop. main() points the app's opener here
+// for the whole run, so no test ever starts a real image viewer or player.
+static std::vector<std::string> g_opened;
+static bool record_open(const char* path, std::string*) {
+    g_opened.push_back(path);
+    return true;
+}
+
+// Enter on a file opens it in the program the desktop has for it; a folder is
+// still walked into and an archive still browsed.
+static void test_enter_opens_default(AppPanes* app) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    std::string dir = test_mkdtemp("mc-open");
+    touch_file(dir, "picture.png");
+    touch_file(dir, "movie.mkv");
+    mkdir((dir + "/folder").c_str(), 0755);
+    refresh_pane(&p, dir.c_str());
+
+    g_opened.clear();
+    p.selected = idx_of(p, "picture.png");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(g_opened.size() == 1 && g_opened[0] == dir + "/picture.png");
+    CHECK(!app->viewer_open);
+    CHECK(strstr(app->status_msg, "picture.png") != nullptr);
+
+    p.selected = idx_of(p, "movie.mkv");
+    app_panes_handle_key(app, SDLK_KP_ENTER, SDL_KMOD_NONE);
+    CHECK(g_opened.size() == 2 && g_opened[1] == dir + "/movie.mkv");
+
+    p.selected = idx_of(p, "folder");
+    app_panes_handle_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(g_opened.size() == 2);
+    CHECK(strcmp(p.current_dir, (dir + "/folder").c_str()) == 0);
+
+    g_opened.clear();
+    sh("rm -rf '" + dir + "'");
+}
+
+// The launch bar: buttons are added (from a pane, a drop or the menu), kept in
+// <settings>/launchbar in their order, moved and removed; a click opens a folder
+// in the focused pane and hands anything else to the desktop.
+static void test_launch_bar(AppPanes* app) {
+    std::string home = test_mkdtemp("mc-launch");
+    CHECK(!home.empty());
+    if (home.empty()) return;
+    auto test_home = std::make_unique<TestHome>(home);
+    std::vector<AppPanes::LaunchItem> saved;
+    saved.swap(app->launch_items);
+    app->left_focus = true;
+
+    char norm[4096];
+    normalize_pane_path(home.c_str(), norm, sizeof norm);
+    const std::string dir = norm;
+    touch_file(dir, "notes.txt");
+    mkdir((dir + "/proj").c_str(), 0755);
+    const std::string notes = dir + "/notes.txt", proj = dir + "/proj";
+
+    CHECK(launch_label("C:/Tools/Total Commander.lnk") == "Total Commander");
+    CHECK(launch_label("C:/Windows/notepad.EXE") == "notepad");
+    CHECK(launch_label("/usr/bin/vim") == "vim");
+    CHECK(launch_label("/home/me/readme.txt") == "readme.txt");   // a document keeps its extension
+
+    CHECK(launchbar_add(app, notes.c_str()));
+    CHECK(launchbar_add(app, (proj + "/").c_str()));   // the trailing slash goes
+    CHECK(!launchbar_add(app, notes.c_str()));          // not twice
+    CHECK(strstr(app->status_msg, "already") != nullptr);
+    CHECK(app->launch_items.size() == 2);
+    CHECK(app->launch_items[1].path == proj);
+    CHECK(!app->launch_items[0].is_dir && app->launch_items[1].is_dir);
+
+    // In the file, in order, and read back the same.
+    {
+        AppPanes other;
+        launchbar_load(&other);
+        CHECK(other.launch_items.size() == 2);
+        CHECK(other.launch_items.size() == 2 && other.launch_items[0].path == notes &&
+              other.launch_items[1].path == proj && other.launch_items[1].is_dir);
+    }
+
+    // Moving: the folder in front of the file, and the order is saved.
+    launchbar_move(app, 1, 0);
+    CHECK(app->launch_items[0].path == proj && app->launch_items[1].path == notes);
+    launchbar_move(app, 0, 2);                           // to the end
+    CHECK(app->launch_items[0].path == notes && app->launch_items[1].path == proj);
+    launchbar_move(app, 0, 1);                           // in front of itself: nothing
+    CHECK(app->launch_items[0].path == notes);
+    {
+        AppPanes other;
+        launchbar_load(&other);
+        CHECK(other.launch_items.size() == 2 && other.launch_items[0].path == notes);
+    }
+
+    // A click: a document goes to its program, a folder opens in the pane.
+    g_opened.clear();
+    launch_item(app, 0);
+    CHECK(g_opened.size() == 1 && g_opened[0] == notes);
+    launch_item(app, 1);
+    CHECK(g_opened.size() == 1);
+    CHECK(strcmp(app->left.current_dir, proj.c_str()) == 0);
+    launch_show_in_pane(app, 0);
+    CHECK(strcmp(app->left.current_dir, dir.c_str()) == 0);
+    CHECK(app->left.selected >= 0 && strcmp(app->left.entries[app->left.selected]->name, "notes.txt") == 0);
+
+    // A drop from Explorer counts only on the bar: where the bar was last drawn.
+    touch_file(dir, "dropped.txt");
+    app->show_launchbar = true;
+    app->launch_bar_min_y = 20.0f;
+    app->launch_bar_max_y = 50.0f;
+    app_panes_drop_file(app, (dir + "/dropped.txt").c_str(), 10.0f, 300.0f);
+    CHECK(app->launch_items.size() == 2);
+    CHECK(strstr(app->status_msg, "launch bar") != nullptr);
+    app_panes_drop_file(app, (dir + "/dropped.txt").c_str(), 10.0f, 30.0f);
+    CHECK(app->launch_items.size() == 3 && app->launch_items[2].path == dir + "/dropped.txt");
+#ifdef _WIN32
+    // Explorer hands over backslashes; the bar keeps the panes' slashes.
+    std::string back = dir + "/proj";
+    for (char& c : back) if (c == '/') c = '\\';
+    CHECK(!launchbar_add(app, back.c_str()));           // the same folder as before
+#endif
+
+    // A button whose file went away says so instead of failing silently.
+    remove((dir + "/dropped.txt").c_str());
+    g_opened.clear();
+    launch_item(app, 2);
+    CHECK(g_opened.empty());
+    CHECK(strstr(app->status_msg, "not there any more") != nullptr);
+    launchbar_remove(app, 2);
+    CHECK(app->launch_items.size() == 2);
+
+    // The bar's on/off goes into the config like the other view settings.
+    MCConfig cfg;
+    mc_config_default(&cfg);
+    app->show_launchbar = false;
+    app_panes_save_state(app, &cfg);
+    CHECK(cfg.show_launchbar == 0);
+    app->show_launchbar = true;
+    app_panes_save_state(app, &cfg);
+    CHECK(cfg.show_launchbar == 1);
+
+    app->launch_items.swap(saved);
+    app->launch_bar_max_y = -1;
+    g_opened.clear();
+    test_home.reset();
+    sh("rm -rf '" + home + "'");
+}
+
 static void test_archive_browse(AppPanes* app, const std::string& root) {
     Pane& p = app->left;
     app->left_focus = true;
@@ -2731,6 +2878,23 @@ static void test_op_tab_ring(AppPanes* app) {
     app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
     CHECK(app->op_focus == OF_FIELD);
 
+    // In the field the arrows belong to the caret; once Tab is on a button they
+    // walk the same ring, so "Run in background" is Tab, Right, Enter.
+    CHECK(!app_key_is_special(SDLK_RIGHT, SDL_KMOD_NONE, app));
+    app_panes_handle_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_RUN);
+    CHECK(app_key_is_special(SDLK_RIGHT, SDL_KMOD_NONE, app));
+    app_panes_handle_key(app, SDLK_RIGHT, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_BG);
+    app_panes_handle_key(app, SDLK_DOWN, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_CANCEL);
+    app_panes_handle_key(app, SDLK_LEFT, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_BG);
+    app_panes_handle_key(app, SDLK_UP, SDL_KMOD_NONE);
+    CHECK(app->op_focus == OF_RUN);
+    CHECK(app->left_focus == focus_was);   // and nothing behind the dialog moved
+    app->op_focus = OF_FIELD;
+
     // Enter runs what the ring sits on. On Cancel that means closing the dialog with
     // nothing recorded, so no operation is left waiting to run between frames.
     app->op_focus = OF_CANCEL;
@@ -3128,6 +3292,46 @@ static void test_bg_transfers(AppPanes* app) {
     CHECK(!ht->abort.load());                               // the transfer was not asked to stop
     CHECK(ht->state.load() == BgTransfer::BG_RUNNING);
     CHECK(app->transfers.size() == 1);                     // the row under the panes has it already
+
+    // The same from the keyboard: the ring starts on "Run in background", so the
+    // first Enter hands over, and the transfer is not touched.
+    prog_begin_watch(app, ht);
+    CHECK(app->prog_focus == PROG_FOCUS_BG);
+    prog_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->prog_handoff);
+    CHECK(!app->prog_abort && !ht->abort.load());
+    app->prog_handoff = false;
+    // Tab, Shift+Tab and the arrows go between the two buttons.
+    prog_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->prog_focus == PROG_FOCUS_ABORT);
+    prog_key(app, SDLK_RIGHT, SDL_KMOD_NONE);
+    CHECK(app->prog_focus == PROG_FOCUS_BG);
+    prog_key(app, SDLK_LEFT, SDL_KMOD_NONE);
+    CHECK(app->prog_focus == PROG_FOCUS_ABORT);
+    prog_key(app, SDLK_TAB, SDL_KMOD_SHIFT);
+    CHECK(app->prog_focus == PROG_FOCUS_BG);
+    prog_key(app, SDLK_SPACE, SDL_KMOD_NONE);
+    CHECK(app->prog_handoff && !ht->abort.load());
+    app->prog_handoff = false;
+    app->prog_active = false;
+    app->prog_watch = nullptr;
+
+    // A copy on this thread has only Abort, and the ring starts on nothing: the
+    // Enter that started the copy, or the next one, does not stop it. Tab puts the
+    // ring on Abort, and only then does Enter press it.
+    prog_begin(app, "/from", "/to", false);
+    CHECK(app->prog_focus == PROG_FOCUS_NONE);
+    prog_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(!app->prog_abort);
+    prog_key(app, SDLK_TAB, SDL_KMOD_NONE);
+    CHECK(app->prog_focus == PROG_FOCUS_ABORT);
+    prog_key(app, SDLK_RIGHT, SDL_KMOD_NONE);
+    CHECK(app->prog_focus == PROG_FOCUS_ABORT);            // there is nothing else to go to
+    prog_key(app, SDLK_RETURN, SDL_KMOD_NONE);
+    CHECK(app->prog_abort);
+    CHECK(!app->prog_handoff);
+    app->prog_abort = false;
+    app->prog_active = false;
 
     // Watching one that finishes on its own ends by itself, and the settle - the
     // status line, the refresh of the destination pane - is still the list's job.
@@ -4031,6 +4235,10 @@ static void test_pane_status_row(AppPanes* app, const std::string& root) {
         q->marked.assign(q->entry_count, false);
     }
     toggle_mark(app->left, idx_of(app->left, "alpha.txt"));
+    // The budget is checked against the menu bar first; the launch bar's share of
+    // it is checked on its own further down.
+    const bool had_launchbar = app->show_launchbar;
+    app->show_launchbar = false;
 
     auto frame = [app]() {
         ImGui::NewFrame();
@@ -4072,7 +4280,27 @@ static void test_pane_status_row(AppPanes* app, const std::string& root) {
         // by the same row. Asserted against the window the pane was actually given.
         CHECK(app->left.page_size  == (int)(lw->Size.y / row));
         CHECK(app->right.page_size == (int)(rw->Size.y / row));
+
+        // With the launch bar on, the same chain lands just under the bar instead:
+        // the panes give up exactly its height and nothing is drawn over it.
+        app->show_launchbar = true;
+        for (int i = 0; i < 3; i++) frame();
+        ImGuiWindow* lb = nullptr;
+        for (ImGuiWindow* w : ctx->Windows)
+            if ((w->Flags & ImGuiWindowFlags_ChildWindow) && strstr(w->Name, "##launchbar")) lb = w;
+        CHECK(lb != nullptr);
+        if (lb) {
+            const float under = lb->Pos.y + lb->Size.y - main->Pos.y;
+            CHECK(under > main->MenuBarHeight);
+            for (ImGuiWindow* w : { lw, rw }) {
+                const float chain = main->Size.y - w->Size.y - bar_h - xfer_h
+                                  - frh - frh - 6.0f - frh;
+                CHECK(chain >= under &&
+                      chain <= under + 2.0f * ImGui::GetStyle().ItemSpacing.y + 2.0f);
+            }
+        }
     }
+    app->show_launchbar = had_launchbar;
 
     // Each pane reports its own folder: the left one is marked, the right one is
     // not, and a shared bar would have got this wrong for free.
@@ -6256,6 +6484,7 @@ static void test_f4_terminal_and_binary(AppPanes* app, const std::string& root) 
 }
 
 int main() {
+    g_open_default = record_open;
     std::string root = test_mkdtemp("mc-clone-test");
     if (root.empty()) { printf("cannot create temp dir\n"); return 1; }
 
@@ -6329,6 +6558,8 @@ int main() {
 
     test_archive_keys_live(&app, root);
     test_archive_browse(&app, root);
+    test_enter_opens_default(&app);
+    test_launch_bar(&app);
     test_archive_guards(&app, root);
     test_archive_f5_copy_out(&app, root);
     test_archive_copy_out(&app, root);

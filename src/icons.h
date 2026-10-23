@@ -29,6 +29,10 @@ IconKind icon_kind(const char* name, bool is_dir, bool is_exec);
 // the first frame a kind is seen asks the shell, later ones do not.
 unsigned long long icon_shell(const char* dir, const char* name, bool is_dir, bool local);
 
+// The same at the shell's large size (32 px at 100%), for the launch bar, where a
+// small icon blown up would be a blur. Cached apart from the small ones.
+unsigned long long icon_shell_large(const char* dir, const char* name, bool is_dir);
+
 // Call once per frame: a file's own icon costs a disk read, and only a few are
 // fetched each frame so a folder of a thousand programs does not freeze the window.
 // Until its turn the file shows its extension's icon.

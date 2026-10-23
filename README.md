@@ -150,7 +150,7 @@ used (`src/platform.*`, `src/proc.cpp`), and is different on purpose:
 
 | | on Windows |
 | --- | --- |
-| settings, hotlist, sites | `%APPDATA%\mc-clone` |
+| settings, hotlist, launch bar, sites | `%APPDATA%\mc-clone` |
 | paths | shown as `C:/Users/you`; `\` is accepted anywhere and becomes `/` |
 | `Alt+F1` `Alt+F2` | the drive letters, with label and file system |
 | network shares | `\\server` lists the server's shares, `\\server\share` (or `smb://server/share`) opens one |
@@ -220,7 +220,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 
 | | |
 | --- | --- |
-| `Enter` `Right` | open |
+| `Enter` `Right` | open: a folder or an archive in the pane; any other file in the program the desktop has for it (a `.png` in the image viewer, a `.mkv` in the video player), as a double click does in Explorer. A program runs in the console instead. A file on a site or inside an archive opens in the built-in viewer |
 | `Backspace` `Left` | up a directory |
 | `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor — including one on a site or inside an archive, and an old `.nfo` read as CP437 when it looks like a drawing |
 | `Ctrl+Q` | quick view as a pane, instead of a file pane |
@@ -259,8 +259,8 @@ field owns it: `Space` types a space, `Ctrl+C` and `Ctrl+V` copy and paste insid
 the line, and nothing marks a file behind your back. With the window closed the
 marking keys belong to the panes unconditionally — the argument about whether an
 empty box meant typing or marking is gone, because there is no box that is always
-focused. `Enter` on a file is unchanged, and `Enter` on an executable runs it and
-puts its output in the console.
+focused. `Enter` on a file opens it in its program, and `Enter` on an executable
+runs it and puts its output in the console.
 
 ### Console
 
@@ -301,6 +301,7 @@ the panes keep answering underneath it.
 | `Shift+F2` | compare the two directories, read-only |
 | `Alt+.` | show hidden files |
 | `Options → Show file icons` | the small icon in front of each name, as in Total Commander: Windows' own icons on Windows, drawn ones elsewhere (`show_icons` in the config) |
+| `Options → Show launch bar` | the row of buttons under the menu, Total Commander's button bar. Drag a program, folder or file onto it (from a pane or from Explorer), or right-click a file → **Add to launch bar**. A click starts a program, opens a document in its program, or opens a folder in the focused pane. Drag a button to move it; right-click it to move, remove it or show it in the pane. Kept in `launchbar` in the settings folder (`show_launchbar` in the config) |
 | `F9` | the per-pane user menu |
 | `F10` `Shift+F10` | the menu bar · the context menu for the cursor |
 | `F1` | About |
@@ -338,6 +339,13 @@ site's transfer queue, behind whatever is already waiting for that site. Each si
 has a **transfer threads** setting in the site editor (1-10, default 2): that many
 files move at once, each over its own connection, until the queue is empty. A
 server that limits connections per user will refuse the ones over its limit.
+
+Both windows work from the keyboard. In the copy dialog, `Tab` moves from the
+destination to the buttons and then the arrows move between them; `Shift+Enter` is
+**Run in background** straight from the field. In the progress window the keyboard
+starts on **Run in background**, so `Enter` sends the transfer to the strip; `Tab`
+or the arrows move to **Abort**. A copy that has only **Abort** starts with nothing
+selected, so a stray `Enter` never stops it.
 
 A site can also **transfer RAR volumes in order**. A RAR set then goes volume by
 volume instead of in listing order (which puts `.rar` after every `.rNN`): first
