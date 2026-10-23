@@ -1855,16 +1855,28 @@ bool net_remove_tree(const NetSite& site, const std::string& rpath,
 
 // Every local directory a download needs, one component at a time. A fetch of a
 // remote tree arrives before any of it exists locally.
+// A component that is already a directory is fine however mkdir refused it:
+// Windows answers "access denied", not "exists", for a drive like D: or a folder
+// the user may not write to, and those are on the way to most destinations.
+static bool make_local_dir(const char* path) {
+    if (mkdir(path, 0755) == 0 || errno == EEXIST) return true;
+    int saved = errno;
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return true;
+    errno = saved;
+    return false;
+}
+
 static bool make_local_dirs(const char* path) {
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s", path);
     for (char* p = buf + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+        if (!make_local_dir(buf)) return false;
         *p = '/';
     }
-    return mkdir(buf, 0755) == 0 || errno == EEXIST;
+    return make_local_dir(buf);
 }
 
 // FTP has no recursive retrieve either: a directory is one mkdir and one fetch
