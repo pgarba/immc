@@ -2349,7 +2349,11 @@ static void test_remote_async(AppPanes* app, const std::string& root) {
 
 static void test_remote_keys(AppPanes* app) {
     Pane& p = app->left;
-    refresh_pane(&p, "/tmp");
+    // A folder of its own rather than /tmp, which Windows does not have.
+    std::string dir = test_mkdtemp("mc-keys");
+    touch_file(dir, "a.txt");
+    touch_file(dir, "b.txt");
+    refresh_pane(&p, dir.c_str());
     CHECK(p.entry_count > 1);
     p.selected = 1;
     int sel = p.selected;
@@ -2440,6 +2444,7 @@ static void test_remote_keys(AppPanes* app) {
     app->remote_note[0] = '\0';
     app->remote_sites.clear();
     app->remote_adhoc.clear();
+    sh("rm -rf '" + dir + "'");
 }
 
 // The Alt+F1/F2 drive picker works without the mouse: the cursor starts on the

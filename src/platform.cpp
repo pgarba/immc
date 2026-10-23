@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #else
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -160,6 +161,7 @@ bool plat_spawn_detached(const std::vector<std::string>& argv, std::string* err)
     pid_t pid = fork();
     if (pid < 0) { *err = strerror(errno); return false; }
     if (pid == 0) {
+        signal(SIGPIPE, SIG_DFL);   // remote.cpp ignores it; the program should not
         std::vector<char*> cs;
         for (const std::string& a : argv) cs.push_back(const_cast<char*>(a.c_str()));
         cs.push_back(nullptr);

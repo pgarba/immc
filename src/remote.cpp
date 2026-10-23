@@ -22,6 +22,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1165,6 +1166,21 @@ long long net_part_size(const char* local) {
 // and whichever listing started first.
 static std::once_flag g_curl_global_once;
 
+// Every handle sets CURLOPT_NOSIGNAL, as threads need, and that also turns off
+// curl's own guard against SIGPIPE. An older libcurl over OpenSSL (7.81, Ubuntu
+// 22.04's) then writes to a socket the server already closed and the process
+// dies of the signal. Ignoring it makes that write fail with EPIPE instead,
+// which curl reports like any other dropped connection. The children the app
+// starts put it back to the default before they exec.
+static void curl_global_once(void) {
+    std::call_once(g_curl_global_once, [] {
+#ifndef _WIN32
+        signal(SIGPIPE, SIG_IGN);
+#endif
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+}
+
 struct CachedHandle {
     std::string key;      // the site root: scheme, user, host, port
     CURL* h;
@@ -1228,7 +1244,7 @@ void net_forget_root(const char* root) {
 // connections and then the library they belong to.
 void net_shutdown(void) {
     net_forget(nullptr);
-    std::call_once(g_curl_global_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    curl_global_once();
     curl_global_cleanup();
 }
 
@@ -1238,7 +1254,7 @@ void net_shutdown(void) {
 // `reused` says whether the handle came from the cache, and so may be holding a
 // connection the server has since dropped.
 static CURL* handle_for(const NetSite& site, bool* reused = nullptr) {
-    std::call_once(g_curl_global_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    curl_global_once();
     std::string key = net_site_root(site);
     HandleCache& c = handle_cache();
     if (reused) *reused = false;

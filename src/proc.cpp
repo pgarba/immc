@@ -42,6 +42,10 @@ bool proc_start(const std::vector<std::string>& argv, const char* cwd,
         return false;
     }
     if (pid == 0) {
+        // remote.cpp ignores SIGPIPE, and an ignored signal stays ignored across
+        // exec: a tool writing into a pipe its reader closed should die of it as
+        // it would from a shell, not loop on EPIPE.
+        signal(SIGPIPE, SIG_DFL);
         dup2(pfd[1], STDOUT_FILENO);
         dup2(pfd[1], STDERR_FILENO);   // errors belong in the same stream
         // A tool that wants a password asks on stdin. We never read that prompt,

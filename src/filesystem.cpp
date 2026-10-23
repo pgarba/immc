@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #else
+#include <signal.h>
 #include <sys/wait.h>
 #endif
 #include <vector>
@@ -216,6 +217,7 @@ static bool run_helper(const char* prog, const char* sub, const char* path) {
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
+        signal(SIGPIPE, SIG_DFL);   // remote.cpp ignores it; the helper should not
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
         if (sub) execlp(prog, prog, sub, path, (char*)nullptr);
