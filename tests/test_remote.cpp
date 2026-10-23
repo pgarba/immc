@@ -1421,7 +1421,7 @@ static void test_ftp_tls(FtpFixture& fx) {
     CHECK(!err.empty());
 
     site.verify_tls = false;
-    CHECK(net_list(site, "/", &rows, &err));
+    CHECK_ERR(net_list(site, "/", &rows, &err), err);
     CHECK(find_row(rows, "hello.txt") != nullptr);
 }
 

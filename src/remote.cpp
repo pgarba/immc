@@ -1509,6 +1509,10 @@ static bool listing(const NetSite& site, const std::string& rpath, const char* c
             case CURLE_SSL_CONNECT_ERROR:    case CURLE_PEER_FAILED_VERIFICATION:
             case CURLE_USE_SSL_FAILED:
                 if (give_up) *give_up = true;
+                // Nothing on this handle is worth keeping, and a handle whose
+                // handshake failed can carry that into the next request: the
+                // next listing starts from a fresh one.
+                net_forget(&site);
                 break;
             default:
                 break;
