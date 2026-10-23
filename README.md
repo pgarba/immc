@@ -11,6 +11,10 @@ It is not a terminal program. It opens a window and draws a table, using Dear
 ImGui over SDL3 and OpenGL 3. It runs on Linux and on Windows 10 (1903 or newer)
 and 11.
 
+![immc in the dark theme: a project folder on the left, photos on the right, the launch bar above](docs/screenshots/dark.png)
+
+![immc in the Windows theme: videos on the left, downloads on the right](docs/screenshots/light.png)
+
 The binary it builds is still called `mc-clone` (on Windows, `immc.exe`); `immc` is
 the project, the desktop entry and the window title.
 
