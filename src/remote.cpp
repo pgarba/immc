@@ -25,10 +25,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef MC_HAVE_CURL
-#include <curl/curl.h>
+#include <atomic>
+#include <deque>
 #include <mutex>   // call_once: curl_global_init is not thread safe, and a
                    // background transfer calls it from its own thread
+
+#ifdef MC_HAVE_CURL
+#include <curl/curl.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1090,56 @@ bool net_parse_list_line(const char* line, FileEntry* out) {
 }
 
 // ---------------------------------------------------------------------------
+// Connection log
+// ---------------------------------------------------------------------------
+
+// One ring for the process, behind one mutex: lines arrive from the UI thread,
+// the listing worker and every transfer thread, and the window reads them once
+// a frame. A copy per frame would be wasteful, so a reader asks only for the
+// lines past the last seq it saw.
+static const size_t kNetLogMax = 4000;
+static std::mutex g_log_mu;
+static std::deque<NetLogLine> g_log;
+static uint64_t g_log_seq = 0;
+
+static int log_thread_number(void) {
+    static std::atomic<int> next{1};
+    static thread_local int mine = 0;
+    if (!mine) mine = next++;
+    return mine;
+}
+
+void net_log_add(const std::string& site, NetLogKind kind, const std::string& text) {
+    NetLogLine l;
+    l.when = time(nullptr);
+    l.thread = log_thread_number();
+    l.kind = kind;
+    l.site = site;
+    l.text = text;
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    l.seq = ++g_log_seq;
+    g_log.push_back(std::move(l));
+    while (g_log.size() > kNetLogMax) g_log.pop_front();
+}
+
+uint64_t net_log_since(uint64_t after_seq, std::vector<NetLogLine>* out) {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    if (out && !g_log.empty() && g_log.back().seq > after_seq) {
+        // The ring is in seq order, so the first wanted line is found by its distance
+        // from the back rather than by walking the whole ring.
+        size_t newer = (size_t)(g_log.back().seq - after_seq);
+        size_t start = newer >= g_log.size() ? 0 : g_log.size() - newer;
+        for (size_t i = start; i < g_log.size(); i++) out->push_back(g_log[i]);
+    }
+    return g_log_seq;
+}
+
+void net_log_clear() {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    g_log.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
@@ -1182,16 +1235,49 @@ void net_shutdown(void) {
 // One handle per site per thread, reused across navigations. That is the whole
 // reason this backend links a library: the second listing into the same server
 // does not log in again or redo the TLS handshake.
-static CURL* handle_for(const NetSite& site) {
+// `reused` says whether the handle came from the cache, and so may be holding a
+// connection the server has since dropped.
+static CURL* handle_for(const NetSite& site, bool* reused = nullptr) {
     std::call_once(g_curl_global_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
     std::string key = net_site_root(site);
     HandleCache& c = handle_cache();
+    if (reused) *reused = false;
     for (CachedHandle& e : c.entries)
-        if (e.key == key) return e.h;
+        if (e.key == key) { if (reused) *reused = true; return e.h; }
     CURL* h = curl_easy_init();
     if (!h) return nullptr;
     c.entries.push_back({ key, h });
     return h;
+}
+
+// The site the calling thread's handle is working for, for the log lines its
+// debug callback writes. The callback runs inside curl_easy_perform() on the same
+// thread, so a thread_local is all the context it needs.
+static thread_local std::string t_log_site;
+
+// curl's verbose output, filtered into the connection log. Only the control
+// channel and curl's narration go in - the data and the TLS records would bury
+// the one line that says where the wait is. A chunk can hold several lines.
+static int log_debug_cb(CURL*, curl_infotype type, char* data, size_t size, void*) {
+    NetLogKind kind;
+    switch (type) {
+        case CURLINFO_TEXT:       kind = NETLOG_INFO; break;
+        case CURLINFO_HEADER_OUT: kind = NETLOG_SENT; break;
+        case CURLINFO_HEADER_IN:  kind = NETLOG_RECV; break;
+        default: return 0;
+    }
+    size_t pos = 0;
+    while (pos < size) {
+        size_t end = pos;
+        while (end < size && data[end] != '\n') end++;
+        std::string line(data + pos, end - pos);
+        pos = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        if (kind == NETLOG_SENT && !strncasecmp(line.c_str(), "PASS ", 5)) line = "PASS ****";
+        net_log_add(t_log_site, kind, line);
+    }
+    return 0;
 }
 
 // Everything that depends on the site, set from scratch: curl_easy_reset()
@@ -1239,6 +1325,9 @@ static bool setup_handle(CURL* h, const NetSite& site, const std::string& url,
     curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 20L);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+    t_log_site = net_site_root(site);
+    curl_easy_setopt(h, CURLOPT_DEBUGFUNCTION, log_debug_cb);
+    curl_easy_setopt(h, CURLOPT_VERBOSE, 1L);
     if (errbuf && errbuf_size) {
         errbuf[0] = '\0';
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
@@ -1250,8 +1339,9 @@ static bool setup_handle(CURL* h, const NetSite& site, const std::string& url,
 // than "Could not connect to server". The URL never carries a password here,
 // because it is built from a site root, so nothing has to be redacted.
 static std::string curl_error(CURLcode rc, const char* errbuf) {
-    if (errbuf && errbuf[0]) return errbuf;
-    return curl_easy_strerror(rc);
+    std::string e = (errbuf && errbuf[0]) ? errbuf : curl_easy_strerror(rc);
+    net_log_add(t_log_site, NETLOG_ERROR, e);
+    return e;
 }
 
 // Progress plumbing for the transfers. `aborted` records that the transfer
@@ -1343,30 +1433,70 @@ static void drop_dot_entries(std::vector<FileEntry>* rows) {
 }
 
 static bool listing(const NetSite& site, const std::string& rpath, const char* cmd,
-                    std::vector<FileEntry>* out, std::string* err) {
+                    std::vector<FileEntry>* out, std::string* err,
+                    fs_progress_fn cb, void* user, bool* give_up) {
     std::string url = dir_url(site, rpath);
     char errbuf[CURL_ERROR_SIZE];
     LineSink sink;
+    PerformCtx pctx = { cb, user, false, false };
 
-    CURL* h = handle_for(site);
-    if (!h) { if (err) *err = "out of memory"; return false; }
-    setup_handle(h, site, url, errbuf, sizeof(errbuf));
-    curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, cmd);
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, collect_lines_cb);
-    curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
-
-    CURLcode rc = curl_easy_perform(h);
-    if (rc != CURLE_OK) {
-        net_forget(&site);
-        h = handle_for(site);
-        if (!h) { if (err) *err = "out of memory"; return false; }
+    // Set up twice when the first attempt fails, so it is one function.
+    auto prepare = [&](CURL* h) {
         setup_handle(h, site, url, errbuf, sizeof(errbuf));
         curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, cmd);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, collect_lines_cb);
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
+        if (cb) {
+            curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+            curl_easy_setopt(h, CURLOPT_XFERINFODATA, &pctx);
+            curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+        }
+    };
+
+    bool reused = false;
+    CURL* h = handle_for(site, &reused);
+    if (!h) { if (err) *err = "out of memory"; return false; }
+    prepare(h);
+    net_log_add(net_site_root(site), NETLOG_INFO,
+                std::string("Listing ") + (rpath.empty() ? "/" : rpath) + " with " + cmd);
+
+    CURLcode rc = curl_easy_perform(h);
+    // A cached connection the server has since dropped fails on first use, so a
+    // failure on a reused handle gets one retry on a fresh one - unless the caller
+    // asked to stop. A fresh connection that failed is not retried: against a
+    // host that does not answer, that only doubles the wait.
+    if (rc != CURLE_OK && !pctx.aborted && reused) {
+        net_log_add(net_site_root(site), NETLOG_INFO,
+                    std::string("Failed (") + curl_easy_strerror(rc) + "), retrying on a new connection");
+        net_forget(&site);
+        h = handle_for(site);
+        if (!h) { if (err) *err = "out of memory"; return false; }
+        sink.text.clear();
+        prepare(h);
         rc = curl_easy_perform(h);
     }
+    if (pctx.aborted) {
+        if (give_up) *give_up = true;
+        // Half a conversation is not something to reuse: the next listing starts
+        // on a fresh connection.
+        net_forget(&site);
+        net_log_add(net_site_root(site), NETLOG_INFO, "Cancelled");
+        if (err) *err = "cancelled";
+        return false;
+    }
     if (rc != CURLE_OK) {
+        // A failure to reach the server or to log in is not something a different
+        // listing command can fix, so the caller does not try one.
+        switch (rc) {
+            case CURLE_COULDNT_RESOLVE_HOST: case CURLE_COULDNT_CONNECT:
+            case CURLE_OPERATION_TIMEDOUT:   case CURLE_LOGIN_DENIED:
+            case CURLE_SSL_CONNECT_ERROR:    case CURLE_PEER_FAILED_VERIFICATION:
+            case CURLE_USE_SSL_FAILED:
+                if (give_up) *give_up = true;
+                break;
+            default:
+                break;
+        }
         if (err) *err = curl_error(rc, errbuf);
         return false;
     }
@@ -1393,18 +1523,23 @@ static bool listing(const NetSite& site, const std::string& rpath, const char* c
 }
 
 bool net_list(const NetSite& site, const std::string& rpath,
-              std::vector<FileEntry>* out, std::string* err) {
+              std::vector<FileEntry>* out, std::string* err,
+              fs_progress_fn cb, void* user) {
     out->clear();
     if (!site.valid()) { if (err) *err = "no host"; return false; }
+    bool give_up = false;
     // MLSD first, and a LIST whenever MLSD produced nothing: an empty answer is
     // either a genuinely empty directory or a server that ignored the command,
-    // and only a LIST can tell them apart.
+    // and only a LIST can tell them apart. A server that could not be reached at
+    // all gets no second command.
     if (site.proto != NET_SFTP) {
         std::string mlsd_err;
-        if (listing(site, rpath, "MLSD", out, &mlsd_err) && !out->empty()) return true;
+        if (listing(site, rpath, "MLSD", out, &mlsd_err, cb, user, &give_up) && !out->empty())
+            return true;
+        if (give_up) { if (err) *err = mlsd_err; return false; }
     }
     std::string list_err;
-    if (listing(site, rpath, "LIST", out, &list_err)) return true;
+    if (listing(site, rpath, "LIST", out, &list_err, cb, user, &give_up)) return true;
     if (err) *err = list_err;
     return false;
 }
@@ -1841,7 +1976,8 @@ static bool no_curl(std::string* err) {
     return false;
 }
 
-bool net_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, std::string* err) {
+bool net_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, std::string* err,
+              fs_progress_fn, void*) {
     out->clear();
     return no_curl(err);
 }

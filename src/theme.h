@@ -19,7 +19,7 @@ struct MCThemeColors {
 };
 
 // Applies the named theme's ImGui style and accent colors.
-// Names: dark | light | classic | gruvbox | gruvbox-light |
+// Names: dark | light | windows | classic | gruvbox | gruvbox-light |
 //        solarized-dark | solarized-light
 void mc_apply_theme(const char* name);
 

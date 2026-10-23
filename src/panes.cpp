@@ -8,6 +8,7 @@
 #include "platform.h" // home, settings, temp dir, and handing things to the desktop
 #include "img.h"     // picture previews: what a file is, and its pixels
 #include "texture.h" // and getting those pixels onto the screen
+#include "icons.h"   // the small icon in front of each name
 #include "theme.h"
 #include "config.h"
 #include "version.h"   // generated: MC_APP_NAME, MC_VERSION
@@ -46,6 +47,8 @@
 #include <time.h>
 #include <algorithm>
 #include <map>
+#include <condition_variable>
+#include <deque>
 
 // Rows per Page Up / Page Down step (approx. visible rows in a 800px pane)
 static const int PAGE_SIZE = 18;
@@ -354,14 +357,10 @@ static const NetSite* net_site_for(const std::string& root) {
 // sizes, times and permission bits, so the pane sorts, filters and formats a
 // remote row exactly like a local one. `rel` is left alone: a remote row's path
 // is its name against the pane's virtual directory, as in an ordinary directory.
-static void list_remote_dir(const NetSite& site, const std::string& rpath,
-                            FileEntry*** out_entries, int* out_count,
-                            std::string* err) {
+static void remote_rows_to_entries(const std::vector<FileEntry>& rows,
+                                   FileEntry*** out_entries, int* out_count) {
     *out_entries = nullptr;
     *out_count = 0;
-
-    std::vector<FileEntry> rows;
-    if (!net_list(site, rpath, &rows, err)) return;
 
     std::vector<FileEntry*> ptrs;
     for (const FileEntry& e : rows) {
@@ -386,6 +385,175 @@ static void list_remote_dir(const NetSite& site, const std::string& rpath,
     int i = 1;
     for (FileEntry* fe : ptrs) (*out_entries)[i++] = fe;
     *out_count = i;
+}
+
+// ---------------------------------------------------------------------------
+// Listing a site in the background
+// ---------------------------------------------------------------------------
+//
+// A listing used to run inside refresh_pane(), on the UI thread, and a server
+// that is slow to answer - or a host that does not answer at all, which curl
+// waits out through a connect timeout, a retry and a second command - froze the
+// whole window for as long as that took. So a remote directory is now asked for
+// here and arrives later: refresh_pane() posts a request and puts a ".." row in
+// the pane so it can be walked out of, and browse_reap() installs the rows once
+// a frame when they come back.
+//
+// One worker thread does every listing. libcurl's handle cache is per thread
+// (remote.cpp), so one long-lived thread is what keeps the login reused from one
+// directory to the next, exactly as when the UI thread did it. That also means a
+// forget - a disconnect, an edited site - has to reach that thread's cache, so
+// it travels down the same queue.
+//
+// A request is wanted for as long as it is the newest one its pane made. A pane
+// that navigates elsewhere, or is cancelled with Esc, stops wanting it, and the
+// listing's progress callback - which curl calls during the connect and the login
+// as well - turns that into an abort within about a second.
+
+struct BrowseReq {
+    uint64_t    id;
+    const Pane* pane;
+    NetSite     site;
+    std::string dir;       // the pane's virtual path, which the result has to match
+    std::string rpath;
+};
+
+struct BrowseDone {
+    uint64_t               id = 0;
+    const Pane*            pane = nullptr;
+    std::string            dir;
+    bool                   ok = false;
+    std::vector<FileEntry> rows;
+    std::string            err;
+};
+
+struct BrowseState {
+    std::mutex                      mu;
+    std::condition_variable         cv;
+    std::thread                     worker;
+    bool                            stop = false;
+    std::deque<BrowseReq>           queue;
+    std::vector<std::string>        forget;   // roots to drop on the worker; "" = every site
+    std::vector<BrowseDone>         done;
+    std::map<const Pane*, uint64_t> wanted;   // each pane's newest request
+    uint64_t                        next_id = 0;
+};
+
+// Never destroyed: a std::thread still joinable in a static destructor ends the
+// process, and a test that never frees its app must not do that on the way out.
+static BrowseState& g_browse = *new BrowseState;
+
+static bool browse_wanted_cb(long long, long long, int, int, void* user) {
+    const BrowseReq* r = (const BrowseReq*)user;
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    if (g_browse.stop) return false;
+    auto it = g_browse.wanted.find(r->pane);
+    return it != g_browse.wanted.end() && it->second == r->id;
+}
+
+static void browse_main() {
+    std::unique_lock<std::mutex> lk(g_browse.mu);
+    for (;;) {
+        g_browse.cv.wait(lk, [] {
+            return g_browse.stop || !g_browse.queue.empty() || !g_browse.forget.empty();
+        });
+        if (g_browse.stop) break;
+        if (!g_browse.forget.empty()) {
+            std::vector<std::string> roots;
+            roots.swap(g_browse.forget);
+            lk.unlock();
+            for (const std::string& r : roots) {
+                if (r.empty()) net_forget(nullptr);
+                else net_forget_root(r.c_str());
+            }
+            lk.lock();
+            continue;
+        }
+        BrowseReq r = std::move(g_browse.queue.front());
+        g_browse.queue.pop_front();
+        auto it = g_browse.wanted.find(r.pane);
+        if (it == g_browse.wanted.end() || it->second != r.id) continue;   // moved on already
+        lk.unlock();
+
+        BrowseDone d;
+        d.id = r.id;
+        d.pane = r.pane;
+        d.dir = r.dir;
+        d.ok = net_list(r.site, r.rpath, &d.rows, &d.err, browse_wanted_cb, &r);
+
+        lk.lock();
+        g_browse.done.push_back(std::move(d));
+    }
+}
+
+// Ask for a listing on behalf of `pane`. Anything the pane asked for before and
+// has not received is no longer wanted.
+static uint64_t browse_request(const Pane* pane, const NetSite& site, const std::string& dir,
+                               const std::string& rpath) {
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    if (!g_browse.worker.joinable()) {
+        g_browse.stop = false;
+        g_browse.worker = std::thread(browse_main);
+    }
+    uint64_t id = ++g_browse.next_id;
+    g_browse.wanted[pane] = id;
+    for (size_t i = 0; i < g_browse.queue.size();) {
+        if (g_browse.queue[i].pane == pane) g_browse.queue.erase(g_browse.queue.begin() + (long)i);
+        else i++;
+    }
+    g_browse.queue.push_back({ id, pane, site, dir, rpath });
+    g_browse.cv.notify_one();
+    return id;
+}
+
+// The pane no longer wants what it asked for. A listing in progress stops at its
+// next progress call.
+static void browse_cancel(const Pane* pane) {
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    g_browse.wanted.erase(pane);
+}
+
+// Drop the worker's cached connection for a site root, or every one for "".
+static void browse_forget(const std::string& root) {
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    if (!g_browse.worker.joinable()) return;   // never listed anything: nothing cached
+    g_browse.forget.push_back(root);
+    g_browse.cv.notify_one();
+}
+
+static void browse_take(std::vector<BrowseDone>* out) {
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    out->swap(g_browse.done);
+    g_browse.done.clear();
+}
+
+// Stop the worker and wait for it. Its connections close with its thread, which
+// is why this has to run before net_shutdown().
+static void browse_stop() {
+    {
+        std::lock_guard<std::mutex> lk(g_browse.mu);
+        g_browse.stop = true;
+        g_browse.wanted.clear();
+        g_browse.queue.clear();
+        g_browse.cv.notify_one();
+    }
+    if (g_browse.worker.joinable()) g_browse.worker.join();
+    std::lock_guard<std::mutex> lk(g_browse.mu);
+    g_browse.done.clear();
+    g_browse.forget.clear();
+    g_browse.stop = false;
+}
+
+// Close a site's connections on every thread that browses: the UI thread's own
+// (the mutations - mkdir, rename, chmod - still run there) and the worker's.
+static void remote_forget(const NetSite* site) {
+    net_forget(site);
+    browse_forget(site ? net_site_root(*site) : std::string());
+}
+
+static void remote_forget_root(const char* root) {
+    net_forget_root(root);
+    if (root && *root) browse_forget(root);
 }
 
 // The sites file is read once, before any pane is refreshed: a session restored
@@ -881,6 +1049,27 @@ void refresh_pane(Pane* pane, const char* path) {
     bool dir_changed = strcmp(pane->current_dir, norm) != 0;
     char previous[4096];
     snprintf(previous, sizeof(previous), "%s", pane->current_dir);
+    char arch[4096], prefix[1024];
+    std::string nroot, nrpath;
+
+    // A reread of the site directory already on screen keeps its rows until the
+    // new ones arrive: a pane that blanks for a second after every upload is
+    // worse than one that is a second out of date. The marks go now, though - they
+    // name files the operation that asked for the reread may have removed.
+    if (!dir_changed && pane->entry_count > 0 && net_split_virtual(norm, &nroot, &nrpath)) {
+        if (const NetSite* site = net_site_for(nroot)) {
+            pane->remote_req = browse_request(pane, *site, norm, nrpath);
+            pane->remote_req_ms = SDL_GetTicks();
+            pane->marked.assign(pane->entry_count, false);
+            pane->mark_undo.clear();
+            return;
+        }
+    }
+    // Anything else this pane was waiting for from a site is not wanted any more.
+    if (pane->remote_req) {
+        browse_cancel(pane);
+        pane->remote_req = 0;
+    }
     free_entries(pane->entries, pane->entry_count);
     // Nothing is a listing until one of the three branches below puts one there.
     // A pane that walks onto a site with no saved login gets no listing at all, and
@@ -893,8 +1082,6 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->selected = 0;
     pane->anchor = 0;
     pane->rel.clear();
-    char arch[4096], prefix[1024];
-    std::string nroot, nrpath;
     bool smb_listed = false;   // the listing is a server's shares, or a failure to reach it
 #ifndef _WIN32
     if (smb_is_url(norm)) {
@@ -931,7 +1118,15 @@ void refresh_pane(Pane* pane, const char* path) {
         const NetSite* site = net_site_for(nroot);
         std::string err;
         if (site) {
-            list_remote_dir(*site, nrpath, &pane->entries, &pane->entry_count, &err);
+            // Only ".." for now, so the pane can be left while it waits; the
+            // rows come from the worker (see browse_reap).
+            pane->entries = (FileEntry**)calloc(1, sizeof(FileEntry*));
+            if (pane->entries) {
+                pane->entries[0] = file_entry_new("..", S_IFDIR | 0755, 0, 0);
+                pane->entry_count = 1;
+            }
+            pane->remote_req = browse_request(pane, *site, norm, nrpath);
+            pane->remote_req_ms = SDL_GetTicks();
         } else {
             err = "No login for " + nroot + ": Ctrl+N connects to a URL, Ctrl+F edits the saved sites";
         }
@@ -6007,6 +6202,91 @@ static void render_columns_dialog(AppPanes* app) {
 
 // The rows of one pane, called with its child window already open. The wrapper
 // at the end decides whether that child holds the list, a tree, or both.
+// A small icon of the app's own, for when the shell has none to give: every row on
+// Linux, ".." everywhere, and anything the shell does not answer for. Drawn rather
+// than shipped as pictures, so it is sharp at any font size.
+static void draw_kind_icon(ImDrawList* dl, IconKind kind, ImVec2 p, float s) {
+    auto at = [&](float x, float y) { return ImVec2(p.x + x * s, p.y + y * s); };
+    const ImU32 outline = IM_COL32(110, 110, 110, 255);
+    const ImU32 folder = IM_COL32(240, 196, 80, 255);
+    const ImU32 folder_tab = IM_COL32(214, 164, 54, 255);
+    const float r = s * 0.08f;
+
+    auto page = [&](ImU32 fill) {
+        ImVec2 pts[5] = { at(0.20f, 0.06f), at(0.60f, 0.06f), at(0.82f, 0.28f),
+                          at(0.82f, 0.94f), at(0.20f, 0.94f) };
+        dl->AddConvexPolyFilled(pts, 5, fill);
+        dl->AddPolyline(pts, 5, outline, ImDrawFlags_Closed, 1.0f);
+        ImVec2 fold[3] = { at(0.60f, 0.06f), at(0.60f, 0.28f), at(0.82f, 0.28f) };
+        dl->AddPolyline(fold, 3, outline, 0, 1.0f);
+    };
+    auto folder_shape = [&]() {
+        dl->AddRectFilled(at(0.06f, 0.14f), at(0.46f, 0.32f), folder_tab, r);
+        dl->AddRectFilled(at(0.06f, 0.26f), at(0.94f, 0.86f), folder, r);
+    };
+
+    switch (kind) {
+        case ICON_UP: {
+            const ImU32 c = ImGui::GetColorU32(mc_theme_colors()->dir);
+            dl->AddTriangleFilled(at(0.50f, 0.10f), at(0.16f, 0.50f), at(0.84f, 0.50f), c);
+            dl->AddRectFilled(at(0.38f, 0.48f), at(0.62f, 0.88f), c);
+            break;
+        }
+        case ICON_DIR:
+            folder_shape();
+            break;
+        case ICON_ARCHIVE:
+            // A folder with a zip down the middle, the way TC and Explorer draw one.
+            folder_shape();
+            for (int k = 0; k < 4; k++) {
+                float y = 0.30f + k * 0.13f;
+                dl->AddRectFilled(at(k % 2 ? 0.50f : 0.42f, y), at(k % 2 ? 0.58f : 0.50f, y + 0.10f),
+                                  IM_COL32(90, 70, 40, 255));
+            }
+            break;
+        case ICON_EXEC:
+            // A window: a frame with a title bar.
+            dl->AddRectFilled(at(0.08f, 0.16f), at(0.92f, 0.84f), IM_COL32(236, 236, 236, 255));
+            dl->AddRectFilled(at(0.08f, 0.16f), at(0.92f, 0.34f), IM_COL32(60, 120, 210, 255));
+            dl->AddRect(at(0.08f, 0.16f), at(0.92f, 0.84f), outline, 0.0f, 0, 1.0f);
+            break;
+        case ICON_IMAGE:
+            page(IM_COL32(245, 245, 245, 255));
+            dl->AddTriangleFilled(at(0.26f, 0.86f), at(0.44f, 0.56f), at(0.62f, 0.86f), IM_COL32(70, 160, 80, 255));
+            dl->AddTriangleFilled(at(0.48f, 0.86f), at(0.62f, 0.66f), at(0.76f, 0.86f), IM_COL32(50, 130, 70, 255));
+            dl->AddCircleFilled(at(0.66f, 0.44f), s * 0.07f, IM_COL32(235, 170, 40, 255));
+            break;
+        case ICON_FILE:
+        default:
+            page(IM_COL32(245, 245, 245, 255));
+            break;
+    }
+}
+
+// The icon in front of a row's name (Options > Show file icons), at the cursor:
+// the shell's own where there is one, the drawn one otherwise. Returns how far the
+// name has to move right to make room for it - 0 with icons off. A row scrolled out
+// of sight is not asked about: a file's own icon is a disk read, and the few the
+// shell is allowed per frame should go to the rows someone can see.
+static float draw_row_icon(const AppPanes* app, const Pane& pane, int i, bool is_dir, bool is_exec) {
+    if (!app->show_icons) return 0.0f;
+    const float s = ImGui::GetTextLineHeight();
+    const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    p.x = floorf(p.x);
+    p.y = floorf(p.y);
+    if (!ImGui::IsRectVisible(p, ImVec2(p.x + s, p.y + s))) return s + gap;
+    const FileEntry* e = pane.entries[i];
+    const bool local = !in_remote(pane) && !in_archive(pane);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    unsigned long long tex = icon_shell(pane.current_dir, entry_rel(pane, i), is_dir, local);
+    if (tex)
+        dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)tex), p, ImVec2(p.x + s, p.y + s));
+    else
+        draw_kind_icon(dl, icon_kind(e->name, is_dir, is_exec), p, s);
+    return s + gap;
+}
+
 static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
     float row_h = ImGui::GetTextLineHeightWithSpacing();
     pane.page_size = row_h > 0 ? (int)(ImGui::GetWindowSize().y / row_h) : PAGE_SIZE;
@@ -6109,6 +6389,8 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                                                             mc_theme_colors()->cursor_outline, 0.0f, 2.0f);
                 }
 
+                if (float iw = draw_row_icon(app, pane, i, is_dir, is_exec))
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + iw);
                 bool clicked = ImGui::Selectable(entry_rel(pane, i), selected, ImGuiSelectableFlags_SpanAllColumns);
                 if (selected) {
                     ImVec2 rp = ImGui::GetCursorScreenPos();
@@ -6216,6 +6498,8 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                                                         mc_theme_colors()->cursor_outline, 0.0f, 2.0f);
             }
 
+            if (float iw = draw_row_icon(app, pane, i, is_dir, is_exec))
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + iw);
             bool clicked = ImGui::Selectable(entry_rel(pane, i), selected);
             if (selected) {
                 ImVec2 rp = ImGui::GetCursorScreenPos();
@@ -6412,12 +6696,145 @@ static void render_console_hist(AppPanes* app) {
     }
 }
 
+static void netlog_time(time_t when, char* out, size_t n) {
+    struct tm tmv;
+    localtime_r(&when, &tmv);
+    strftime(out, n, "%H:%M:%S", &tmv);
+}
+
+// Lines that belong to one server reply: replies, one after the other, from the
+// same connection. curl hands a multi-line reply over a line at a time, and a
+// welcome banner drawn in box characters is exactly that.
+static bool netlog_same_reply(const NetLogLine& a, const NetLogLine& b) {
+    return a.kind == NETLOG_RECV && b.kind == NETLOG_RECV &&
+           a.thread == b.thread && a.site == b.site;
+}
+
+// What each log line looks like on screen, from `from` on. A server reply is read
+// the way the quick view reads an .nfo: a banner from a DOS-era scene server is
+// CP437 box drawing, which is not UTF-8 and would draw as nothing, so it goes
+// through text.h's rule and `preview_codepage` like any other file. The rule needs
+// a few art bytes to decide, more than one line of a border may have, so it is
+// asked of the whole reply - and a reply that grew since the last frame is
+// decided again from its first line.
+static void netlog_restyle(const std::vector<NetLogLine>& lines, std::vector<std::string>* shown,
+                           size_t from, TextCodepage page) {
+    shown->resize(lines.size());
+    while (from > 0 && from < lines.size() && netlog_same_reply(lines[from - 1], lines[from])) from--;
+    size_t i = from;
+    while (i < lines.size()) {
+        size_t j = i + 1;
+        while (j < lines.size() && netlog_same_reply(lines[j - 1], lines[j])) j++;
+        bool cp437 = false;
+        if (lines[i].kind == NETLOG_RECV) {
+            std::string reply;
+            for (size_t k = i; k < j; k++) reply += lines[k].text + "\n";
+            cp437 = text_decide_codepage(reply, page) == TEXT_CODEPAGE_CP437;
+        }
+        for (size_t k = i; k < j; k++)
+            (*shown)[k] = cp437 ? text_cp437_to_utf8(lines[k].text) : lines[k].text;
+        i = j;
+    }
+}
+
+// The connection log: every line remote.cpp recorded about talking to a server,
+// newest at the bottom. It opens with a connect, small and in the corner, so a
+// connect that takes its time shows what it is waiting on - a lookup, a TCP
+// connect, a TLS handshake, a reply to PASV - while the panes stay usable.
+static void render_netlog(AppPanes* app) {
+    if (!app->netlog_open) return;
+
+    // Copy out only what is new since the last frame; the log keeps its own cap,
+    // and so does this copy of it.
+    size_t had = app->netlog.size();
+    app->netlog_seq = net_log_since(app->netlog_seq, &app->netlog);
+    app->netlog_shown.resize(app->netlog.size());
+    const size_t keep = 4000;
+    if (app->netlog.size() > keep) {
+        const size_t drop = app->netlog.size() - keep;
+        app->netlog.erase(app->netlog.begin(), app->netlog.begin() + (long)drop);
+        app->netlog_shown.erase(app->netlog_shown.begin(), app->netlog_shown.begin() + (long)drop);
+        had = had > drop ? had - drop : 0;
+    }
+    // A change of `preview_codepage` in Options redraws everything in the new one.
+    const TextCodepage page = text_codepage_from_name(app->preview_codepage);
+    if (page != app->netlog_page) { app->netlog_page = page; had = 0; }
+    if (had < app->netlog.size()) netlog_restyle(app->netlog, &app->netlog_shown, had, page);
+
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    const ImVec2 size(ImMin(640.0f, disp.x - 24.0f), ImMin(220.0f, disp.y * 0.4f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(disp.x - size.x - 12.0f, disp.y - size.y - 60.0f),
+                            ImGuiCond_FirstUseEver);
+    bool open = true;
+    ImGui::Begin("Connection log", &open, ImGuiWindowFlags_NoCollapse);
+
+    if (ImGui::SmallButton("Clear")) {
+        net_log_clear();
+        app->netlog.clear();
+        app->netlog_shown.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy")) {
+        std::string all;
+        for (size_t i = 0; i < app->netlog.size(); i++) {
+            const NetLogLine& l = app->netlog[i];
+            char ts[16];
+            netlog_time(l.when, ts, sizeof ts);
+            const char* mark = l.kind == NETLOG_SENT ? "> " : l.kind == NETLOG_RECV ? "< "
+                             : l.kind == NETLOG_ERROR ? "! " : "* ";
+            all += std::string(ts) + " [" + std::to_string(l.thread) + "] " + mark +
+                   app->netlog_shown[i] + "\n";
+        }
+        ImGui::SetClipboardText(all.c_str());
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Follow", &app->netlog_follow);
+    ImGui::Separator();
+
+    ImGui::BeginChild("##netlog_lines", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+    if (app->netlog.empty())
+        ImGui::TextDisabled("(nothing yet - connect to a site and its conversation shows up here)");
+    // A long session is thousands of lines; only the visible ones are drawn. The
+    // prefix is one width on every line, so a banner's columns stay lined up.
+    ImGuiListClipper clip;
+    clip.Begin((int)app->netlog.size());
+    while (clip.Step()) {
+        for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+            const NetLogLine& l = app->netlog[(size_t)i];
+            const char* text = app->netlog_shown[(size_t)i].c_str();
+            char ts[16];
+            netlog_time(l.when, ts, sizeof ts);
+            ImGui::TextDisabled("%s %2d", ts, l.thread);
+            ImGui::SameLine();
+            switch (l.kind) {
+                case NETLOG_SENT:  ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "> %s", text); break;
+                case NETLOG_RECV:  ImGui::TextColored(ImVec4(0.55f, 0.90f, 0.55f, 1.0f), "< %s", text); break;
+                case NETLOG_ERROR: ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "! %s", text); break;
+                default:           ImGui::TextDisabled("* %s", text); break;
+            }
+        }
+    }
+    // Scrolling up to read stops the follow; scrolling back to the bottom resumes it.
+    if (ImGui::GetScrollY() < ImGui::GetScrollMaxY() - 1.0f && ImGui::IsWindowHovered() &&
+        ImGui::GetIO().MouseWheel > 0.0f)
+        app->netlog_follow = false;
+    if (app->netlog_follow) ImGui::SetScrollHereY(1.0f);
+    else if (ImGui::GetScrollMaxY() > 0.0f && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f)
+        app->netlog_follow = true;
+    ImGui::EndChild();
+
+    ImGui::End();
+    if (!open) app->netlog_open = false;
+}
+
 // The console window: the backlog above, the line being typed below, and the
 // directory the next command will run in. It is a window over the panes, not a
 // modal - it holds the keyboard only while its field holds it, and Esc hides it
 // without touching the backlog, which is the whole point of the feature: the
 // transcript is still there when it comes back, in another directory or after a
 // restart.
+
 static void render_console(AppPanes* app) {
     if (!app->console_open) return;
     Pane& active = app->left_focus ? app->left : app->right;
@@ -7446,6 +7863,14 @@ static void pane_status_text(const Pane& pane, const PaneTotals& t, float width,
 // there are, and how many directories.
 static void render_pane_status(const Pane& pane, bool focused, float width) {
     char line[160];
+    if (pane.remote_req) {
+        // Waiting on a site: say for how long, and that it can be given up on. A
+        // count that keeps climbing is the difference between "slow" and "stuck".
+        unsigned secs = (unsigned)((SDL_GetTicks() - pane.remote_req_ms) / 1000);
+        snprintf(line, sizeof(line), "Waiting for the server... %us  (Esc stops, see the connection log)", secs);
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "%s", line);
+        return;
+    }
     pane_status_text(pane, pane_totals(pane), width, line, sizeof(line));
     // The focused pane is the one being read, so it gets the normal text colour
     // and the other one goes dim, like the path bars above them.
@@ -7679,9 +8104,9 @@ static bool remote_form_site(AppPanes* app, NetSite* out, const NetSite* base) {
 static void remote_remember(AppPanes* app, const NetSite& site) {
     std::string root = net_site_root(site);
     for (NetSite& s : app->remote_adhoc)
-        if (net_site_root(s) == root) { net_forget(&s); s = site; return; }
+        if (net_site_root(s) == root) { remote_forget(&s); s = site; return; }
     for (NetSite& s : app->remote_sites)
-        if (net_site_root(s) == root) { net_forget(&s); s = site; return; }
+        if (net_site_root(s) == root) { remote_forget(&s); s = site; return; }
     app->remote_adhoc.push_back(site);
 }
 
@@ -7701,26 +8126,98 @@ static void remote_open(AppPanes* app, const NetSite& site) {
     char back[4096];
     snprintf(back, sizeof(back), "%s", active.current_dir);
     remote_remember(app, site);
+    // Watching the conversation is the point of the log, and the connect is where
+    // a server is most often slow, so the window comes up with it.
+    app->netlog_open = true;
     navigate_to(app, &active, target.c_str());
-    // A successful listing always has at least the ".." row, so nothing came
-    // back only when the listing failed. refresh_pane() left the reason behind;
-    // it reaches the status line from there.
-    if (active.entry_count == 0) {
-        navigate_to(app, &active, back);
+    // The listing is on its way from the worker. Whether the connect worked is
+    // known when it arrives, and remote_connect_done() finishes the job then.
+    if (active.remote_req) {
+        app->remote_connect_req = active.remote_req;
+        snprintf(app->remote_connect_back, sizeof(app->remote_connect_back), "%s", back);
+        app->remote_connect_target = target;
+        snprintf(app->status_msg, sizeof(app->status_msg), "Connecting to %s...",
+                 net_site_root(site).c_str());
         return;
     }
-    snprintf(app->status_msg, sizeof(app->status_msg), "%s", target.c_str());
+    // No listing was even asked for; refresh_pane() left the reason behind, and
+    // it reaches the status line from there.
+    navigate_to(app, &active, back);
+}
+
+// The first listing of a connect came back. A failure puts the pane back where
+// it was and leaves the dialogs open, because there the reason is on screen and
+// the fields are what needs fixing; a success closes them.
+static void remote_connect_done(AppPanes* app, Pane* pane, bool ok) {
+    app->remote_connect_req = 0;
+    if (!ok) {
+        navigate_to(app, pane, app->remote_connect_back);
+        return;
+    }
+    snprintf(app->status_msg, sizeof(app->status_msg), "%s", app->remote_connect_target.c_str());
     // A connect that worked closes the windows that offered it: a manager left
     // open over a pane that is already showing the site is a second window with
-    // nothing left to decide. The failure paths above return early and leave
-    // everything open, because there the reason is on screen and the fields are
-    // what needs fixing.
+    // nothing left to decide.
     app->remote_mgr_open = false;
     app->remote_quick_open = false;
     app->remote_quick[0] = '\0';
     g_net_form.open = false;
     app->remote_edit = -1;
     app->remote_note[0] = '\0';
+}
+
+// Put the listings the worker finished since the last frame into their panes. A
+// result is only used when its pane still wants it and is still on the
+// directory it was asked for; anything else is a listing the user walked away
+// from, and is dropped.
+static void browse_reap(AppPanes* app) {
+    std::vector<BrowseDone> done;
+    browse_take(&done);
+    for (BrowseDone& d : done) {
+        Pane* p = d.pane == &app->left ? &app->left : d.pane == &app->right ? &app->right : nullptr;
+        if (!p || p->remote_req != d.id || d.dir != p->current_dir) continue;
+        p->remote_req = 0;
+        bool connecting = app->remote_connect_req == d.id;
+        if (!d.ok) {
+            // Whatever the pane shows stays: ".." for a directory it just walked
+            // into, the old rows for a reread.
+            g_net_note = d.err;
+            if (connecting) remote_connect_done(app, p, false);
+            continue;
+        }
+        // A reread keeps the cursor on the file it was on; a directory just
+        // entered gets the cursor it had when it was last left.
+        std::string keep;
+        if (p->entry_count > 1 && p->selected > 0 && p->selected < p->entry_count)
+            keep = p->entries[p->selected]->name;
+        free_entries(p->entries, p->entry_count);
+        remote_rows_to_entries(d.rows, &p->entries, &p->entry_count);
+        p->selected = 0;
+        p->anchor = 0;
+        p->list_gen++;
+        p->marked.assign(p->entry_count, false);
+        p->dir_size.assign(p->entry_count, -1);
+        p->mark_undo.clear();
+        rebuild_view(*p);
+        bool placed = false;
+        for (int i = 0; !keep.empty() && i < p->entry_count; i++) {
+            if (keep == p->entries[i]->name) { p->selected = i; p->scroll_request = true; placed = true; break; }
+        }
+        if (!placed) restore_selection(p);
+        if (connecting) remote_connect_done(app, p, true);
+    }
+}
+
+// Esc on a pane that is waiting for a site: stop waiting. The pane keeps what it
+// shows, and the listing on the worker ends at its next progress call.
+static bool browse_cancel_pane(AppPanes* app, Pane* p) {
+    if (!p->remote_req) return false;
+    browse_cancel(p);
+    bool connecting = app->remote_connect_req == p->remote_req;
+    p->remote_req = 0;
+    snprintf(app->status_msg, sizeof(app->status_msg), "Stopped waiting for %s", p->remote_root);
+    if (connecting) remote_connect_done(app, p, false);
+    return true;
 }
 
 // Open a typed URL in the focused pane. Anything the URL leaves out comes from
@@ -7743,7 +8240,7 @@ static void remote_disconnect(AppPanes* app) {
     // The connection is keyed by the site root, which is exactly what the pane
     // still knows here - and what it is about to forget. A saved entry that was
     // edited or deleted mid-session is not a reason to leave a session open.
-    net_forget_root(root.c_str());
+    remote_forget_root(root.c_str());
     char back[4096];
     if (active.remote_came_from[0])
         snprintf(back, sizeof(back), "%s", active.remote_came_from);
@@ -7807,7 +8304,7 @@ static void remote_save_form(AppPanes* app) {
     NetSite site;
     if (!remote_form_site(app, &site, base)) return;   // the reason is in remote_note
     if (base) {
-        net_forget(base);            // an old login must not be reused after an edit
+        remote_forget(base);            // an old login must not be reused after an edit
         app->remote_sites[app->remote_edit] = site;
     } else {
         app->remote_sites.push_back(site);
@@ -7924,7 +8421,7 @@ static int fz_import_commit(AppPanes* app) {
         bool replaced = false;
         for (NetSite& s : app->remote_sites) {
             if (net_site_root(s) != root) continue;
-            net_forget(&s);            // an old login must not be reused after an edit
+            remote_forget(&s);            // an old login must not be reused after an edit
             s = site;
             replaced = true;
             break;
@@ -8039,7 +8536,7 @@ static void render_remote_manager(AppPanes* app) {
         remote_form_fill(app->remote_adhoc[promote_idx]);
     }
     if (remove_idx >= 0) {
-        net_forget(&app->remote_sites[remove_idx]);
+        remote_forget(&app->remote_sites[remove_idx]);
         app->remote_sites.erase(app->remote_sites.begin() + remove_idx);
         if (app->remote_edit == remove_idx) { app->remote_edit = -1; g_net_form.open = false; }
         else if (app->remote_edit > remove_idx) app->remote_edit--;
@@ -8294,6 +8791,8 @@ static void render_options_items(AppPanes* app) {
         app_panes_refresh_left(app);
         app_panes_refresh_right(app);
     }
+    if (ImGui::MenuItem("Show file icons", nullptr, app->show_icons))
+        app->show_icons = !app->show_icons;
     if (ImGui::MenuItem("Define columns", "Shift+F1")) app->columns_open = !app->columns_open;
 
     if (ImGui::BeginMenu("Sort by")) {
@@ -8366,6 +8865,8 @@ static void render_commands_items(AppPanes* app) {
     // pane it would act on instead of doing nothing when it is clicked.
     if (ImGui::MenuItem("Disconnect from site", "Ctrl+D", in_remote(active)))
         remote_disconnect(app);
+    if (ImGui::MenuItem("Connection log", nullptr, app->netlog_open))
+        app->netlog_open = !app->netlog_open;
     // No key binding: every plausible one still needs the collision audit
     // FEATURES_PLAN.md describes before it can be claimed.
     if (ImGui::MenuItem("Verify SFV")) sfv_run_for_pane(app);
@@ -8449,9 +8950,15 @@ void app_panes_render(AppPanes* app) {
     // left alone after.
     app->focus_claimed = false;
 
-    // A listing that failed did so inside refresh_pane(), which has no status
-    // line of its own. The reason waits there and lands here, where the user
-    // sees it instead of an empty pane.
+    // Site listings that came back from the worker go into their panes here.
+    browse_reap(app);
+
+    // A fresh allowance of shell icons that cost a disk read (see icons.h).
+    icon_frame();
+
+    // A listing that failed did so inside refresh_pane() or on the worker, neither
+    // of which has a status line of its own. The reason waits there and lands
+    // here, where the user sees it instead of an empty pane.
     if (!g_net_note.empty()) {
         snprintf(app->status_msg, sizeof(app->status_msg), "%s", g_net_note.c_str());
         g_net_note.clear();
@@ -8663,6 +9170,7 @@ void app_panes_render(AppPanes* app) {
     if (right.quick_view) render_quick_view(app, right);
     render_viewer(app);
     render_console(app);
+    render_netlog(app);
     render_hotlist(app);
     render_dirhist(app);
     render_volumes(app);
@@ -8726,6 +9234,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->font_size = app->font_size;
     snprintf(cfg->hinting, sizeof(cfg->hinting), "%s", app->hinting);
     cfg->show_hidden = app->show_hidden ? 1 : 0;
+    cfg->show_icons = app->show_icons ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
@@ -8807,6 +9316,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     if (mc_hinting_index(cfg->hinting) >= 0)
         snprintf(app->hinting, sizeof(app->hinting), "%s", cfg->hinting);
     app->show_hidden = cfg->show_hidden != 0;
+    app->show_icons = cfg->show_icons != 0;
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
@@ -8913,6 +9423,8 @@ void app_panes_free(AppPanes* app) {
     bg_stop_all(app);
     // Quick view fetches are inside the same transport, so they go the same way.
     qv_stop_all(app);
+    // The row icons are GL textures, like the previews below.
+    icon_free_all();
     // A .sfv still hashing when the app closes: a std::thread that is still joinable
     // when AppPanes is destroyed ends the process, so the hash is stopped and waited
     // for rather than abandoned.
@@ -8935,6 +9447,9 @@ void app_panes_free(AppPanes* app) {
         if (app->console_job->worker.joinable()) app->console_job->worker.join();
         app->console_job.reset();
     }
+    // The listing worker is inside libcurl too, possibly waiting on a dead host;
+    // stopping it makes its progress callback say no, so this is quick.
+    browse_stop();
     free_entries(app->left.entries, app->left.entry_count);
     free_entries(app->right.entries, app->right.entry_count);
     // The cached handles belong to this app's site list, and so do the pointers
@@ -9557,6 +10072,15 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // field. In the manager, Enter commits the editor when one is showing, which
     // is what a keyboard user expects from a form, and Esc steps out of the form
     // before it closes the window.
+    //
+    // While a connect started from one of them is still waiting for the server,
+    // Esc gives up on the connect first and leaves the dialog where it was.
+    if (key == SDLK_ESCAPE && app->remote_connect_req) {
+        Pane* waiting = app->left.remote_req == app->remote_connect_req ? &app->left
+                      : app->right.remote_req == app->remote_connect_req ? &app->right : nullptr;
+        if (waiting && browse_cancel_pane(app, waiting)) return;
+        app->remote_connect_req = 0;
+    }
     if (app->remote_quick_open) {
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { remote_quick_commit(app); return; }
         if (key == SDLK_ESCAPE) {
@@ -10282,6 +10806,8 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             app->entry_menu_open = false;
             return;
         }
+        // A pane waiting on a site stops waiting.
+        if (browse_cancel_pane(app, &active)) return;
         // A quick filter is cleared before the command line (TC Esc).
         if (active.filter_active || active.filter[0] || active.filter_exec_only) {
             active.filter[0] = '\0';

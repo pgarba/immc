@@ -2070,6 +2070,29 @@ static void test_options_config(AppPanes* app) {
     const char* const* names = mc_theme_list(&n);
     CHECK(n > 0);
     for (int i = 0; i < n; i++) CHECK(fs_exists(names[i]) == false || names[i][0] != '\0');
+
+    // "windows" is offered, and is what it says: black text on white, with a
+    // cursor row light enough that the black text on it stays readable, and the
+    // accent behind the focused path dark enough for the white text drawn on it.
+    bool offered = false;
+    for (int i = 0; i < n; i++) if (!strcmp(names[i], "windows")) offered = true;
+    CHECK(offered);
+    // A theme is ImGui style, so it needs a context; this part of the run may come
+    // before the one the menu tests make.
+    ImGuiContext* own = ImGui::GetCurrentContext() ? nullptr : ImGui::CreateContext();
+    mc_apply_theme("windows");
+    const ImVec4 text = ImGui::GetStyle().Colors[ImGuiCol_Text];
+    const ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+    CHECK(text.x == 0.0f && text.y == 0.0f && text.z == 0.0f);
+    CHECK(bg.x == 1.0f && bg.y == 1.0f && bg.z == 1.0f);
+    const MCThemeColors* tc = mc_theme_colors();
+    CHECK(tc->window_bg.x == 1.0f && tc->window_bg.y == 1.0f && tc->window_bg.z == 1.0f);
+    ImVec4 cur = ImGui::ColorConvertU32ToFloat4(tc->cursor_bg);
+    CHECK(0.299f * cur.x + 0.587f * cur.y + 0.114f * cur.z > 0.8f);
+    ImVec4 acc = tc->title_focused;
+    CHECK(0.299f * acc.x + 0.587f * acc.y + 0.114f * acc.z < 0.5f);
+    mc_apply_theme("dark");
+    if (own) ImGui::DestroyContext(own);
 }
 
 // The keys have to survive the file, not just the struct: the next run reads what
@@ -2188,6 +2211,142 @@ static void test_options_keys(AppPanes* app) {
 // key the dialog does not take must still not reach the file list. What this
 // pins is the reported bug: Enter with the site manager open activated whatever
 // the pane cursor happened to be sitting on.
+// A server's welcome banner in CP437 box drawing is shown as box drawing, the way
+// the quick view shows an .nfo. The decision is made over the whole reply, so a
+// line that is too short to decide on alone goes with the lines around it - even
+// when they arrive in a later frame.
+static void test_netlog_cp437(void) {
+    auto line = [](NetLogKind k, int thread, const char* text) {
+        NetLogLine l;
+        l.kind = k;
+        l.thread = thread;
+        l.site = "ftp://scene.example";
+        l.text = text;
+        return l;
+    };
+    std::vector<NetLogLine> lines;
+    std::vector<std::string> shown;
+    lines.push_back(line(NETLOG_SENT, 1, "USER someone"));
+    lines.push_back(line(NETLOG_RECV, 1, "220-\xBA hi \xBA"));   // two art bytes: not enough alone
+    netlog_restyle(lines, &shown, 0, TEXT_CODEPAGE_AUTO);
+    CHECK(shown.size() == 2);
+    CHECK(shown[0] == "USER someone");
+    CHECK(shown[1] == lines[1].text);                            // undecided, left as bytes
+
+    // The rest of the banner arrives; the whole reply is decided again.
+    lines.push_back(line(NETLOG_RECV, 1, "220-\xC9\xCD\xCD\xCD\xCD\xBB"));
+    lines.push_back(line(NETLOG_RECV, 1, "220 \xC8\xCD\xCD\xCD\xCD\xBC"));
+    netlog_restyle(lines, &shown, 2, TEXT_CODEPAGE_AUTO);
+    CHECK(shown[1] == "220-\xE2\x95\x91 hi \xE2\x95\x91");                         // 220-║ hi ║
+    CHECK(shown[2] == "220-\xE2\x95\x94\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x97");
+    CHECK(shown[3] == "220 \xE2\x95\x9A\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x9D");
+
+    // Another connection's reply is its own block, and UTF-8 stays UTF-8.
+    lines.push_back(line(NETLOG_RECV, 2, "230 Gr\xC3\xBC\xC3\x9F Gott"));
+    netlog_restyle(lines, &shown, 4, TEXT_CODEPAGE_AUTO);
+    CHECK(shown[4] == lines[4].text);
+    CHECK(shown[2] != lines[2].text);                            // the banner was left alone
+
+    // preview_codepage = utf8 turns the transcode off, as it does for a file.
+    netlog_restyle(lines, &shown, 0, TEXT_CODEPAGE_UTF8);
+    CHECK(shown[2] == lines[2].text);
+}
+
+// The row icons: what each row is drawn as when the shell has no icon for it, and
+// the setting that turns them off surviving a restart.
+static void test_row_icons(AppPanes* app) {
+    CHECK(icon_kind("..", true, false) == ICON_UP);
+    CHECK(icon_kind("crack", true, false) == ICON_DIR);
+    CHECK(icon_kind("XboxUnpacker_2_0.zip", false, false) == ICON_ARCHIVE);
+    CHECK(icon_kind("cover.JPG", false, false) == ICON_IMAGE);
+    CHECK(icon_kind("setup.exe", false, true) == ICON_EXEC);
+    CHECK(icon_kind("readme", false, false) == ICON_FILE);
+    CHECK(icon_kind(".bashrc", false, false) == ICON_FILE);   // a dotfile has no extension
+
+    MCConfig cfg;
+    mc_config_default(&cfg);
+    CHECK(cfg.show_icons == 1);                               // on unless turned off
+    app->show_icons = false;
+    app_panes_save_state(app, &cfg);
+    CHECK(cfg.show_icons == 0);
+    app->show_icons = true;
+    app_panes_apply_state(app, &cfg);
+    CHECK(!app->show_icons);
+    app->show_icons = true;
+}
+
+// Wait for the listing worker to answer a pane, the way the frame loop does.
+static bool reap_until_answered(AppPanes* app, Pane* p) {
+    for (int i = 0; i < 400 && p->remote_req; i++) {
+        SDL_Delay(50);
+        browse_reap(app);
+    }
+    return p->remote_req == 0;
+}
+
+// A site listing happens on the worker, not inside refresh_pane(): the pane comes
+// back at once with a ".." row and a request outstanding, and the answer - here a
+// refusal, from a port nothing listens on - arrives through browse_reap(). A
+// connect that fails puts the pane back where it was; Esc gives up on a wait.
+static void test_remote_async(AppPanes* app, const std::string& root) {
+    if (!net_available()) return;
+    NetSite dead;
+    dead.proto = NET_FTP;
+    dead.host = "127.0.0.1";
+    dead.port = 1;
+    dead.user = "someone";
+    dead.password = "pw";
+    app->remote_adhoc.push_back(dead);
+    const std::string where = net_virtual_path(net_site_root(dead), "/pub");
+    Pane& p = app->left;
+    app->left_focus = true;
+
+    navigate_to(app, &p, root.c_str());
+    navigate_to(app, &p, where.c_str());
+    CHECK(p.remote_req != 0);                       // asked, not answered
+    CHECK(p.entry_count == 1 && !strcmp(p.entries[0]->name, ".."));
+    CHECK(in_remote(p));
+    g_net_note.clear();
+    CHECK(reap_until_answered(app, &p));
+    CHECK(!g_net_note.empty());                     // the refusal, for the status line
+    CHECK(p.entry_count == 1);                      // still a way out
+    g_net_note.clear();
+
+    // Walking away drops the request, and a late answer for it is ignored.
+    navigate_to(app, &p, where.c_str());
+    uint64_t stale = p.remote_req;
+    CHECK(stale != 0);
+    navigate_to(app, &p, root.c_str());
+    CHECK(p.remote_req == 0);
+    CHECK(!in_remote(p));
+    for (int i = 0; i < 20; i++) { SDL_Delay(25); browse_reap(app); }
+    CHECK(!in_remote(p));
+
+    // Esc stops a wait.
+    navigate_to(app, &p, where.c_str());
+    CHECK(p.remote_req != 0);
+    app_panes_handle_key(app, SDLK_ESCAPE, SDL_KMOD_NONE);
+    CHECK(p.remote_req == 0);
+
+    // A connect that fails goes back to where it started, once the answer is in,
+    // and the log window came up with it.
+    navigate_to(app, &p, root.c_str());
+    app->netlog_open = false;
+    remote_open(app, dead);
+    CHECK(app->netlog_open);
+    CHECK(app->remote_connect_req != 0);
+    CHECK(in_remote(p));
+    CHECK(reap_until_answered(app, &p));
+    CHECK(app->remote_connect_req == 0);
+    CHECK(!in_remote(p));
+    CHECK(!strcmp(p.current_dir, root.c_str()));
+
+    app->netlog_open = false;
+    g_net_note.clear();
+    app->remote_adhoc.pop_back();
+    browse_stop();
+}
+
 static void test_remote_keys(AppPanes* app) {
     Pane& p = app->left;
     refresh_pane(&p, "/tmp");
@@ -6186,6 +6345,9 @@ int main() {
     test_tab_restore(&app, root);
     test_options_keys(&app);
     test_remote_keys(&app);
+    test_remote_async(&app, root);
+    test_netlog_cp437();
+    test_row_icons(&app);
     test_filezilla_import_dialog(&app);
     test_volumes_keys(&app);
     test_op_tab_ring(&app);
