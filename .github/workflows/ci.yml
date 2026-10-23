@@ -7,19 +7,28 @@
 # machine does not have.
 #
 # SDL3 is built from the release tarball rather than installed from apt:
-# ubuntu-latest is noble, and noble carries no libsdl3-dev at all. The version
+# neither noble nor jammy carries a libsdl3-dev at all. The version
 # is pinned to the one the app is developed against, so CI builds the same SDL
 # the code was written for instead of whatever a distro happens to ship.
 name: build and test
 
+# Every push also packages the full build (libcurl, FreeType, pictures) for
+# Windows and Linux and keeps it as a workflow artifact for two weeks. Pushing
+# a tag v<version>, the version in CMakeLists.txt's project() line, also
+# publishes those two packages as a GitHub release:
+#
+#     git tag v0.9.0 && git push origin v0.9.0
+
 # Nothing here writes to the repository, so the token the runner gets is
-# read-only, and checkout is told not to leave it behind in .git/config.
+# read-only, and checkout is told not to leave it behind in .git/config. The
+# release job alone is given write access, to create the release.
 permissions:
   contents: read
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   SDL3_VERSION: 3.4.18
@@ -29,16 +38,27 @@ env:
   SDL3_PREFIX: /tmp/sdl3
 
 jobs:
+  # The leg with libcurl is the one that is packaged, so it runs on jammy: a
+  # binary only starts on a glibc at least as new as the one it was linked
+  # against, and jammy's 2.35 is older than any desktop distro still supported.
+  # It also builds SDL3 with Wayland, which SDL loads at run time only where the
+  # session has it. The leg without libcurl keeps the newest Ubuntu tested.
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: with libcurl
+            os: ubuntu-22.04
             curl_args: ""
+            extra_packages: libwayland-dev libegl-dev libdecor-0-dev patchelf
+            package: true
           - name: without libcurl
+            os: ubuntu-latest
             curl_args: "-DCMAKE_DISABLE_FIND_PACKAGE_CURL=ON"
+            extra_packages: ""
+            package: false
     steps:
       # Pinned to a commit rather than a moving tag: a workflow that installs
       # packages on a runner should not fetch its steps by mutable reference.
@@ -61,15 +81,16 @@ jobs:
             libdbus-1-dev libudev-dev libibus-1.0-dev \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxfixes-dev \
             libxrandr-dev libxss-dev libxtst-dev libxrender-dev \
-            zip unzip p7zip-full python3
+            zip unzip p7zip-full python3 ${{ matrix.extra_packages }}
 
-      # The second matrix leg reuses the first leg's SDL3.
+      # Keyed by the image: an SDL3 built against noble's glibc does not link on
+      # jammy, and only the packaged leg's has Wayland in it.
       - name: SDL3 cache
         id: sdl3
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SDL3_PREFIX }}
-          key: sdl3-${{ runner.os }}-${{ env.SDL3_VERSION }}
+          key: sdl3-${{ matrix.os }}-${{ env.SDL3_VERSION }}
 
       - name: build SDL3
         if: steps.sdl3.outputs.cache-hit != 'true'
@@ -100,12 +121,36 @@ jobs:
       - name: test
         run: ctest --test-dir build --output-on-failure
 
+      # A folder that runs where it is unpacked: SDL3 travels in lib/ and the
+      # binary looks for it there. libcurl and FreeType are the system's, as
+      # every distro ships libcurl.so.4 and libfreetype.so.6.
+      - name: package
+        if: matrix.package
+        run: |
+          dir=immc-linux-x64
+          mkdir -p "$dir/lib"
+          cp build/mc-clone "$dir/"
+          cp -P "$SDL3_PREFIX"/lib/libSDL3.so* "$dir/lib/"
+          patchelf --set-rpath '$ORIGIN/lib' "$dir/mc-clone"
+          strip "$dir/mc-clone"
+          cp README.md LICENSE assets/immc.desktop assets/immc.svg "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: upload package
+        if: matrix.package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: immc-linux-x64
+          path: immc-linux-x64.tar.gz
+          retention-days: 14
+
   # The same app on Windows, built with MSVC through the Visual Studio generator
   # (no developer prompt needed, ctest takes the configuration with -C). SDL3 is
-  # built from the same pinned release; libcurl is left out, which is a supported
-  # configuration. The suites drive their fixtures with sh, which Git for Windows
-  # puts on the runner's PATH; zip archives go through the bsdtar every Windows
-  # ships in System32, and 7-Zip is preinstalled on the image.
+  # built from the same pinned release, and libcurl and FreeType from theirs, so
+  # this is the full build and the one that is packaged. The suites drive their
+  # fixtures with sh, which Git for Windows puts on the runner's PATH; zip
+  # archives go through the bsdtar every Windows ships in System32, and 7-Zip is
+  # preinstalled on the image.
   windows:
     runs-on: windows-latest
     env:
@@ -113,6 +158,8 @@ jobs:
       CURL_PREFIX: C:/curl
       CURL_VERSION: 8.16.0
       LIBSSH2_VERSION: 1.11.1
+      FREETYPE_PREFIX: C:/freetype
+      FREETYPE_TAG: VER-2-13-3
     defaults:
       run:
         shell: bash
@@ -168,14 +215,95 @@ jobs:
           cmake --build curl-build --config Release
           cmake --install curl-build --config Release --prefix "$CURL_PREFIX"
 
+      # FreeType for hinted text, linked statically. Everything it can use and
+      # does not need (zlib, bzip2, libpng, HarfBuzz, Brotli) is turned off, so
+      # it brings no DLL of its own.
+      - name: FreeType cache
+        id: freetype
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.FREETYPE_PREFIX }}
+          key: freetype-${{ runner.os }}-${{ env.FREETYPE_TAG }}
+
+      - name: build FreeType
+        if: steps.freetype.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o freetype.tar.gz "https://github.com/freetype/freetype/archive/refs/tags/$FREETYPE_TAG.tar.gz"
+          tar xzf freetype.tar.gz
+          cmake -S "freetype-$FREETYPE_TAG" -B freetype-build -DBUILD_SHARED_LIBS=OFF \
+            -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON \
+            -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON
+          cmake --build freetype-build --config Release
+          cmake --install freetype-build --config Release --prefix "$FREETYPE_PREFIX"
+
       - name: fetch Dear ImGui
         run: scripts/get-deps.sh
 
       - name: configure
-        run: cmake -S . -B build -DCMAKE_PREFIX_PATH="$SDL3_PREFIX;$CURL_PREFIX"
+        run: cmake -S . -B build -DCMAKE_PREFIX_PATH="$SDL3_PREFIX;$CURL_PREFIX;$FREETYPE_PREFIX"
 
       - name: build
         run: cmake --build build --config Release
 
       - name: test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      # The build already puts SDL3.dll and libcurl.dll next to immc.exe. The
+      # Visual C++ runtime goes in too, from Visual Studio's redistributable
+      # folder, which is what Microsoft allows for app-local use: a fresh
+      # Windows does not have it, and without it the exe does not start.
+      - name: package
+        run: |
+          dir=immc-windows-x64
+          mkdir "$dir"
+          cp build/Release/immc.exe build/Release/*.dll "$dir/"
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)
+          crt=$(ls -d "$(cygpath "$vs")"/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT | sort -V | tail -1)
+          cp "$crt"/msvcp140.dll "$crt"/vcruntime140.dll "$crt"/vcruntime140_1.dll "$dir/"
+          cp README.md LICENSE "$dir/"
+          7z a -tzip "$dir.zip" "$dir"
+
+      - name: upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: immc-windows-x64
+          path: immc-windows-x64.zip
+          retention-days: 14
+
+  # A tag v<version> becomes a release with both packages attached, once both
+  # platforms built and passed. The tag has to match the version the binaries
+  # report, so a release cannot say 1.0 about a build that calls itself 0.9.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: check the version
+        run: |
+          want=$(sed -n 's/^project(mc-clone VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "v$want" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but CMakeLists.txt says version $want"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd packages
+          mv immc-windows-x64.zip "immc-$GITHUB_REF_NAME-windows-x64.zip"
+          mv immc-linux-x64.tar.gz "immc-$GITHUB_REF_NAME-linux-x64.tar.gz"
+          sha256sum immc-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "immc $GITHUB_REF_NAME" --generate-notes immc-* SHA256SUMS
