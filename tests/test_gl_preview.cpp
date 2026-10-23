@@ -112,7 +112,14 @@ int main() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     ImGui_ImplSDL3_InitForOpenGL(win, cx);
-    ImGui_ImplOpenGL3_Init();
+    // A context is not yet OpenGL 3: Windows without a GPU driver, as on a CI
+    // runner, hands out its own OpenGL 1.1, and the backend says so here.
+    if (!ImGui_ImplOpenGL3_Init()) {
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext(ctx);
+        SDL_GL_DestroyContext(cx); SDL_DestroyWindow(win); SDL_Quit();
+        return skip("OpenGL 3");
+    }
 
     std::string root = scratch_dir();
     if (root.empty()) {

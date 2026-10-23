@@ -49,6 +49,18 @@ static int checks = 0;
         }                                                                  \
     } while (0)
 
+// CHECK for a call that reports through `err`: a failure also says what went wrong,
+// which on a CI runner is the only way to find out.
+#define CHECK_ERR(cond, err)                                               \
+    do {                                                                   \
+        checks++;                                                          \
+        if (!(cond)) {                                                     \
+            failures++;                                                    \
+            printf("FAIL %s:%d  %s\n     -> %s\n", __FILE__, __LINE__, #cond, \
+                   (err).c_str());                                         \
+        }                                                                  \
+    } while (0)
+
 static const char* kUser = "tester";
 static const char* kPass = "hunter2";
 
@@ -1022,7 +1034,7 @@ static void test_ftp_escaped_names(FtpFixture& fx) {
     CHECK(find_row(rows, "two.txt") != nullptr);
 
     std::string back = out + "/back";
-    CHECK(net_download_tree(site, "/IDA Pro 9.6.261001/my tree", back.c_str(), nullptr, nullptr, &err));
+    CHECK_ERR(net_download_tree(site, "/IDA Pro 9.6.261001/my tree", back.c_str(), nullptr, nullptr, &err), err);
     CHECK(read_file(back + "/one two.txt") == "one\n");
     CHECK(read_file(back + "/deep dir/two.txt") == "two\n");
 
@@ -1096,7 +1108,7 @@ static void test_ftp_transfer(FtpFixture& fx) {
 
     std::string back = out + "/back";
     sh("rm -rf " + q(back));
-    CHECK(net_download_tree(site, "/tree", back.c_str(), nullptr, nullptr, &err));
+    CHECK_ERR(net_download_tree(site, "/tree", back.c_str(), nullptr, nullptr, &err), err);
     CHECK(read_file(back + "/one.txt") == "one\n");
     CHECK(read_file(back + "/deep/two.txt") == "two\n");
 
@@ -1295,11 +1307,11 @@ static void test_ftp_resume(FtpFixture& fx) {
 
     std::string back = out + "/back";
     sh("rm -rf " + q(back));
-    CHECK(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err));
+    CHECK_ERR(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err), err);
     std::string one = read_file(back + "/one two.txt");
     sh("rm -f " + q(back + "/one two.txt"));
     write_file(back + "/one two.txt.part", one.substr(0, 2));
-    CHECK(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err, true));
+    CHECK_ERR(net_download_tree(site, "/resume tree", back.c_str(), nullptr, nullptr, &err, true), err);
     CHECK(read_file(back + "/one two.txt") == one);
     CHECK(read_file(back + "/deep dir/two.txt") == "two\n");
     CHECK(!exists(back + "/one two.txt.part"));
