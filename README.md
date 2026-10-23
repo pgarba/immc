@@ -14,6 +14,24 @@ and 11.
 The binary it builds is still called `mc-clone` (on Windows, `immc.exe`); `immc` is
 the project, the desktop entry and the window title.
 
+## Download
+
+Ready-built packages are on the [releases page][releases]. Both are the full build,
+with FTP/FTPS/SFTP, hinted fonts and picture previews.
+
+- **Windows:** `immc-<version>-windows-x64.zip`. Unpack it anywhere and run
+  `immc.exe`. It carries the DLLs it needs, so nothing has to be installed.
+- **Linux:** `immc-<version>-linux-x64.tar.gz`. Unpack it and run `./mc-clone`. SDL3
+  comes in the package's `lib/`; libcurl and FreeType come from the system, which
+  almost every distro has already (`libcurl4` and `libfreetype6` on Debian and
+  Ubuntu). Built on Ubuntu 22.04, so it needs glibc 2.35 or newer.
+
+`SHA256SUMS` next to them holds each file's checksum. Every push to the repository
+also builds both packages; they are under that run's *Artifacts* on the Actions tab
+for two weeks.
+
+[releases]: https://github.com/pgarba/immc/releases
+
 ## Build
 
 Needs CMake 3.20 or newer, a C++20 compiler, SDL3 (with its CMake config) and an
