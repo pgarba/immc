@@ -71,7 +71,7 @@ static int print_version(void) {
 }
 
 // The Windows build is a GUI program, so it starts with no console and its stdout
-// goes nowhere. When it was started from one (`mc-clone --version` in a terminal)
+// goes nowhere. When it was started from one (`immc --version` in a terminal)
 // the text belongs in that terminal. Output already redirected to a file or a pipe,
 // which is how ctest reads it, is left where it was sent.
 static void attach_parent_console(void) {

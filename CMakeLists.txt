@@ -4,17 +4,12 @@ project(mc-clone VERSION 0.10.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
 
-# Identity. The repository and the desktop entry call the app immc; the
-# executable it builds is still mc-clone on Linux, where scripts and the desktop
-# entry start it by that name. On Windows, which has no such history, the file is
-# immc.exe. version.h is generated so the version number exists once, in the
-# project() line above.
+# Identity. The app, its executable and the desktop entry are all immc (immc.exe
+# on Windows); mc-clone survives as the CMake target and the settings folder, so
+# an existing config is still found. version.h is generated so the version
+# number exists once, in the project() line above.
 set(MC_APP_NAME   "immc")
-if (WIN32)
-    set(MC_APP_BINARY "${MC_APP_NAME}")
-else()
-    set(MC_APP_BINARY "${PROJECT_NAME}")
-endif()
+set(MC_APP_BINARY "${MC_APP_NAME}")
 configure_file(${CMAKE_SOURCE_DIR}/src/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h)
 
 # Windows. The code is POSIX, and src/win/posix.h gives the slice of it the program

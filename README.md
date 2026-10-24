@@ -15,8 +15,8 @@ and 11.
 
 ![immc in the Windows theme: videos on the left, downloads on the right](docs/screenshots/light.png)
 
-The binary it builds is still called `mc-clone` (on Windows, `immc.exe`); `immc` is
-the project, the desktop entry and the window title.
+The binary it builds is called `immc` (`immc.exe` on Windows), the same name as the
+project, the desktop entry and the window title.
 
 ## Download
 
@@ -25,7 +25,7 @@ with FTP/FTPS/SFTP, hinted fonts and picture previews.
 
 - **Windows:** `immc-<version>-windows-x64.zip`. Unpack it anywhere and run
   `immc.exe`. It carries the DLLs it needs, so nothing has to be installed.
-- **Linux:** `immc-<version>-linux-x64.tar.gz`. Unpack it and run `./mc-clone`. SDL3
+- **Linux:** `immc-<version>-linux-x64.tar.gz`. Unpack it and run `./immc`. SDL3
   comes in the package's `lib/`; libcurl and FreeType come from the system, which
   almost every distro has already (`libcurl4` and `libfreetype6` on Debian and
   Ubuntu). Built on Ubuntu 22.04, so it needs glibc 2.35 or newer.
@@ -94,7 +94,7 @@ Then:
 
     cmake -S . -B build
     cmake --build build -j4
-    ./build/mc-clone
+    ./build/immc
 
 A build **without** libcurl is a supported configuration rather than a broken one.
 The URL layer, the sites file and both FTP listing parsers still compile and are
@@ -185,7 +185,7 @@ Ten suites, a little over 3,100 checks between them:
 | `terminal` | the search for a terminal to run the editor in, and the exact command line each one wants: `-e` for xterm and konsole, `--` for gnome-terminal, kitty and foot, one quoted string for xfce4-terminal, and the config or `$TERMINAL` overriding the whole list |
 | `texture` | the GL texture upload, against a real context, including the way out when there is no context at all |
 | `gl-preview` | the whole feature on screen: a fixture decoded, cached, textured, drawn by the real renderer, and read back out of the framebuffer as magenta pixels |
-| `version` | `mc-clone --version`, which runs before SDL is initialised |
+| `version` | `immc --version`, which runs before SDL is initialised |
 
 Three of them skip half their work rather than failing for want of an environment,
 and say so on the way out: `remote` without libcurl or a startable fixture, `img` and

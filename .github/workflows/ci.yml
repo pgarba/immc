@@ -129,10 +129,10 @@ jobs:
         run: |
           dir=immc-linux-x64
           mkdir -p "$dir/lib"
-          cp build/mc-clone "$dir/"
+          cp build/immc "$dir/"
           cp -P "$SDL3_PREFIX"/lib/libSDL3.so* "$dir/lib/"
-          patchelf --set-rpath '$ORIGIN/lib' "$dir/mc-clone"
-          strip "$dir/mc-clone"
+          patchelf --set-rpath '$ORIGIN/lib' "$dir/immc"
+          strip "$dir/immc"
           cp README.md LICENSE assets/immc.desktop assets/immc.svg "$dir/"
           tar czf "$dir.tar.gz" "$dir"
 
