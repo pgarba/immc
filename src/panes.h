@@ -460,6 +460,10 @@ public:
     std::vector<std::string> console_hist;      // commands only, for Up/Down
     int console_hist_pos;        // == size() means "editing a fresh line"
     std::unique_ptr<ConsoleJob> console_job;    // non-null: a command is running
+    // Where a `cd` typed in the console went. Empty until there has been one: the
+    // console then runs commands in the focused pane's directory. A cd moves only
+    // the console, never a pane.
+    std::string console_dir;
     // The user scrolled up inside the transcript: stop following the tail of a
     // running command, or the line being typed would be pushed off screen.
     bool console_scroll_lock;

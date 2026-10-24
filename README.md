@@ -278,7 +278,7 @@ runs it and puts its output in the console.
 | `Alt+PgUp` `Alt+PgDn` | walk the history |
 | `Ctrl+P` | put the pane's path in the console |
 | `Alt+C` | open it with `cd ` already typed |
-| `cd` `pwd` `clear` `history` `exit` | builtins; `cd` moves the focused pane |
+| `cd` `pwd` `clear` `history` `exit` | builtins. `cd` moves the console only, not the panes; until the first `cd`, commands run in the focused pane's directory. The line at the top of the window says where the next command runs |
 
 Anything else goes to `/bin/sh`, so pipes and redirection work. A command runs on a
 worker thread: a `find` that takes a minute shows its results during the minute and

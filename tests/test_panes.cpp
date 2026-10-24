@@ -4724,11 +4724,11 @@ static void test_console(AppPanes* app, const std::string& root) {
     CHECK(app->console_log[4].out == "a\xC2\xB7" "bc\n");
 
     // ---- builtins ----
-    // `cd` moves a pane. The process's own working directory is not where the user
-    // is looking, and a console that changed it would move the ground under the next
-    // command without moving anything on screen.
+    // `cd` moves the console, not a pane: the panes are moved by the panes. Nor the
+    // process's own working directory, which nobody is looking at.
     console_type(app, "cd sub");
-    CHECK(app->left.current_dir == root + "/sub");
+    CHECK(app->left.current_dir == root);
+    CHECK(app->console_dir == root + "/sub");
     CHECK(app->console_log.back().builtin);
     CHECK(app->console_log.back().out == root + "/sub");   // it says where it landed
 
@@ -4740,16 +4740,38 @@ static void test_console(AppPanes* app, const std::string& root) {
     CHECK(app->console_log.back().cwd == root + "/sub");
     CHECK(app->console_log.back().out == "deep\n");
 
-    // A cd that cannot be done leaves the pane where it was and says why.
-    console_type(app, "cd /definitely-not-here");
+    // Moving the pane now leaves the console where its cd put it, and `..` is
+    // relative to the console. The panes never move.
+    refresh_pane(&app->left, (root + "/sub").c_str());
+    console_type(app, "cd ..");
+    CHECK(app->console_dir == root);
     CHECK(app->left.current_dir == root + "/sub");
+    refresh_pane(&app->left, root.c_str());
+    console_type(app, "cd sub");
+
+    // A cd that cannot be done leaves the console where it was and says why.
+    console_type(app, "cd /definitely-not-here");
+    CHECK(app->console_dir == root + "/sub");
+    CHECK(app->left.current_dir == root);
     CHECK(app->console_log.back().out.find("no such directory") != std::string::npos);
 
     // Bare `cd` goes home, the rule the command line had.
     console_type(app, "cd");
     const std::string home_dir = plat_home_dir();
-    CHECK(app->left.current_dir == (!home_dir.empty() ? home_dir : plat_root_of(nullptr)));
-    refresh_pane(&app->left, root.c_str());
+    char home_norm[4096];
+    normalize_pane_path(!home_dir.empty() ? home_dir.c_str() : plat_root_of(nullptr).c_str(),
+                        home_norm, sizeof(home_norm));
+    CHECK(app->console_dir == home_norm);
+    CHECK(app->left.current_dir == root);
+
+    // A console directory that has been deleted falls back to the pane's.
+    mkdir((root + "/gone").c_str(), 0755);
+    console_type(app, ("cd " + root + "/gone").c_str());
+    CHECK(app->console_dir == root + "/gone");
+    rmdir((root + "/gone").c_str());
+    console_type(app, "pwd");
+    CHECK(app->console_log.back().out == root);
+    CHECK(app->console_dir.empty());
 
     // clear empties the backlog and is not an entry of its own: recording the
     // command that removes entries would leave the transcript one line shorter than
@@ -5438,18 +5460,21 @@ static void test_path_normalization(AppPanes* app, Pane& p, const std::string& r
         auto test_home = std::make_unique<TestHome>(chome);
         app->left_focus = true;
         refresh_pane(&app->left, "/");
-        // The tab the pane stands on, so the chain can be watched where the corruption
-        // used to land rather than only in the path bar.
+        // The tab the pane stands on: the console's cd is its own now, and must not
+        // land in the pane or its tab at all.
         app->left.tab_count = 1;
         app->left.tab_active = 0;
         snprintf(app->left.tabs[0].dir, sizeof(app->left.tabs[0].dir), "%s", "/");
+        const std::string pane_before = app->left.current_dir;
         console_cd(app, "~/");
-        CHECK(strcmp(app->left.current_dir, chome.c_str()) == 0);
+        CHECK(app->console_dir == chome);
         console_cd(app, "sub");
-        CHECK(strcmp(app->left.current_dir, (chome + "/sub").c_str()) == 0);
-        CHECK(strstr(app->left.current_dir, "//") == nullptr);
-        CHECK(strcmp(app->left.tabs[0].dir, app->left.current_dir) == 0);
+        CHECK(app->console_dir == chome + "/sub");
+        CHECK(app->console_dir.find("//") == std::string::npos);
+        CHECK(app->left.current_dir == pane_before);
+        CHECK(strcmp(app->left.tabs[0].dir, "/") == 0);
         app->left.tab_count = 0;
+        app->console_dir.clear();
         test_home.reset();
     }
 

@@ -1820,19 +1820,60 @@ static void console_worker(ConsoleJob* job, std::string line, std::string cwd) {
     job->done.store(true);
 }
 
-// The console's `cd` moves a pane, not the process. The app's own working
-// directory is not where the user is looking, and a console that changed it would
-// move the ground under the next command without moving anything on screen. The
-// path rules are the ones the command line had, unchanged: `~`, an absolute path,
-// a path relative to the pane, and a URL, which is a directory too.
+// Resolve the "." and ".." steps of a path normalize_pane_path() has spelled, so
+// "C:/work/sub/.." is kept as "C:/work". A ".." at the root stays at the root.
+static std::string collapse_dots(const std::string& path) {
+    size_t root = 0;
+    if (path.size() >= 3 && path[1] == ':' && path[2] == '/') root = 3;   // C:/
+    else if (path.compare(0, 2, "//") == 0) root = 2;                    // UNC
+    else if (!path.empty() && path[0] == '/') root = 1;
+    std::vector<std::string> parts;
+    size_t i = root;
+    while (i <= path.size()) {
+        size_t j = path.find('/', i);
+        if (j == std::string::npos) j = path.size();
+        std::string seg = path.substr(i, j - i);
+        if (seg == "..") { if (!parts.empty()) parts.pop_back(); }
+        else if (!seg.empty() && seg != ".") parts.push_back(seg);
+        i = j + 1;
+    }
+    std::string out = path.substr(0, root);
+    for (size_t k = 0; k < parts.size(); k++) {
+        if (k) out += '/';
+        out += parts[k];
+    }
+    return out.empty() ? "/" : out;
+}
+
+// The directory the console's next command runs in: where its last `cd` went
+// or, before any cd (or once that directory has gone away), the focused pane's.
+// Never the process's own working directory, which nobody is looking at.
+static std::string console_cwd(AppPanes* app) {
+    if (!app->console_dir.empty()) {
+        if (DIR* d = opendir(app->console_dir.c_str())) {
+            closedir(d);
+            return app->console_dir;
+        }
+        app->console_dir.clear();
+    }
+    Pane& active = app->left_focus ? app->left : app->right;
+    return active.current_dir;
+}
+
+// `cd` in the console moves the console and nothing else; the panes stay where
+// they are. The path rules are the ones the command line had: `~`, an absolute
+// path, a path relative to where the console is. A site or an smb:// share is not
+// a directory a shell can sit in, so those still open in the focused pane, the
+// way typing them in the path bar would.
 static void console_cd(AppPanes* app, const char* arg) {
     while (*arg == ' ') arg++;
     Pane& active = app->left_focus ? app->left : app->right;
+    const std::string base = console_cwd(app);
     char target[4096];
     const std::string home = plat_home_dir();
     if (!*arg) {
         snprintf(target, sizeof(target), "%s",
-                 !home.empty() ? home.c_str() : plat_root_of(active.current_dir).c_str());
+                 !home.empty() ? home.c_str() : plat_root_of(base.c_str()).c_str());
     } else if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\\' || arg[1] == '\0')) {
         snprintf(target, sizeof(target), "%s%s", home.c_str(), arg + 1);
     } else if (net_is_remote(arg) || smb_is_url(arg)) {
@@ -1845,7 +1886,7 @@ static void console_cd(AppPanes* app, const char* arg) {
     } else if (plat_path_is_absolute(arg)) {
         snprintf(target, sizeof(target), "%s", arg);
     } else {
-        snprintf(target, sizeof(target), "%s/%s", active.current_dir, arg);
+        snprintf(target, sizeof(target), "%s/%s", base.c_str(), arg);
     }
     if (net_is_remote(target)) { remote_open_url(app, target); return; }
 #ifndef _WIN32
@@ -1853,10 +1894,13 @@ static void console_cd(AppPanes* app, const char* arg) {
     // whether it can be reached, and the reason lands in the status line if not.
     if (smb_is_url(target)) { navigate_to(app, &active, target); return; }
 #endif
-    DIR* probe = opendir(target);
+    char real[4096];
+    normalize_pane_path(target, real, sizeof(real));
+    snprintf(real, sizeof(real), "%s", collapse_dots(real).c_str());
+    DIR* probe = opendir(real);
     if (probe) {
         closedir(probe);
-        navigate_to(app, &active, target);
+        app->console_dir = real;
     } else {
         snprintf(app->status_msg, sizeof(app->status_msg), "cd: no such directory: %s", target);
     }
@@ -1866,7 +1910,7 @@ static void console_cd(AppPanes* app, const char* arg) {
 // backlog. Defined below console_run, which is the half that decides a line is a
 // command at all; the other caller is Enter on an executable file, where the
 // command is already decided.
-static void console_start(AppPanes* app, const std::string& line);
+static void console_start(AppPanes* app, const std::string& line, const std::string& cwd);
 
 // Run one console line. Builtins are answered here, on this thread; everything
 // else is a shell command in the directory the focused pane is showing, on a
@@ -1892,7 +1936,7 @@ static void console_run(AppPanes* app) {
     console_hist_push(app, c);
 
     Pane& active = app->left_focus ? app->left : app->right;
-    const std::string cwd = active.current_dir;
+    const std::string cwd = console_cwd(app);
 
     if (strcmp(c, "exit") == 0 || strcmp(c, "quit") == 0) {
         console_push(app, cwd, c, "", -1, true);
@@ -1924,13 +1968,14 @@ static void console_run(AppPanes* app) {
     // address bar takes \\server: cmd.exe would answer that it is not a command.
     bool place = names_network_place(c) || net_is_remote(c);
     if (place || strcmp(c, "cd") == 0 || strncmp(c, "cd ", 3) == 0) {
+        app->status_msg[0] = '\0';
         console_cd(app, place ? c : c + 2);
         Pane& after = app->left_focus ? app->left : app->right;
         // The transcript says where the console is now sitting, because that is the
-        // thing `cd` changed. If the pane did not move, the reason is what belongs
-        // there instead.
-        std::string out = after.current_dir;
-        if (out == cwd && app->status_msg[0]) out = app->status_msg;
+        // thing `cd` changed - or, for a site, which the pane opens, where the pane
+        // went. A cd that could not be done says why instead.
+        std::string out = place ? std::string(after.current_dir) : console_cwd(app);
+        if (app->status_msg[0] && (!place || out == cwd)) out = app->status_msg;
         console_push(app, cwd, c, out, -1, true);
         return;
     }
@@ -1939,7 +1984,7 @@ static void console_run(AppPanes* app) {
     // an archive or on a site the pane's directory is a name only this program
     // understands, and running the command in the directory the pane walked in
     // from would be a guess about what the user meant.
-    if (in_archive(active) || in_remote(active)) {
+    if (app->console_dir.empty() && (in_archive(active) || in_remote(active))) {
         console_push(app, cwd, c,
                      in_archive(active)
                          ? "This pane is inside an archive: there is no directory here to run a "
@@ -1950,26 +1995,24 @@ static void console_run(AppPanes* app) {
         return;
     }
 
-    console_start(app, c);
+    console_start(app, c, cwd);
 }
 
-// Start a shell command in the focused pane's directory and record it in the
-// backlog. Split out of console_run because Enter on an executable file is the
-// same thing with the command already decided: the answer belongs in the console
-// either way, and it belongs on a thread either way.
-static void console_start(AppPanes* app, const std::string& line) {
+// Start a shell command in `cwd` and record it in the backlog. Split out of
+// console_run because Enter on an executable file is the same thing with the
+// command already decided (and run in the pane's directory, where the file is):
+// the answer belongs in the console either way, and on a thread either way.
+static void console_start(AppPanes* app, const std::string& line, const std::string& cwd) {
     console_reap(app);
     if (app->console_job) {
         snprintf(app->status_msg, sizeof(app->status_msg),
                  "A command is still running. Esc cancels it.");
         return;
     }
-    Pane& active = app->left_focus ? app->left : app->right;
-    console_push(app, active.current_dir, line, "", -1, false);
+    console_push(app, cwd, line, "", -1, false);
     app->console_scroll_lock = false;
     app->console_job = std::make_unique<ConsoleJob>();
-    app->console_job->worker = std::thread(console_worker, app->console_job.get(),
-                                           line, std::string(active.current_dir));
+    app->console_job->worker = std::thread(console_worker, app->console_job.get(), line, cwd);
 }
 
 // Open the console and, when asked, take the keyboard for its field. Focus is
@@ -5329,7 +5372,7 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
         // pane: a program that takes a minute should not take the file manager
         // with it, and it no longer does - it runs on the console's worker.
         console_show(app, false);
-        console_start(app, full);
+        console_start(app, full, pane.current_dir);
     } else if (!in_remote(pane)) {
         // Any other file opens in the program the desktop has for it, as a double
         // click in Explorer or Total Commander does: a .png in the image viewer, a
@@ -7099,7 +7142,6 @@ static void render_netlog(AppPanes* app) {
 
 static void render_console(AppPanes* app) {
     if (!app->console_open) return;
-    Pane& active = app->left_focus ? app->left : app->right;
 
     ImGui::SetNextWindowSize(ImVec2(app->console_w, app->console_h), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f - 380.0f,
@@ -7113,9 +7155,9 @@ static void render_console(AppPanes* app) {
     app->console_h = csz.y;
 
     // Where the next command runs, said out loud, because it is the one thing about
-    // a console in a file manager that is not obvious: commands run in the directory
-    // the focused pane is showing, not the one the app was started in.
-    ImGui::TextDisabled("in %s", active.current_dir);
+    // a console in a file manager that is not obvious: the focused pane's directory
+    // until a `cd` in here moves the console somewhere of its own.
+    ImGui::TextDisabled("in %s", console_cwd(app).c_str());
     if (app->console_job) {
         ImGui::SameLine();
         ImGui::TextDisabled("- running, Esc cancels");
