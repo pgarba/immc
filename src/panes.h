@@ -95,6 +95,13 @@ struct Pane {
     bool quick_active;
     std::vector<int> view;      // visible rows -> entry index
     bool quick_view;          // F3 quick view for this panel
+    // PageUp/PageDown and Up/Down while F3 is open: pages and lines to scroll the
+    // preview by, applied and cleared by the next draw. `qv_row` is the row the
+    // preview last showed, so a new file starts at its top rather than where the
+    // last one was left.
+    int qv_page = 0;
+    int qv_line = 0;
+    int qv_row = -1;
     int list_mode = LIST_NORMAL;  // LIST_NORMAL | LIST_BRANCH
     // TC tree panel (Ctrl+Shift+F8 embeds it, Shift+Tab splits the panel).
     // Each pane owns its model: the floating Alt+F10 window edits the target

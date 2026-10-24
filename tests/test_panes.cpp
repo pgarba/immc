@@ -3793,6 +3793,42 @@ static void test_quick_view(AppPanes* app, const std::string& root) {
     CHECK(qv_preview(app, p, ghost) == "(cannot read " + ghost_path + ")");
     CHECK(qv_cache_find(app, ghost_path) == nullptr);
 
+    // A PDF previews as its text, read by pdftotext on a worker: a long document
+    // takes it a moment. The file is the smallest one poppler reads - no xref,
+    // which it rebuilds - so the test needs nothing else to make it.
+    if (qv_pdftotext_available()) {
+        FILE* pf = fopen((qv + "/src/doc.pdf").c_str(), "wb");
+        CHECK(pf != nullptr);
+        if (pf) {
+            fputs("%PDF-1.4\n"
+                  "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+                  "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+                  "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 100]/Contents 4 0 R"
+                  "/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+                  "4 0 obj<</Length 41>>stream\n"
+                  "BT /F1 12 Tf 10 50 Td (Hello PDF) Tj ET\n"
+                  "endstream endobj\n"
+                  "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+                  "trailer<</Root 1 0 R>>\n%%EOF\n", pf);
+            fclose(pf);
+        }
+        refresh_pane(&p, (qv + "/src").c_str());
+        int pdf = idx_of(p, "doc.pdf");
+        CHECK(pdf >= 0);
+        std::string pt = qv_preview(app, p, pdf);
+        CHECK(pt == k_qv_reading);
+        for (int tries = 0; tries < 200 && pt == k_qv_reading; tries++) {
+            SDL_Delay(25);
+            qv_reap(app);
+            pt = qv_preview(app, p, pdf);
+        }
+        CHECK(pt.find("Hello PDF") != std::string::npos);
+        CHECK(pt.find('\f') == std::string::npos);   // page breaks are blank lines
+        CHECK(app->qv_fetches.empty());
+    } else {
+        printf("skip: pdftotext missing\n");
+    }
+
     // What reading a row would take, for a row of each kind.
     QvJob job;
     CHECK(qv_job_for(app, p, idx_of(p, "inner.txt"), &job));

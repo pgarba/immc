@@ -19,6 +19,7 @@ enum ArchKind {
     ARCH_TAR_XZ,   // tar.xz, txz
     ARCH_7Z,       // 7z
     ARCH_RAR,      // rar, read-only through 7z's bundled decoder
+    ARCH_ISO,      // iso, a disc image: read-only, 7z reads ISO 9660 and UDF
     ARCH_KIND_COUNT
 };
 

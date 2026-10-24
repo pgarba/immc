@@ -124,6 +124,7 @@ static void test_kind_of(void) {
     CHECK(arch_kind_of("a.tar.xz") == ARCH_TAR_XZ);
     CHECK(arch_kind_of("a.7z") == ARCH_7Z);
     CHECK(arch_kind_of("a.rar") == ARCH_RAR);
+    CHECK(arch_kind_of("Disc.ISO") == ARCH_ISO);
     CHECK(arch_kind_of("a.txt") == ARCH_NONE);
     CHECK(arch_kind_of("a.gz") == ARCH_NONE);       // bare gzip is not a listing
     CHECK(arch_is_archive("a.tgz"));
@@ -132,6 +133,7 @@ static void test_kind_of(void) {
     // rar has no writer
     CHECK(!arch_can_pack(ARCH_RAR));
     CHECK(arch_can_extract(ARCH_RAR));
+    CHECK(!arch_can_pack(ARCH_ISO));
     // A split archive names its parts after the whole, so the part number is not
     // the format. Without this the pack dialog's own volumes would be unreadable.
     CHECK(arch_kind_of("a.7z.001") == ARCH_7Z);
@@ -281,6 +283,30 @@ static void test_extract_whole(const std::string& root, const char* arch) {
     CHECK(pr.total_files >= 3);
     CHECK(pr.total_bytes >= 10);
     sh("rm -rf '" + out + "'");
+}
+
+// A disc image is read by 7z like any other archive. 7z cannot write one, so the
+// test makes it with bsdtar or xorriso, whichever is here, with Rock Ridge and
+// Joliet names so "a file.txt" stays lower case and keeps its space.
+static void test_iso(const std::string& root) {
+    if (!arch_tool_available(ARCH_ISO)) { printf("skip: 7z missing (iso)\n"); return; }
+    const std::string iso = root + "/t.iso", src = root + "/dotsrc";
+    if (system(("bsdtar --format iso9660 -cf " + q(iso) + " -C " + q(src) + " . 2>/dev/null").c_str()) != 0 &&
+        system(("xorriso -as mkisofs -R -J -quiet -o " + q(iso) + " " + q(src) + " 2>/dev/null").c_str()) != 0) {
+        printf("skip: no bsdtar or xorriso to make an iso\n");
+        return;
+    }
+    std::vector<ArchEntry> v;
+    std::string err;
+    CHECK(arch_list(iso.c_str(), &v, &err));
+    const ArchEntry* f = find(v, "a file.txt");
+    CHECK(f != nullptr);
+    if (f) CHECK(f->size == 6);
+    const ArchEntry* d = find(v, "sub/deep");
+    CHECK(d != nullptr);
+    if (d) CHECK(S_ISDIR(d->mode));
+    CHECK(find(v, "t.iso") == nullptr);
+    test_extract_whole(root, "t.iso");
 }
 
 // The whole point of passing members as argv: a name with a space, a quote and
@@ -604,6 +630,7 @@ int main() {
     test_extract_whole(root, "t.tar.gz");
     test_extract_whole(root, "t.tar");
     if (arch_tool_available(ARCH_7Z)) test_extract_whole(root, "t.7z");
+    test_iso(root);
     test_extract_members_with_tricky_names(root);
     test_extract_tar_members(root);
     test_extract_directory_member(root, "t.zip");

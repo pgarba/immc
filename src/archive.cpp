@@ -45,6 +45,7 @@ static const KindSuffix KINDS[] = {
     { ".7z",      ARCH_7Z      },
     { ".rar",     ARCH_RAR     },
     { ".r00",     ARCH_RAR     },
+    { ".iso",     ARCH_ISO     },
 };
 
 const char* arch_kind_name(ArchKind k) {
@@ -56,6 +57,7 @@ const char* arch_kind_name(ArchKind k) {
     case ARCH_TAR_XZ:  return "tar.xz";
     case ARCH_7Z:      return "7z";
     case ARCH_RAR:     return "rar";
+    case ARCH_ISO:     return "iso";
     default:           return "archive";
     }
 }
@@ -86,8 +88,9 @@ ArchKind arch_kind_of(const char* path) {
 
 bool arch_is_archive(const char* path) { return arch_kind_of(path) != ARCH_NONE; }
 
-// The tool that handles a kind. rar has no writer, and 7z carries a bundled
-// Rar/Rar5 decoder, so rar needs no parser of its own.
+// The tool that handles a kind. rar and iso have no writer, and 7z carries a
+// bundled Rar/Rar5 decoder and reads disc images, so neither needs a parser of
+// its own.
 static const char* tool_for(ArchKind k) {
     switch (k) {
     case ARCH_ZIP:
@@ -96,7 +99,8 @@ static const char* tool_for(ArchKind k) {
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ:  return nullptr;   // handled per-op: zip/unzip/tar
     case ARCH_7Z:
-    case ARCH_RAR:     return "7z";
+    case ARCH_RAR:
+    case ARCH_ISO:     return "7z";
     default:           return nullptr;
     }
 }
@@ -165,7 +169,8 @@ bool arch_tool_available(ArchKind k) {
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ:  ok = path_has_tool("tar"); break;
     case ARCH_7Z:
-    case ARCH_RAR:     ok = path_has_tool("7z") || path_has_tool("7za"); break;
+    case ARCH_RAR:
+    case ARCH_ISO:     ok = path_has_tool("7z") || path_has_tool("7za"); break;
     default:           ok = false; break;
     }
     cache[k] = ok;
@@ -180,7 +185,7 @@ bool arch_can_pack(ArchKind k) {
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ:  return path_has_tool("tar");
     case ARCH_7Z:      return path_has_tool("7z") || path_has_tool("7za");
-    default:           return false;   // rar is read-only
+    default:           return false;   // rar and iso are read-only
     }
 }
 
@@ -645,12 +650,14 @@ static bool parse_tar_list(const std::string& out, std::vector<ArchEntry>* out_e
 static bool parse_7z_list(const std::string& out, std::vector<ArchEntry>* out_entries) {
     bool in_rows = false;
     bool have = false;
-    std::string path, size_s, modified, attrs;
+    std::string path, size_s, modified, attrs, folder;
 
     auto flush = [&]() {
         if (!have || path.empty()) { path.clear(); have = false; return; }
         ArchEntry e{};
-        bool dir = !attrs.empty() && attrs[0] == 'D';
+        // A .7z or .rar says D in Attributes. A disc image has no attributes and
+        // says it in Folder instead, which 7z prints for every format.
+        bool dir = (!attrs.empty() && attrs[0] == 'D') || folder == "+";
         e.mode = (dir ? S_IFDIR : S_IFREG) | (dir ? 0755 : 0644);
         e.size = (off_t)atoll(size_s.c_str());
         char d[64] = "", t[64] = "";
@@ -663,7 +670,7 @@ static bool parse_7z_list(const std::string& out, std::vector<ArchEntry>* out_en
         for (char* c = e.rel; *c; c++) if (*c == '\\') *c = '/';
 #endif
         if (e.rel[0]) out_entries->push_back(e);
-        path.clear(); size_s.clear(); modified.clear(); attrs.clear();
+        path.clear(); size_s.clear(); modified.clear(); attrs.clear(); folder.clear();
         have = false;
     };
 
@@ -687,6 +694,7 @@ static bool parse_7z_list(const std::string& out, std::vector<ArchEntry>* out_en
         else if (key == "Size") size_s = val;
         else if (key == "Modified") modified = val;
         else if (key == "Attributes") attrs = val;
+        else if (key == "Folder") folder = val;
     }
     flush();
     return !out_entries->empty();
@@ -738,7 +746,8 @@ static bool arch_list_run(const std::vector<std::string>& argv, ArchKind k,
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ: parsed = parse_tar_list(out_text, out); break;
     case ARCH_7Z:
-    case ARCH_RAR: parsed = parse_7z_list(out_text, out); break;
+    case ARCH_RAR:
+    case ARCH_ISO: parsed = parse_7z_list(out_text, out); break;
     default: break;
     }
     if (!parsed) {
@@ -769,7 +778,8 @@ bool arch_list(const char* archive, std::vector<ArchEntry>* out, std::string* er
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ: argv = { "tar", "-tvf", a }; break;
     case ARCH_7Z:
-    case ARCH_RAR: argv = { "7z", "l", "-slt", a }; break;
+    case ARCH_RAR:
+    case ARCH_ISO: argv = { "7z", "l", "-slt", a }; break;
     default: *err = "not an archive"; return false;
     }
     return arch_list_run(argv, k, out, err);
@@ -835,7 +845,8 @@ bool arch_extract(const char* archive, const char* dest,
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ: pr.mode = UNIT_ANY; argv = { "tar", "-xvf", a, "-C", d }; break;
     case ARCH_7Z:
-    case ARCH_RAR: pr.mode = UNIT_PERCENT; argv = { "7z", "x", a, "-o" + d, "-y" }; break;
+    case ARCH_RAR:
+    case ARCH_ISO: pr.mode = UNIT_PERCENT; argv = { "7z", "x", a, "-o" + d, "-y" }; break;
     default: return false;
     }
 
@@ -949,6 +960,7 @@ bool arch_extract_members(const char* archive, const char* dest,
         break;
     case ARCH_7Z:
     case ARCH_RAR:
+    case ARCH_ISO:
         pr.mode = UNIT_PERCENT;
         argv = { "7z", "x", a, "-o" + d, "-y", "--" };
         argv.insert(argv.end(), names.begin(), names.end());
@@ -1123,7 +1135,8 @@ bool arch_test(const char* archive, arch_progress_fn cb, void* user, std::string
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ: pr.mode = UNIT_ANY; argv = { "tar", "-tvf", a }; break;
     case ARCH_7Z:
-    case ARCH_RAR: pr.mode = UNIT_PERCENT; argv = { "7z", "t", a, "-y" }; break;
+    case ARCH_RAR:
+    case ARCH_ISO: pr.mode = UNIT_PERCENT; argv = { "7z", "t", a, "-y" }; break;
     default: return false;
     }
 

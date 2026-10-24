@@ -165,7 +165,7 @@ used (`src/platform.*`, `src/proc.cpp`), and is different on purpose:
 | `F4` | `%EDITOR%` (Notepad when unset) in a window of its own; no terminal is looked for, since a console program started that way gets one. `terminal =` in the config is still honoured. |
 | console | runs `cmd.exe`; output that is not UTF-8 is read in the system's OEM code page, which is what `cmd` writes |
 | zip and tar | Windows' own `tar.exe` (bsdtar) in System32 - no `zip` or `unzip` needed. It cannot encrypt, so a zip with a password is refused with a pointer to 7z. |
-| 7z, rar | 7-Zip, when `7z.exe` is on `PATH` |
+| 7z, rar, iso | 7-Zip, when `7z.exe` is on `PATH` |
 | Properties | no owner or group; of the mode, only the owner's write bit means anything - it is the read-only attribute |
 
 ## Tests
@@ -226,7 +226,7 @@ and in `FEATURES_PLAN.md`. The ones worth knowing on the first run:
 | --- | --- |
 | `Enter` `Right` | open: a folder or an archive in the pane; any other file in the program the desktop has for it (a `.png` in the image viewer, a `.mkv` in the video player), as a double click does in Explorer. A program runs in the console instead. A file on a site or inside an archive opens in the built-in viewer |
 | `Backspace` `Left` | up a directory |
-| `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor — including one on a site or inside an archive, and an old `.nfo` read as CP437 when it looks like a drawing |
+| `F3` | quick view: a picture if the file is one, otherwise the beginning of the file under the cursor — including one on a site or inside an archive, an old `.nfo` read as CP437 when it looks like a drawing, and the text of a PDF when `pdftotext` (poppler-utils) is installed. While it is open, `PageUp`/`PageDown` and `Up`/`Down` scroll the preview instead of moving the cursor, and `Esc` closes it |
 | `Ctrl+Q` | quick view as a pane, instead of a file pane |
 | `Alt+F3` | open with the desktop's default program |
 | `F4` | edit in the terminal editor — it asks first if the file's bytes are not text |

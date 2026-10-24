@@ -2248,7 +2248,7 @@ void app_about_identity(char* out, size_t n) {
              "text rasterized with %s\n"
              "archive tools found: %s%s\n",
              MC_APP_NAME, MC_VERSION, MC_APP_BINARY, IMGUI_VERSION, sdlv, cfgp, raster,
-             tools, arch_tool_available(ARCH_RAR) ? ", RAR read-only" : "");
+             tools, arch_tool_available(ARCH_RAR) ? ", RAR and ISO read-only" : "");
 }
 
 // Past this many characters a title bar stops being readable, and the path is
@@ -6041,6 +6041,52 @@ static bool qv_still_wanted_cb(long long, long long, int, int, void* user) {
     return !((QvFetch*)user)->cancel.load();
 }
 
+// A PDF says so in its first bytes, whatever it is called.
+static bool qv_is_pdf(const std::string& body) { return body.compare(0, 5, "%PDF-") == 0; }
+
+// Is pdftotext (poppler-utils) here? Asked on the UI thread, once: a PDF on a
+// machine without it keeps the hex dump it always had.
+static bool qv_pdftotext_available() {
+    static int have = -1;
+    if (have < 0) {
+        std::string where;
+        have = term_which("pdftotext", &where) ? 1 : 0;
+    }
+    return have == 1;
+}
+
+// The text of a PDF on this disk, read by pdftotext into the preview's byte cap.
+// Past the cap, or when the cursor moves on, the tool is stopped rather than left
+// to read a 900-page manual nobody will scroll to. -q keeps its complaints about
+// a damaged file off the pipe, where they would be read as the document's text.
+// A form feed between pages becomes a blank line: ImGui draws it as a box.
+static bool qv_pdf_text(const std::string& path, std::string* text, QvFetch* f) {
+    Proc p;
+    std::string err;
+    if (!proc_start({ "pdftotext", "-q", "-enc", "UTF-8", path, "-" }, nullptr, kNoEnv, &p, &err))
+        return false;
+    char buf[8192];
+    bool stopped = false;
+    for (;;) {
+        long n = proc_read(&p, buf, sizeof buf, 100);
+        if (n > 0) text->append(buf, (size_t)n);
+        else if (n != -1) break;   // end of output, or a read error
+        if (text->size() >= k_qv_max_bytes || f->cancel.load()) { stopped = true; break; }
+    }
+    int st = proc_finish(&p, stopped);
+    if (f->cancel.load() || (!stopped && st != 0)) return false;
+    if (text->size() > k_qv_max_bytes) {
+        // Cut on a character boundary, not through the middle of one.
+        size_t cut = k_qv_max_bytes;
+        while (cut > 0 && ((unsigned char)(*text)[cut] & 0xC0) == 0x80) cut--;
+        text->resize(cut);
+    }
+    for (char& c : *text) if (c == '\f') c = '\n';
+    if (text->find_first_not_of(" \t\r\n") == std::string::npos)
+        *text = "(a PDF with no text in it: scanned pages, or only pictures)";
+    return true;
+}
+
 // The worker. It writes text and err and only then raises done, so a frame that
 // sees done can read both. Nothing here touches the app, the panes, or ImGui.
 static void qv_run_fetch(QvFetch* f, QvJob job) {
@@ -6063,6 +6109,14 @@ static void qv_run_fetch(QvFetch* f, QvJob job) {
             if (job.want_image) qv_read_body(file, &body, &fmt, &err);
             else qv_read_file(file, &body, &err);
         }
+    }
+    // A PDF is read for its text while the file is still here: a member of an
+    // archive is only on this disk until the line below. A site's file is not, and
+    // what arrived of it is only its head, so it stays what it was before.
+    bool pdf_text = false;
+    if (err.empty() && job.kind != QV_REMOTE && qv_is_pdf(body)) {
+        std::string text;
+        if (qv_pdf_text(file, &text, f)) { body = std::move(text); pdf_text = true; }
     }
     if (tmpdir[0]) fs_delete_entry(tmpdir);   // no shell: see close_viewer
 
@@ -6102,7 +6156,8 @@ static void qv_run_fetch(QvFetch* f, QvJob job) {
         }
     }
 
-    if (err.empty() && !qv_to_text(&body, job.codepage)) body = k_qv_binary;
+    if (err.empty() && !qv_to_text(&body, pdf_text ? TEXT_CODEPAGE_UTF8 : job.codepage))
+        body = k_qv_binary;
     f->text = err.empty() ? body : "";
     f->err = err;
     f->done = true;
@@ -6218,6 +6273,14 @@ static std::string qv_preview(AppPanes* app, const Pane& pane, int idx) {
             for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
                 if (f->key == full.key) { f->wanted = true; return k_qv_reading; }
             if (app->qv_fetches.size() < k_qv_inflight_max) qv_start(app, full);
+            return k_qv_reading;
+        }
+        if (qv_is_pdf(body) && qv_pdftotext_available()) {
+            // pdftotext takes a moment on a long document, so it runs on a worker,
+            // like the rest of a picture does.
+            for (std::unique_ptr<QvFetch>& f : app->qv_fetches)
+                if (f->key == job.key) { f->wanted = true; return k_qv_reading; }
+            if (app->qv_fetches.size() < k_qv_inflight_max) qv_start(app, job);
             return k_qv_reading;
         }
         if (!qv_to_text(&body, job.codepage)) body = k_qv_binary;
@@ -6899,8 +6962,14 @@ static void render_file_list(AppPanes* app, Pane& pane, bool focused, float widt
 }
 
 static void render_quick_view(AppPanes* app, Pane& pane) {
-    ImGui::SetNextWindowSize(ImVec2(app->qv_w, app->qv_h), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 640, 60), ImGuiCond_FirstUseEver);
+    // Opens centred over the main window, at the remembered size cut down to what
+    // fits: a size saved on a bigger screen would otherwise hang off the edge.
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImVec2 sz(app->qv_w < vp->Size.x ? app->qv_w : vp->Size.x,
+              app->qv_h < vp->Size.y ? app->qv_h : vp->Size.y);
+    ImGui::SetNextWindowSize(sz, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + (vp->Size.x - sz.x) * 0.5f,
+                                   vp->Pos.y + (vp->Size.y - sz.y) * 0.5f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Quick view");
     // Remember the shape to open at next session. FirstUseEver means ImGui holds
     // the live size for the rest of this one, so what gets recorded here is what
@@ -6927,6 +6996,13 @@ static void render_quick_view(AppPanes* app, Pane& pane) {
     ImGui::Text("Mode: %s", mode);
     ImGui::Separator();
 
+    // The preview scrolls in a child of its own, so PageUp/PageDown page the file
+    // and the four lines above stay where they are.
+    ImGui::BeginChild("##qvbody", ImVec2(0, 0));
+    if (pane.qv_row != pane.selected) {
+        pane.qv_row = pane.selected;
+        ImGui::SetScrollY(0.0f);
+    }
     if (!is_directory(e->name, e->mode)) {
         // A picture first. Only when there is no picture to show does this row go
         // through the text path, so a photograph never gets a hex dump.
@@ -6952,6 +7028,20 @@ static void render_quick_view(AppPanes* app, Pane& pane) {
             }
         }
     }
+    if (pane.qv_page || pane.qv_line) {
+        // A page is the visible height less a line, so the line at the bottom
+        // is still in sight at the top after PageDown.
+        const float line = ImGui::GetTextLineHeightWithSpacing();
+        float page = ImGui::GetWindowHeight() - line;
+        if (page < line) page = line;
+        float y = ImGui::GetScrollY() + pane.qv_page * page + pane.qv_line * line;
+        if (y > ImGui::GetScrollMaxY()) y = ImGui::GetScrollMaxY();
+        if (y < 0.0f) y = 0.0f;
+        ImGui::SetScrollY(y);
+        pane.qv_page = 0;
+        pane.qv_line = 0;
+    }
+    ImGui::EndChild();
     ImGui::End();
 }
 
@@ -7624,6 +7714,7 @@ static void render_about(AppPanes* app) {
         "Shift+F3 view only the entry under the cursor\n"
         "F3 draws a picture as a picture; one this build cannot decode says which kind it is\n"
         "F3 reads an old .nfo's box drawing as CP437 when the bytes look like a drawing\n"
+        "F3 shows a PDF's text when pdftotext (poppler-utils) is installed\n"
         "Tab switch pane    Enter open/run   Backspace or Ctrl+PgUp parent\n"
         "Ctrl+PgDn open entry under cursor  Alt+Left/Right dir history\n"
         "Ctrl+T new tab     Ctrl+W close     Ctrl+Shift+W close all tabs\n"
@@ -7647,7 +7738,7 @@ static void render_about(AppPanes* app) {
         "Shift+Ctrl+F5 link in the other pane  Ctrl+L count marked  Alt+Shift+Enter dir sizes\n"
         "AltGr + letter quick search (Esc ends it)   Shift+F1 define the long view columns\n"
         "Ctrl+Shift+F8 tree in the panel   Shift+Tab split view: tree + list\n"
-        "ARCHIVES (zip, tar, tar.gz/bz2/xz, 7z, RAR read-only)\n"
+        "ARCHIVES (zip, tar, tar.gz/bz2/xz, 7z, RAR and ISO read-only)\n"
         "Enter on an archive browses it like a folder; .. or Backspace leaves it\n"
         "Alt+F5 pack        Alt+Shift+F5 pack and remove the sources\n"
         "Alt+F6 extract into the other pane   Alt+F9 extract into this one\n"
@@ -11189,6 +11280,18 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     }
 
     // ---- navigation (all moves walk the visible rows, i.e. the filter) ----
+    // With F3 open on this pane, PageUp/PageDown and Up/Down scroll the preview,
+    // not the list, the way they do in the full viewer.
+    if (active.quick_view && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
+        if (key == SDLK_PAGEUP || key == SDLK_PAGEDOWN) {
+            active.qv_page += key == SDLK_PAGEDOWN ? 1 : -1;
+            return;
+        }
+        if (key == SDLK_UP || key == SDLK_DOWN) {
+            active.qv_line += key == SDLK_DOWN ? 1 : -1;
+            return;
+        }
+    }
     if (key == SDLK_UP) {
         if (shift) toggle_mark(active, active.selected);
         int n = nav_step(active, active.selected, -1);
@@ -11308,6 +11411,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         }
         // A pane waiting on a site stops waiting.
         if (browse_cancel_pane(app, &active)) return;
+        // The F3 window is over everything below, so it goes next: the active
+        // pane's first, then the other pane's.
+        Pane& other = app->left_focus ? app->right : app->left;
+        if (active.quick_view) { active.quick_view = false; return; }
+        if (other.quick_view)  { other.quick_view = false; return; }
         // A quick filter is cleared before the command line (TC Esc).
         if (active.filter_active || active.filter[0] || active.filter_exec_only) {
             active.filter[0] = '\0';
