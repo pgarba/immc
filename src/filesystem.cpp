@@ -39,10 +39,13 @@ void file_entry_free(FileEntry* entry) {
 }
 
 static int g_sort_mode = FS_SORT_NAME;
+static bool g_sort_desc = false;
 static bool g_show_hidden = false;
 
 void fs_set_sort_mode(int mode) { g_sort_mode = mode; }
 int  fs_get_sort_mode()        { return g_sort_mode; }
+void fs_set_sort_desc(bool d)  { g_sort_desc = d; }
+bool fs_get_sort_desc()        { return g_sort_desc; }
 void fs_set_show_hidden(bool s){ g_show_hidden = s; }
 bool fs_get_show_hidden()      { return g_show_hidden; }
 
@@ -75,22 +78,23 @@ int compare_files(const void* a, const void* b) {
     bool b_dir = S_ISDIR(fb->mode);
     if (a_dir != b_dir) return a_dir ? -1 : 1;
     
+    int r = 0;
     switch (g_sort_mode) {
-    case FS_SORT_EXT: {
-        int r = strcasecmp(ext_of(fa->name), ext_of(fb->name));
-        if (r) return r;
-        return strcasecmp(fa->name, fb->name);
-    }
+    case FS_SORT_EXT:
+        r = strcasecmp(ext_of(fa->name), ext_of(fb->name));
+        break;
     case FS_SORT_SIZE:
-        if (fa->size != fb->size) return fa->size < fb->size ? -1 : 1;
-        return strcasecmp(fa->name, fb->name);
+        if (fa->size != fb->size) r = fa->size < fb->size ? -1 : 1;
+        break;
     case FS_SORT_DATE:
-        if (fa->mtime != fb->mtime) return fa->mtime < fb->mtime ? -1 : 1;
-        return strcasecmp(fa->name, fb->name);
-    case FS_SORT_NAME:
+        if (fa->mtime != fb->mtime) r = fa->mtime < fb->mtime ? -1 : 1;
+        break;
     default:
-        return strcasecmp(fa->name, fb->name);
+        break;
     }
+    // The name settles ties, and is the whole key for FS_SORT_NAME.
+    if (!r) r = strcasecmp(fa->name, fb->name);
+    return g_sort_desc ? -r : r;
 }
 
 void list_directory(const char* path, FileEntry*** out_entries, int* out_count) {

@@ -19,6 +19,10 @@ enum FsSortMode { FS_SORT_NAME = 0, FS_SORT_EXT, FS_SORT_SIZE, FS_SORT_DATE,
                   FS_SORT_NONE };
 void fs_set_sort_mode(int mode);
 int  fs_get_sort_mode();
+// Reverse the sort key (a second click on a column header, or the same Ctrl+F
+// key again). Directories stay in front either way, as Total Commander has them.
+void fs_set_sort_desc(bool desc);
+bool fs_get_sort_desc();
 void fs_set_show_hidden(bool show);   // Alt+. toggles dotfiles
 bool fs_get_show_hidden();
 

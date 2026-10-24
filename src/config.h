@@ -48,6 +48,7 @@ struct MCConfig {
     // Listing options, restored at startup and written back on exit.
     int   view_mode;      // 0 = mid, 1 = brief, 2 = full (AppView in panes.h)
     int   sort_mode;      // FsSortMode in filesystem.h
+    int   sort_desc;      // 1 = that key in reverse (Z-A, newest/biggest first)
     int   show_hidden;    // 1 = list dotfiles
     int   show_icons;     // 1 = a small icon in front of each name, as in TC
     int   show_launchbar; // 1 = the launch bar under the menu

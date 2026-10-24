@@ -611,6 +611,139 @@ static void test_enter_opens_default(AppPanes* app) {
     sh("rm -rf '" + dir + "'");
 }
 
+// Names of the real rows in the order the pane lists them ("..", folders first).
+static std::string row_order(const Pane& p) {
+    std::string s;
+    for (int i = 0; i < p.entry_count; i++) {
+        if (!strcmp(p.entries[i]->name, "..")) continue;
+        if (!s.empty()) s += ",";
+        s += p.entries[i]->name;
+    }
+    return s;
+}
+
+static void write_sized(const std::string& dir, const char* name, size_t bytes, time_t mtime) {
+    std::string path = dir + "/" + name;
+    FILE* f = fopen(path.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    for (size_t i = 0; i < bytes; i++) fputc('x', f);
+    fclose(f);
+    struct timespec ts[2];
+    ts[0].tv_sec = ts[1].tv_sec = mtime;
+    ts[0].tv_nsec = ts[1].tv_nsec = 0;
+    utimensat(AT_FDCWD, path.c_str(), ts, 0);
+}
+
+// Sorting: Ctrl+F3..F7, the Sort by menu and the column headers all go through
+// set_sort(). A new key starts names A-Z and dates/sizes newest/biggest first, the
+// same key again reverses it, directories stay on top both ways, and a click on a
+// header in the mid view sorts by that column.
+static void test_sort_headers(AppPanes* app) {
+    Pane& p = app->left;
+    app->left_focus = true;
+    std::string dir = test_mkdtemp("mc-sort");
+    write_sized(dir, "b.log", 300, 1700000000);   // biggest, oldest
+    write_sized(dir, "a.txt", 10,  1800000000);   // smallest, newest
+    write_sized(dir, "c.dat", 100, 1750000000);
+    mkdir((dir + "/zdir").c_str(), 0755);
+    mkdir((dir + "/adir").c_str(), 0755);
+    fs_set_sort_mode(FS_SORT_NAME);
+    fs_set_sort_desc(false);
+    refresh_pane(&p, dir.c_str());
+    CHECK(row_order(p) == "adir,zdir,a.txt,b.log,c.dat");
+
+    app_panes_handle_key(app, SDLK_F3, SDL_KMOD_CTRL);   // name again: reversed
+    CHECK(fs_get_sort_mode() == FS_SORT_NAME && fs_get_sort_desc());
+    CHECK(row_order(p) == "zdir,adir,c.dat,b.log,a.txt");
+    CHECK(strstr(app->status_msg, "name, descending") != nullptr);
+
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_CTRL);   // date: newest first
+    CHECK(fs_get_sort_mode() == FS_SORT_DATE && fs_get_sort_desc());
+    CHECK(row_order(p).find("a.txt,c.dat,b.log") != std::string::npos);
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_CTRL);   // oldest first
+    CHECK(!fs_get_sort_desc());
+    CHECK(row_order(p).find("b.log,c.dat,a.txt") != std::string::npos);
+
+    app_panes_handle_key(app, SDLK_F6, SDL_KMOD_CTRL);   // size: biggest first
+    CHECK(fs_get_sort_mode() == FS_SORT_SIZE && fs_get_sort_desc());
+    CHECK(row_order(p).find("b.log,c.dat,a.txt") != std::string::npos);
+
+    app_panes_handle_key(app, SDLK_F4, SDL_KMOD_CTRL);   // ext: A-Z
+    CHECK(fs_get_sort_mode() == FS_SORT_EXT && !fs_get_sort_desc());
+    CHECK(row_order(p) == "adir,zdir,c.dat,b.log,a.txt");
+
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_CTRL);   // unsorted never flips
+    app_panes_handle_key(app, SDLK_F7, SDL_KMOD_CTRL);
+    CHECK(fs_get_sort_mode() == FS_SORT_NONE && !fs_get_sort_desc());
+
+    // The direction is kept with the key in the config.
+    set_sort(app, FS_SORT_SIZE);
+    {
+        MCConfig cfg;
+        mc_config_default(&cfg);
+        app_panes_save_state(app, &cfg);
+        CHECK(cfg.sort_mode == FS_SORT_SIZE && cfg.sort_desc == 1);
+        fs_set_sort_mode(FS_SORT_NAME);
+        fs_set_sort_desc(false);
+        app_panes_apply_state(app, &cfg);
+        CHECK(fs_get_sort_mode() == FS_SORT_SIZE && fs_get_sort_desc());
+    }
+
+    // A click on the Date header of the left pane's mid view.
+    fs_set_sort_mode(FS_SORT_NAME);
+    fs_set_sort_desc(false);
+    refresh_pane(&p, dir.c_str());
+    int view_before = app->view_mode;
+    app->view_mode = VIEW_MID;
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1000, 600);
+    unsigned char* px = nullptr; int fw = 0, fh = 0, bpp = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &fw, &fh, &bpp);
+    auto frame = [app]() {
+        ImGui::NewFrame();
+        app_panes_render(app);
+        ImGui::Render();
+    };
+    frame(); frame();
+    ImGuiTable* left = nullptr;
+    for (int n = 0; n < ctx->Tables.GetMapSize(); n++) {
+        ImGuiTable* t = ctx->Tables.TryGetMapData(n);
+        if (!t || t->ColumnsCount != 3 || t->LastFrameActive != ctx->FrameCount) continue;
+        if (!left || t->OuterRect.Min.x < left->OuterRect.Min.x) left = t;
+    }
+    CHECK(left != nullptr);
+    if (left) {
+        CHECK(left->FreezeRowsRequest == 1);   // the header stays put while rows scroll
+        const ImGuiTableColumn& date = left->Columns[2];
+        ImVec2 at((date.MinX + date.MaxX) * 0.5f,
+                  left->OuterRect.Min.y + ImGui::GetTextLineHeightWithSpacing() * 0.5f);
+        io.AddMousePosEvent(at.x, at.y);
+        frame();
+        io.AddMouseButtonEvent(0, true);
+        frame();
+        io.AddMouseButtonEvent(0, false);
+        frame();
+        CHECK(fs_get_sort_mode() == FS_SORT_DATE && fs_get_sort_desc());
+        CHECK(row_order(p).find("a.txt,c.dat,b.log") != std::string::npos);
+        io.AddMouseButtonEvent(0, true);    // again: reversed
+        frame();
+        io.AddMouseButtonEvent(0, false);
+        frame();
+        CHECK(fs_get_sort_mode() == FS_SORT_DATE && !fs_get_sort_desc());
+        io.AddMousePosEvent(-1.0f, -1.0f);
+        frame();
+    }
+    ImGui::DestroyContext(ctx);
+    app->view_mode = view_before;
+
+    fs_set_sort_mode(FS_SORT_NAME);
+    fs_set_sort_desc(false);
+    sh("rm -rf '" + dir + "'");
+}
+
 // The launch bar: buttons are added (from a pane, a drop or the menu), kept in
 // <settings>/launchbar in their order, moved and removed; a click opens a folder
 // in the focused pane and hands anything else to the desktop.
@@ -4277,9 +4410,10 @@ static void test_pane_status_row(AppPanes* app, const std::string& root) {
                   chain <= main->MenuBarHeight + 2.0f * ImGui::GetStyle().ItemSpacing.y + 1.0f);
         }
         // page_size is measured from the child window, so PgUp/PgDn page shorter
-        // by the same row. Asserted against the window the pane was actually given.
-        CHECK(app->left.page_size  == (int)(lw->Size.y / row));
-        CHECK(app->right.page_size == (int)(rw->Size.y / row));
+        // by the same row. Asserted against the window the pane was actually given,
+        // less the column header row that the table freezes at its top.
+        CHECK(app->left.page_size  == (int)(lw->Size.y / row) - 1);
+        CHECK(app->right.page_size == (int)(rw->Size.y / row) - 1);
 
         // With the launch bar on, the same chain lands just under the bar instead:
         // the panes give up exactly its height and nothing is drawn over it.
@@ -6559,6 +6693,7 @@ int main() {
     test_archive_keys_live(&app, root);
     test_archive_browse(&app, root);
     test_enter_opens_default(&app);
+    test_sort_headers(&app);
     test_launch_bar(&app);
     test_archive_guards(&app, root);
     test_archive_f5_copy_out(&app, root);

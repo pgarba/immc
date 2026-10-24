@@ -45,6 +45,7 @@ void mc_config_default(MCConfig* c) {
     c->filter_preset[0] = '\0';
     c->view_mode = 0;      // VIEW_MID
     c->sort_mode = 0;      // FS_SORT_NAME
+    c->sort_desc = 0;
     c->show_hidden = 0;
     c->show_icons = 1;
     c->show_launchbar = 1;
@@ -139,6 +140,7 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "filter_preset")) snprintf(c->filter_preset, sizeof(c->filter_preset), "%s", val);
         else if (!strcmp(key, "view_mode"))   c->view_mode = atoi(val);
         else if (!strcmp(key, "sort_mode"))   c->sort_mode = atoi(val);
+        else if (!strcmp(key, "sort_desc"))   c->sort_desc = atoi(val) != 0;
         else if (!strcmp(key, "show_hidden")) c->show_hidden = atoi(val);
         else if (!strcmp(key, "show_icons"))  c->show_icons = atoi(val);
         else if (!strcmp(key, "show_launchbar")) c->show_launchbar = atoi(val);
@@ -255,12 +257,14 @@ void mc_config_save(const MCConfig* c) {
         "filter_preset = %s\n"
         "\n"
         "# Listing, restored at startup: view_mode 0=mid 1=brief 2=full,\n"
-        "# sort_mode 0=name 1=ext 2=size 3=date 4=unsorted, show_hidden 1=dotfiles\n"
+        "# sort_mode 0=name 1=ext 2=size 3=date 4=unsorted, sort_desc 1=reversed,\n"
+        "# show_hidden 1=dotfiles\n"
         "# trash 1 = Del/F8 goes to the desktop trash (Shift+Del is always direct)\n"
         "# show_icons 1 = a small icon in front of each name\n"
         "# show_launchbar 1 = the launch bar under the menu (its buttons: launchbar)\n"
         "view_mode = %d\n"
         "sort_mode = %d\n"
+        "sort_desc = %d\n"
         "show_hidden = %d\n"
         "show_icons = %d\n"
         "show_launchbar = %d\n"
@@ -273,7 +277,7 @@ void mc_config_save(const MCConfig* c) {
         "quickview_h = %d\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
         c->font, (double)c->font_size, c->hinting, c->theme,
-        c->filter_preset, c->view_mode, c->sort_mode, c->show_hidden, c->show_icons, c->show_launchbar, c->trash,
+        c->filter_preset, c->view_mode, c->sort_mode, c->sort_desc, c->show_hidden, c->show_icons, c->show_launchbar, c->trash,
         c->columns, c->qv_w, c->qv_h);
 
     fprintf(f,

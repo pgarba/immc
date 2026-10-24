@@ -297,7 +297,7 @@ the panes keep answering underneath it.
 
 | | |
 | --- | --- |
-| `Ctrl+F3`…`Ctrl+F7` | sort by name, extension, date, size, unsorted |
+| `Ctrl+F3`…`Ctrl+F7` | sort by name, extension, date, size, unsorted; the same key again reverses the order. Clicking a column header (Name, Ext, Size, Date) does the same, and an arrow marks the column and direction. Dates and sizes start newest and biggest first |
 | `Ctrl+S` | quick filter; `Ctrl+F10` clears it, `Ctrl+F11` is executables only, `Ctrl+F12` is the saved filter |
 | `Ctrl+B` | branch view: the subtree flattened into the pane |
 | `Ctrl+F8` `Alt+F10` | the directory tree |

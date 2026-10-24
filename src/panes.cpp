@@ -6442,6 +6442,76 @@ static float draw_row_icon(const AppPanes* app, const Pane& pane, int i, bool is
     return s + gap;
 }
 
+// Sort both panes by `mode` (an FsSortMode). Asking for the key already in use
+// flips its direction, as a second click on a Total Commander column header or a
+// second Ctrl+F5 does. A new key starts the way it is usually wanted: names and
+// extensions A to Z, dates newest first, sizes biggest first.
+static void set_sort(AppPanes* app, int mode) {
+    static const char* names[5] = { "name", "ext", "size", "date", "unsorted" };
+    if (mode == fs_get_sort_mode() && mode != FS_SORT_NONE) {
+        fs_set_sort_desc(!fs_get_sort_desc());
+    } else {
+        fs_set_sort_mode(mode);
+        fs_set_sort_desc(mode == FS_SORT_DATE || mode == FS_SORT_SIZE);
+    }
+    if (mode == FS_SORT_NONE)
+        snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: unsorted");
+    else
+        snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s, %s", names[mode],
+                 fs_get_sort_desc() ? "descending" : "ascending");
+    app_panes_refresh_left(app);
+    app_panes_refresh_right(app);
+}
+
+// The sort key a long-view column header stands for, -1 for one that sorts nothing.
+static int col_sort_key(int col) {
+    switch (col) {
+        case COL_NAME: return FS_SORT_NAME;
+        case COL_EXT:  return FS_SORT_EXT;
+        case COL_SIZE: return FS_SORT_SIZE;
+        case COL_DATE: return FS_SORT_DATE;
+        default:       return -1;
+    }
+}
+
+// The header row of the long and mid views: one button per column. A click sorts
+// by that column, a second click reverses it, and the column the panes are sorted
+// by carries a small arrow pointing the way the order runs.
+static void render_sort_headers(AppPanes* app, const int* col_order, int ncols) {
+    // The file rows blank the Header colors so hovering a row does not paint it;
+    // the header buttons want the real ones back to show they can be pressed.
+    const ImGuiStyle& st = ImGui::GetStyle();
+    ImGui::PushStyleColor(ImGuiCol_Header, st.Colors[ImGuiCol_Header]);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, st.Colors[ImGuiCol_HeaderHovered]);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, st.Colors[ImGuiCol_HeaderActive]);
+    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+    for (int k = 0; k < ncols; k++) {
+        ImGui::TableSetColumnIndex(k);
+        int key = col_sort_key(col_order[k]);
+        ImGui::PushID(k);
+        ImGui::TableHeader(k_col_label[col_order[k]]);   // a button with no return value
+        if (key >= 0 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) set_sort(app, key);
+        if (key >= 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip(key == fs_get_sort_mode() ? "Click to reverse the order"
+                                                        : "Click to sort by this column");
+        if (key >= 0 && key == fs_get_sort_mode()) {
+            ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            float h = ImGui::GetFontSize() * 0.35f;
+            float cx = mx.x - h - st.CellPadding.x, cy = (mn.y + mx.y) * 0.5f;
+            ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            if (fs_get_sort_desc())
+                dl->AddTriangleFilled(ImVec2(cx - h, cy - h * 0.5f), ImVec2(cx + h, cy - h * 0.5f),
+                                      ImVec2(cx, cy + h * 0.6f), col);
+            else
+                dl->AddTriangleFilled(ImVec2(cx - h, cy + h * 0.5f), ImVec2(cx, cy - h * 0.6f),
+                                      ImVec2(cx + h, cy + h * 0.5f), col);
+        }
+        ImGui::PopID();
+    }
+    ImGui::PopStyleColor(3);
+}
+
 // Drag-and-drop payloads: a local file or folder picked up from a pane row (its
 // full path, NUL-terminated), and a launch bar button being moved (its index).
 static const char* const k_dnd_path   = "IMMC_PATH";
@@ -6467,9 +6537,11 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
 
     // Clicking anywhere in the pane - below the last row, between rows, on the
     // scrollbar - makes it the active pane. Checked on the child window, because
-    // IsItemHovered() would refer to the widget before it.
-    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0))
+    // IsItemHovered() would refer to the widget before it; the long view's table
+    // is a window of its own inside it, hence ChildWindows.
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseClicked(0))
         app->left_focus = (&pane == &app->left);
+    const ImGuiID ctx_id = ImGui::GetID("ctxmenu");
 
     // The filter field is edited by ImGui, so re-apply the filter here, before
     // the rows are walked.
@@ -6501,8 +6573,13 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
             col_order[ncols++] = COL_SIZE;
             col_order[ncols++] = COL_DATE;
         }
+        // The table scrolls itself (ScrollY), so its header row can stay frozen at
+        // the top while the rows move under it. It fills the child, leaving a line
+        // for the "no entries match" note when the filter hides everything.
+        float table_h = pane.view.empty() ? -row_h : 0.0f;
         if (ImGui::BeginTable("##filetable", ncols,
-                              ImGuiTableFlags_NoBordersInBody | ImGuiTableFlags_SizingStretchProp)) {
+                              ImGuiTableFlags_NoBordersInBody | ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_ScrollY, ImVec2(0.0f, table_h))) {
             for (int k = 0; k < ncols; k++) {
                 int c = col_order[k];
                 if (c == COL_NAME)
@@ -6510,6 +6587,13 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                 else
                     ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthFixed, k_col_width[c]);
             }
+            ImGui::TableSetupScrollFreeze(0, 1);
+            // A page is what fits under the header in the table's own window.
+            if (row_h > 0) {
+                pane.page_size = (int)(ImGui::GetWindowSize().y / row_h) - 1;
+                if (pane.page_size < 1) pane.page_size = 1;
+            }
+            render_sort_headers(app, col_order, ncols);
 
             for (int r = 0; r < (int)pane.view.size(); r++) {
                 int i = pane.view[r];
@@ -6581,7 +6665,10 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                 if (rclick) {
                     pane.selected = i;
                     app->left_focus = (&pane == &app->left);
-                    ImGui::OpenPopup("ctxmenu");
+                    // By the id taken outside the table: in here the table's own
+                    // window is current, and "ctxmenu" would hash to a popup the
+                    // BeginPopup below never looks for.
+                    ImGui::OpenPopup(ctx_id);
                 }
                 if (clicked) {
                     pane.selected = i;
@@ -8976,14 +9063,9 @@ static void render_options_items(AppPanes* app) {
         static const int         keys[5] = { FS_SORT_NAME, FS_SORT_EXT, FS_SORT_DATE, FS_SORT_SIZE, FS_SORT_NONE };
         static const char*       names[5] = { "Name", "Extension", "Date", "Size", "Unsorted" };
         static const char*       hints[5] = { "Ctrl+F3", "Ctrl+F4", "Ctrl+F5", "Ctrl+F6", "Ctrl+F7" };
-        static const char*       short_[5] = { "name", "ext", "date", "size", "unsorted" };
         for (int i = 0; i < 5; i++) {
-            if (ImGui::MenuItem(names[i], hints[i], fs_get_sort_mode() == keys[i])) {
-                fs_set_sort_mode(keys[i]);
-                snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s", short_[i]);
-                app_panes_refresh_left(app);
-                app_panes_refresh_right(app);
-            }
+            if (ImGui::MenuItem(names[i], hints[i], fs_get_sort_mode() == keys[i]))
+                set_sort(app, keys[i]);
         }
         ImGui::EndMenu();
     }
@@ -9605,6 +9687,7 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->show_launchbar = app->show_launchbar ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
     cfg->sort_mode = fs_get_sort_mode();
+    cfg->sort_desc = fs_get_sort_desc() ? 1 : 0;
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
     snprintf(cfg->columns, sizeof(cfg->columns), "%s", app->columns);
     // The F3 window's size, so the preview is as big as the user left it. Its
@@ -9689,6 +9772,7 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
     if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
+    fs_set_sort_desc(cfg->sort_desc != 0);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
     // "ask" | "always" | "never", already validated by mc_config_load: a value it did
     // not recognise came back as "ask".
@@ -10870,15 +10954,11 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
         return;
     }
     // ---- TC sort keys: Ctrl+F3 name, Ctrl+F4 ext, Ctrl+F5 date, Ctrl+F6 size,
-    //      Ctrl+F7 unsorted (readdir order) ----
+    //      Ctrl+F7 unsorted (readdir order); the same key again reverses ----
     if ((mod & SDL_KMOD_CTRL) && key >= SDLK_F3 && key <= SDLK_F7) {
         static const int map[5] = { FS_SORT_NAME, FS_SORT_EXT, FS_SORT_DATE,
                                     FS_SORT_SIZE, FS_SORT_NONE };
-        static const char* names[5] = { "name", "ext", "date", "size", "unsorted" };
-        fs_set_sort_mode(map[key - SDLK_F3]);
-        snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s", names[key - SDLK_F3]);
-        app_panes_refresh_left(app);
-        app_panes_refresh_right(app);
+        set_sort(app, map[key - SDLK_F3]);
         return;
     }
     // TC Shift+F3: view only the entry under the cursor even when several are
