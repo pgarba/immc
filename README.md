@@ -551,7 +551,7 @@ preview naming the count of characters with no glyph. Pick a font that carries t
   shortcut reference this was written against, and Midnight Commander's source.
   Both are read for reference and neither is shipped here. `scripts/get-deps.sh`
   brings the one thing actually needed to build.
-- The state is honest about being unfinished: version `0.9.0`, and the plan names
+- The state is honest about being unfinished: version `0.10.0`, and the plan names
   what is still open.
 
 ## License
