@@ -316,6 +316,16 @@ int main(int argc, char** argv)
                     continue;
                 }
 
+                // The console's transcript, clicked into to mark some of it: the
+                // keys are the text's (Ctrl+C copies the marked part, Ctrl+A marks
+                // all, the arrows and Shift extend the mark), and Esc hides the
+                // console as it does from the field.
+                if (panes->console_open && panes->console_view_active) {
+                    if (k == SDLK_ESCAPE) app_panes_handle_key(panes, k, m);
+                    else ImGui_ImplSDL3_ProcessEvent(&event);
+                    continue;
+                }
+
                 // Navigation / function / shortcut keys are the app's;
                 // printable keys type into whatever field ImGui has the caret in.
                 if (app_key_is_special(k, m, panes)) {

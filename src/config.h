@@ -49,6 +49,14 @@ struct MCConfig {
     int   view_mode;      // 0 = mid, 1 = brief, 2 = full (AppView in panes.h)
     int   sort_mode;      // FsSortMode in filesystem.h
     int   sort_desc;      // 1 = that key in reverse (Z-A, newest/biggest first)
+    // The panes sort independently: sort_mode/sort_desc are the left pane's,
+    // these the right's. -1 (an older config) = the same as the left pane.
+    int   right_sort_mode;
+    int   right_sort_desc;
+    // Widths of the long view's fixed columns per pane, "ext,size,date,perms,type"
+    // in pixels; 0 or a missing value = the built-in width.
+    char  left_col_widths[128];
+    char  right_col_widths[128];
     int   show_hidden;    // 1 = list dotfiles
     int   show_icons;     // 1 = a small icon in front of each name, as in TC
     int   show_launchbar; // 1 = the launch bar under the menu

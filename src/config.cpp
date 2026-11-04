@@ -46,6 +46,10 @@ void mc_config_default(MCConfig* c) {
     c->view_mode = 0;      // VIEW_MID
     c->sort_mode = 0;      // FS_SORT_NAME
     c->sort_desc = 0;
+    c->right_sort_mode = -1;   // same as the left pane
+    c->right_sort_desc = -1;
+    c->left_col_widths[0] = '\0';
+    c->right_col_widths[0] = '\0';
     c->show_hidden = 0;
     c->show_icons = 1;
     c->show_launchbar = 1;
@@ -141,6 +145,12 @@ void mc_config_load(MCConfig* c) {
         else if (!strcmp(key, "view_mode"))   c->view_mode = atoi(val);
         else if (!strcmp(key, "sort_mode"))   c->sort_mode = atoi(val);
         else if (!strcmp(key, "sort_desc"))   c->sort_desc = atoi(val) != 0;
+        else if (!strcmp(key, "right_sort_mode")) c->right_sort_mode = atoi(val);
+        else if (!strcmp(key, "right_sort_desc")) c->right_sort_desc = atoi(val) != 0;
+        else if (!strcmp(key, "left_col_widths"))
+            snprintf(c->left_col_widths, sizeof(c->left_col_widths), "%s", val);
+        else if (!strcmp(key, "right_col_widths"))
+            snprintf(c->right_col_widths, sizeof(c->right_col_widths), "%s", val);
         else if (!strcmp(key, "show_hidden")) c->show_hidden = atoi(val);
         else if (!strcmp(key, "show_icons"))  c->show_icons = atoi(val);
         else if (!strcmp(key, "show_launchbar")) c->show_launchbar = atoi(val);
@@ -211,6 +221,11 @@ void mc_config_load(MCConfig* c) {
     if (c->right_tab_active < 0 || c->right_tab_active >= c->right_tab_count) c->right_tab_active = 0;
     if (c->view_mode < 0 || c->view_mode > 2) c->view_mode = 0;
     if (c->sort_mode < 0 || c->sort_mode > 4) c->sort_mode = 0;
+    if (c->right_sort_mode < 0 || c->right_sort_mode > 4) {
+        c->right_sort_mode = c->sort_mode;
+        c->right_sort_desc = c->sort_desc;
+    }
+    if (c->right_sort_desc < 0) c->right_sort_desc = c->sort_desc;
     c->show_hidden = c->show_hidden ? 1 : 0;
     c->show_icons = c->show_icons ? 1 : 0;
     c->show_launchbar = c->show_launchbar ? 1 : 0;
@@ -257,7 +272,8 @@ void mc_config_save(const MCConfig* c) {
         "filter_preset = %s\n"
         "\n"
         "# Listing, restored at startup: view_mode 0=mid 1=brief 2=full,\n"
-        "# sort_mode 0=name 1=ext 2=size 3=date 4=unsorted, sort_desc 1=reversed,\n"
+        "# sort_mode 0=name 1=ext 2=size 3=date 4=unsorted, sort_desc 1=reversed\n"
+        "# (sort_* is the left pane, right_sort_* the right pane),\n"
         "# show_hidden 1=dotfiles\n"
         "# trash 1 = Del/F8 goes to the desktop trash (Shift+Del is always direct)\n"
         "# show_icons 1 = a small icon in front of each name\n"
@@ -265,20 +281,27 @@ void mc_config_save(const MCConfig* c) {
         "view_mode = %d\n"
         "sort_mode = %d\n"
         "sort_desc = %d\n"
+        "right_sort_mode = %d\n"
+        "right_sort_desc = %d\n"
         "show_hidden = %d\n"
         "show_icons = %d\n"
         "show_launchbar = %d\n"
         "trash = %d\n"
         "\n# Columns of the long view (Shift+F1); name is always first\n"
         "columns = %s\n"
+        "# Widths in pixels of ext,size,date,perms,type per pane (0 = default);\n"
+        "# drag a column header's edge to change them\n"
+        "left_col_widths = %s\n"
+        "right_col_widths = %s\n"
         "\n# Size in pixels of the F3 quick view window (written on exit).\n"
         "# The window opens here next time; its position is left to the screen.\n"
         "quickview_w = %d\n"
         "quickview_h = %d\n",
         c->win_x, c->win_y, c->win_w, c->win_h,
         c->font, (double)c->font_size, c->hinting, c->theme,
-        c->filter_preset, c->view_mode, c->sort_mode, c->sort_desc, c->show_hidden, c->show_icons, c->show_launchbar, c->trash,
-        c->columns, c->qv_w, c->qv_h);
+        c->filter_preset, c->view_mode, c->sort_mode, c->sort_desc,
+        c->right_sort_mode, c->right_sort_desc, c->show_hidden, c->show_icons, c->show_launchbar, c->trash,
+        c->columns, c->left_col_widths, c->right_col_widths, c->qv_w, c->qv_h);
 
     fprintf(f,
         "\n# Pane tabs restored at startup (written on exit)\n"

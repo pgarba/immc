@@ -34,6 +34,7 @@
 #ifdef MC_HAVE_CURL
 #include <curl/curl.h>
 #endif
+#include "smb.h"
 
 // ---------------------------------------------------------------------------
 // Protocol vocabulary
@@ -45,6 +46,7 @@ const char* net_proto_name(NetProto p) {
         case NET_FTPS:          return "FTPS";
         case NET_FTPS_IMPLICIT: return "FTPS (implicit)";
         case NET_SFTP:          return "SFTP";
+        case NET_SMB:           return "SMB";
         default:                return "?";
     }
 }
@@ -55,6 +57,7 @@ const char* net_proto_key(NetProto p) {
         case NET_FTPS:          return "ftps";
         case NET_FTPS_IMPLICIT: return "ftps-implicit";
         case NET_SFTP:          return "sftp";
+        case NET_SMB:           return "smb";
         default:                return "ftp";
     }
 }
@@ -62,6 +65,7 @@ const char* net_proto_key(NetProto p) {
 const char* net_proto_scheme(NetProto p) {
     switch (p) {
         case NET_SFTP:          return "sftp://";
+        case NET_SMB:           return "smb://";
         case NET_FTPS:          return "ftps://";
         case NET_FTPS_IMPLICIT: return "ftps://";
         default:                return "ftp://";
@@ -72,6 +76,7 @@ int net_proto_port(NetProto p) {
     switch (p) {
         case NET_FTPS_IMPLICIT: return 990;
         case NET_SFTP:          return 22;
+        case NET_SMB:           return 445;
         case NET_FTPS:
         case NET_FTP:
         default:                return 21;
@@ -85,6 +90,7 @@ bool net_proto_of(const char* name, NetProto* out) {
     if (!strcmp(name, "ftps-implicit"))  { *out = NET_FTPS_IMPLICIT; return true; }
     if (!strcmp(name, "sftp"))           { *out = NET_SFTP;          return true; }
     if (!strcmp(name, "ssh"))            { *out = NET_SFTP;          return true; }
+    if (!strcmp(name, "smb"))            { *out = NET_SMB;           return true; }
     return false;
 }
 
@@ -96,6 +102,9 @@ int net_site_port(const NetSite& s) { return s.port > 0 ? s.port : net_proto_por
 
 std::string net_site_root(const NetSite& s) {
     std::string out = net_proto_scheme(s.proto);
+    // SMB spells a domain login "DOMAIN;user", as smbclient's own URLs do. The
+    // domain is part of who logs in, so it is part of the key too.
+    if (s.proto == NET_SMB && !s.domain.empty() && !s.user.empty()) out += s.domain + ";";
     if (!s.user.empty()) out += s.user + "@";
     // An IPv6 literal needs brackets or the port separator becomes ambiguous.
     if (s.host.find(':') != std::string::npos) out += "[" + s.host + "]";
@@ -174,10 +183,15 @@ static const struct { const char* scheme; NetProto proto; } kSchemes[] = {
     { "ftps://", NET_FTPS },
     { "sftp://", NET_SFTP },
     { "ssh://",  NET_SFTP },
+    { "smb://",  NET_SMB  },
 };
 
 static bool scheme_of(const char* path, NetProto* proto, const char** rest) {
     for (const auto& s : kSchemes) {
+        // smb:// is a site only where this program speaks SMB itself. On Windows,
+        // and in a build without libsmbclient, it stays the network path the pane
+        // code hands to the system (or to GVfs).
+        if (s.proto == NET_SMB && !smb_available()) continue;
         size_t n = strlen(s.scheme);
         if (!strncasecmp(path, s.scheme, n)) { *proto = s.proto; *rest = path + n; return true; }
     }
@@ -290,6 +304,14 @@ bool net_parse_url(const char* text, NetSite* out, std::string* err) {
             site.user = net_url_unescape(creds.substr(0, colon));
             site.password = net_url_unescape(creds.substr(colon + 1));
         }
+        // smb://DOMAIN;user@host, and the DOMAIN\user a Windows habit types.
+        if (site.proto == NET_SMB) {
+            size_t sep = site.user.find_first_of(";\\");
+            if (sep != std::string::npos) {
+                site.domain = site.user.substr(0, sep);
+                site.user = site.user.substr(sep + 1);
+            }
+        }
     }
     if (hostpart.size() >= 2 && hostpart[0] == '[') {
         size_t close = hostpart.find(']');
@@ -324,7 +346,8 @@ bool net_parse_url(const char* text, NetSite* out, std::string* err) {
     // FTP has a guest account by convention, so a URL with no user means it.
     // SFTP has no such convention; there curl falls back to the local user name,
     // which is the only guess worth making, so the field is left empty.
-    if (site.user.empty() && site.proto != NET_SFTP) site.user = "anonymous";
+    // SMB's guest is an empty user, which is what the server is asked for first.
+    if (site.user.empty() && site.proto != NET_SFTP && site.proto != NET_SMB) site.user = "anonymous";
     site.path = rpath == "/" ? "" : rpath;
 
     *out = site;
@@ -378,6 +401,7 @@ bool net_sites_load(std::vector<NetSite>* out, std::string* err) {
         else if (!strcmp(key, "host"))     site.host = val;
         else if (!strcmp(key, "port"))     site.port = atoi(val);
         else if (!strcmp(key, "user"))     site.user = val;
+        else if (!strcmp(key, "domain"))   site.domain = val;
         else if (!strcmp(key, "password")) site.password = val;
         else if (!strcmp(key, "remember")) site.remember = atoi(val) != 0;
         else if (!strcmp(key, "path"))     site.path = val;
@@ -430,7 +454,7 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err) {
         "# mc-clone remote sites\n"
         "#\n"
         "# One [site] block per site. proto is one of ftp, ftps, ftps-implicit,\n"
-        "# sftp. port 0 means the protocol's own default. verify_tls 0 connects to a\n"
+        "# sftp, smb (domain = the Windows domain of an SMB login). port 0 means the protocol's own default. verify_tls 0 connects to a\n"
         "# server whose certificate cannot be checked, and the UI says so while it\n"
         "# is in effect. threads is how many files a copy moves at once (1-10).\n"
         "# rar_order 1 sends RAR sets volume by volume (.rar .r00 .r01 ... .s00).\n"
@@ -447,6 +471,7 @@ bool net_sites_save(const std::vector<NetSite>& sites, std::string* err) {
         fprintf(f, "host = %s\n", s.host.c_str());
         fprintf(f, "port = %d\n", s.port);
         fprintf(f, "user = %s\n", s.user.c_str());
+        if (!s.domain.empty()) fprintf(f, "domain = %s\n", s.domain.c_str());
         if (s.remember && !s.password.empty()) fprintf(f, "password = %s\n", s.password.c_str());
         fprintf(f, "remember = %d\n", s.remember ? 1 : 0);
         fprintf(f, "path = %s\n", s.path.c_str());
@@ -1205,16 +1230,16 @@ static HandleCache& handle_cache(void) {
     return c;
 }
 
-bool net_available(void) { return true; }
+static bool ftp_available(void) { return true; }
 
-void net_what(char* out, size_t n) {
+static void ftp_what(char* out, size_t n) {
     curl_version_info_data* v = curl_version_info(CURLVERSION_NOW);
     const char* ssl = "no TLS";
     if (v && v->ssl_version) ssl = v->ssl_version;
     snprintf(out, n, "libcurl %s (%s)", v ? v->version : "?", ssl);
 }
 
-void net_forget(const NetSite* site) {
+static void ftp_forget(const NetSite* site) {
     std::string key = site ? net_site_root(*site) : std::string();
     HandleCache& c = handle_cache();
     for (size_t i = 0; i < c.entries.size();) {
@@ -1227,7 +1252,7 @@ void net_forget(const NetSite* site) {
     }
 }
 
-void net_forget_root(const char* root) {
+static void ftp_forget_root(const char* root) {
     if (!root || !*root) return;   // an empty root is not a site, and "every site" is not what was asked
     HandleCache& c = handle_cache();
     for (size_t i = 0; i < c.entries.size();) {
@@ -1242,8 +1267,8 @@ void net_forget_root(const char* root) {
 
 // Only safe once every transfer thread has been joined: this closes the
 // connections and then the library they belong to.
-void net_shutdown(void) {
-    net_forget(nullptr);
+static void ftp_shutdown(void) {
+    ftp_forget(nullptr);
     curl_global_once();
     curl_global_cleanup();
 }
@@ -1542,7 +1567,7 @@ static bool listing(const NetSite& site, const std::string& rpath, const char* c
     return true;
 }
 
-bool net_list(const NetSite& site, const std::string& rpath,
+static bool ftp_list(const NetSite& site, const std::string& rpath,
               std::vector<FileEntry>* out, std::string* err,
               fs_progress_fn cb, void* user) {
     out->clear();
@@ -1564,7 +1589,7 @@ bool net_list(const NetSite& site, const std::string& rpath,
     return false;
 }
 
-bool net_stat(const NetSite& site, const std::string& rpath, FileEntry* out, std::string* err) {
+static bool ftp_stat(const NetSite& site, const std::string& rpath, FileEntry* out, std::string* err) {
     memset(out, 0, sizeof(*out));
     if (!site.valid()) { if (err) *err = "no host"; return false; }
     // One listing of the parent, and the row whose name matches. There is no
@@ -1604,7 +1629,7 @@ static size_t read_file_cb(char* dest, size_t size, size_t nmemb, void* user) {
     return fread(dest, size, nmemb, s->f);
 }
 
-bool net_download(const NetSite& site, const std::string& rpath, const char* local,
+static bool ftp_download(const NetSite& site, const std::string& rpath, const char* local,
                   fs_progress_fn cb, void* user, std::string* err,
                   long long resume_from, long long* got) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
@@ -1689,7 +1714,7 @@ static size_t write_prefix_cb(char* ptr, size_t size, size_t nmemb, void* user) 
     return got;
 }
 
-bool net_download_prefix(const NetSite& site, const std::string& rpath, std::string* out,
+static bool ftp_download_prefix(const NetSite& site, const std::string& rpath, std::string* out,
                          size_t max_bytes, fs_progress_fn cb, void* user, std::string* err) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
     out->clear();
@@ -1716,7 +1741,7 @@ bool net_download_prefix(const NetSite& site, const std::string& rpath, std::str
     return false;
 }
 
-bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
+static bool ftp_upload(const NetSite& site, const std::string& rpath, const char* local,
                 fs_progress_fn cb, void* user, std::string* err,
                 long long resume_from) {
     if (!site.valid()) { if (err) *err = "no host"; return false; }
@@ -1816,7 +1841,7 @@ static bool quote_cmds(const NetSite& site, const std::string& parent,
     return true;
 }
 
-bool net_mkdir(const NetSite& site, const std::string& rpath, std::string* err) {
+static bool ftp_mkdir(const NetSite& site, const std::string& rpath, std::string* err) {
     std::string parent, base;
     split_remote(rpath, &parent, &base);
     if (base.empty()) { if (err) *err = "no name to create"; return false; }
@@ -1825,13 +1850,171 @@ bool net_mkdir(const NetSite& site, const std::string& rpath, std::string* err) 
     return quote_cmds(site, parent, { "MKD " + base }, err);
 }
 
-bool net_remove(const NetSite& site, const std::string& rpath, bool is_dir, std::string* err) {
+static bool ftp_remove(const NetSite& site, const std::string& rpath, bool is_dir, std::string* err) {
     std::string parent, base;
     split_remote(rpath, &parent, &base);
     if (base.empty()) { if (err) *err = "no name to delete"; return false; }
     return quote_cmds(site, parent, { (is_dir ? "RMD " : "DELE ") + base }, err);
 }
 
+static bool ftp_rename(const NetSite& site, const std::string& rpath, const char* new_name,
+                std::string* err) {
+    std::string parent, base;
+    split_remote(rpath, &parent, &base);
+    if (base.empty() || !new_name || !*new_name) { if (err) *err = "nothing to rename"; return false; }
+    if (strchr(new_name, '/')) { if (err) *err = "a new name cannot contain /"; return false; }
+    // RNFR and RNTO have to arrive as a pair, which one QUOTE list guarantees.
+    return quote_cmds(site, parent, { "RNFR " + base, "RNTO " + std::string(new_name) }, err);
+}
+
+static bool ftp_chmod(const NetSite& site, const std::string& rpath, int mode, std::string* err) {
+    std::string parent, base;
+    split_remote(rpath, &parent, &base);
+    if (base.empty()) { if (err) *err = "no name to change"; return false; }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "SITE CHMOD %03o %s", mode & 07777, base.c_str());
+    // Not every server implements SITE CHMOD. The server's own reply is what
+    // the caller shows, rather than a generic failure that hides the reason.
+    return quote_cmds(site, parent, { buf }, err);
+}
+
+#else  // ---------------------------------------------------------------------
+// A build without libcurl. The vocabulary, the sites file and the parsers above
+// still work, so the dialogs and the tests behave the same and only the
+// transport says no. This is the same shape as a build without FreeType.
+// ---------------------------------------------------------------------------
+
+static bool ftp_available(void) { return false; }
+
+static void ftp_what(char* out, size_t n) {
+    snprintf(out, n, "no FTP support in this build");
+}
+
+static void ftp_forget(const NetSite*) {}
+static void ftp_forget_root(const char*) {}
+static void ftp_shutdown(void) {}
+
+static const char* const kNoCurl = "this build has no FTP support: install libcurl and rebuild";
+
+static bool no_curl(std::string* err) {
+    if (err) *err = kNoCurl;
+    return false;
+}
+
+static bool ftp_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, std::string* err,
+              fs_progress_fn, void*) {
+    out->clear();
+    return no_curl(err);
+}
+static bool ftp_stat(const NetSite&, const std::string&, FileEntry*, std::string* err) { return no_curl(err); }
+static bool ftp_download(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
+                  long long, long long*) { return no_curl(err); }
+static bool ftp_upload(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
+                long long) { return no_curl(err); }
+static bool ftp_download_prefix(const NetSite&, const std::string&, std::string* out, size_t, fs_progress_fn, void*, std::string* err) {
+    out->clear();
+    return no_curl(err);
+}
+static bool ftp_mkdir(const NetSite&, const std::string&, std::string* err) { return no_curl(err); }
+static bool ftp_remove(const NetSite&, const std::string&, bool, std::string* err) { return no_curl(err); }
+static bool ftp_rename(const NetSite&, const std::string&, const char*, std::string* err) { return no_curl(err); }
+static bool ftp_chmod(const NetSite&, const std::string&, int, std::string* err) { return no_curl(err); }
+
+#endif // MC_HAVE_CURL
+
+// ---------------------------------------------------------------------------
+// The public transport: each call goes to the backend the site's protocol needs.
+// FTP, FTPS and SFTP are libcurl (above); SMB is libsmbclient (smb.cpp).
+// ---------------------------------------------------------------------------
+
+bool net_proto_available(NetProto p) {
+    return p == NET_SMB ? smb_available() : ftp_available();
+}
+
+bool net_available(void) { return ftp_available() || smb_available(); }
+
+void net_what(char* out, size_t n) {
+    char ftp[128], smb[96];
+    ftp_what(ftp, sizeof ftp);
+    smb_what(smb, sizeof smb);
+    snprintf(out, n, "%s; %s", ftp, smb);
+}
+
+void net_forget(const NetSite* site) {
+    if (!site || site->proto != NET_SMB) ftp_forget(site);
+    if (!site || site->proto == NET_SMB) smb_forget(site ? net_site_root(*site).c_str() : nullptr);
+}
+
+void net_forget_root(const char* root) {
+    if (!root || !*root) return;
+    ftp_forget_root(root);
+    smb_forget(root);
+}
+
+void net_shutdown(void) {
+    ftp_shutdown();
+    smb_shutdown();
+}
+
+bool net_list(const NetSite& site, const std::string& rpath,
+              std::vector<FileEntry>* out, std::string* err,
+              fs_progress_fn cb, void* user) {
+    if (site.proto == NET_SMB) return smb_list(site, rpath, out, err, cb, user);
+    return ftp_list(site, rpath, out, err, cb, user);
+}
+
+bool net_stat(const NetSite& site, const std::string& rpath, FileEntry* out, std::string* err) {
+    if (site.proto == NET_SMB) return smb_stat(site, rpath, out, err);
+    return ftp_stat(site, rpath, out, err);
+}
+
+bool net_download(const NetSite& site, const std::string& rpath, const char* local,
+                  fs_progress_fn cb, void* user, std::string* err,
+                  long long resume_from, long long* got) {
+    if (site.proto == NET_SMB) return smb_download(site, rpath, local, cb, user, err, resume_from, got);
+    return ftp_download(site, rpath, local, cb, user, err, resume_from, got);
+}
+
+bool net_download_prefix(const NetSite& site, const std::string& rpath, std::string* out,
+                         size_t max_bytes, fs_progress_fn cb, void* user, std::string* err) {
+    if (site.proto == NET_SMB) return smb_download_prefix(site, rpath, out, max_bytes, cb, user, err);
+    return ftp_download_prefix(site, rpath, out, max_bytes, cb, user, err);
+}
+
+bool net_upload(const NetSite& site, const std::string& rpath, const char* local,
+                fs_progress_fn cb, void* user, std::string* err, long long resume_from) {
+    if (site.proto == NET_SMB) return smb_upload(site, rpath, local, cb, user, err, resume_from);
+    return ftp_upload(site, rpath, local, cb, user, err, resume_from);
+}
+
+bool net_mkdir(const NetSite& site, const std::string& rpath, std::string* err) {
+    if (site.proto == NET_SMB) return smb_mkdir(site, rpath, err);
+    return ftp_mkdir(site, rpath, err);
+}
+
+bool net_remove(const NetSite& site, const std::string& rpath, bool is_dir, std::string* err) {
+    if (site.proto == NET_SMB) return smb_remove(site, rpath, is_dir, err);
+    return ftp_remove(site, rpath, is_dir, err);
+}
+
+bool net_rename(const NetSite& site, const std::string& rpath, const char* new_name,
+                std::string* err) {
+    if (site.proto == NET_SMB) return smb_rename(site, rpath, new_name, err);
+    return ftp_rename(site, rpath, new_name, err);
+}
+
+bool net_chmod(const NetSite& site, const std::string& rpath, int mode, std::string* err) {
+    if (site.proto == NET_SMB) return smb_chmod(site, rpath, mode, err);
+    return ftp_chmod(site, rpath, mode, err);
+}
+
+const char* const kNetLoginRefused = "login refused";
+
+bool net_login_refused(const std::string& err) {
+    return err.compare(0, strlen(kNetLoginRefused), kNetLoginRefused) == 0;
+}
+
+// The tree operations are built on the calls above, so they serve every protocol.
 // FTP has no recursive delete, so a directory goes only after everything inside
 // it: list, take out the deepest entries first, then the directory itself.
 bool net_remove_tree(const NetSite& site, const std::string& rpath,
@@ -1964,70 +2147,3 @@ bool net_upload_tree(const NetSite& site, const char* local, const std::string& 
     return ok;
 }
 
-bool net_rename(const NetSite& site, const std::string& rpath, const char* new_name,
-                std::string* err) {
-    std::string parent, base;
-    split_remote(rpath, &parent, &base);
-    if (base.empty() || !new_name || !*new_name) { if (err) *err = "nothing to rename"; return false; }
-    if (strchr(new_name, '/')) { if (err) *err = "a new name cannot contain /"; return false; }
-    // RNFR and RNTO have to arrive as a pair, which one QUOTE list guarantees.
-    return quote_cmds(site, parent, { "RNFR " + base, "RNTO " + std::string(new_name) }, err);
-}
-
-bool net_chmod(const NetSite& site, const std::string& rpath, int mode, std::string* err) {
-    std::string parent, base;
-    split_remote(rpath, &parent, &base);
-    if (base.empty()) { if (err) *err = "no name to change"; return false; }
-    char buf[64];
-    snprintf(buf, sizeof(buf), "SITE CHMOD %03o %s", mode & 07777, base.c_str());
-    // Not every server implements SITE CHMOD. The server's own reply is what
-    // the caller shows, rather than a generic failure that hides the reason.
-    return quote_cmds(site, parent, { buf }, err);
-}
-
-#else  // ---------------------------------------------------------------------
-// A build without libcurl. The vocabulary, the sites file and the parsers above
-// still work, so the dialogs and the tests behave the same and only the
-// transport says no. This is the same shape as a build without FreeType.
-// ---------------------------------------------------------------------------
-
-bool net_available(void) { return false; }
-
-void net_what(char* out, size_t n) {
-    snprintf(out, n, "no FTP support in this build");
-}
-
-void net_forget(const NetSite*) {}
-void net_forget_root(const char*) {}
-void net_shutdown(void) {}
-
-static const char* const kNoCurl = "this build has no FTP support: install libcurl and rebuild";
-
-static bool no_curl(std::string* err) {
-    if (err) *err = kNoCurl;
-    return false;
-}
-
-bool net_list(const NetSite&, const std::string&, std::vector<FileEntry>* out, std::string* err,
-              fs_progress_fn, void*) {
-    out->clear();
-    return no_curl(err);
-}
-bool net_stat(const NetSite&, const std::string&, FileEntry*, std::string* err) { return no_curl(err); }
-bool net_download(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
-                  long long, long long*) { return no_curl(err); }
-bool net_upload(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err,
-                long long) { return no_curl(err); }
-bool net_download_prefix(const NetSite&, const std::string&, std::string* out, size_t, fs_progress_fn, void*, std::string* err) {
-    out->clear();
-    return no_curl(err);
-}
-bool net_mkdir(const NetSite&, const std::string&, std::string* err) { return no_curl(err); }
-bool net_remove(const NetSite&, const std::string&, bool, std::string* err) { return no_curl(err); }
-bool net_remove_tree(const NetSite&, const std::string&, fs_progress_fn, void*, std::string* err) { return no_curl(err); }
-bool net_download_tree(const NetSite&, const std::string&, const char*, fs_progress_fn, void*, std::string* err, bool) { return no_curl(err); }
-bool net_upload_tree(const NetSite&, const char*, const std::string&, fs_progress_fn, void*, std::string* err, bool) { return no_curl(err); }
-bool net_rename(const NetSite&, const std::string&, const char*, std::string* err) { return no_curl(err); }
-bool net_chmod(const NetSite&, const std::string&, int, std::string* err) { return no_curl(err); }
-
-#endif // MC_HAVE_CURL

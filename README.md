@@ -44,11 +44,12 @@ OpenGL 3 implementation. Two optional dependencies change what the app can do:
 | dependency | what it turns on |
 | --- | --- |
 | libcurl | FTP, FTPS and SFTP: browsing sites, and copy/move that runs on a thread |
+| libsmbclient | SMB shares on Linux (`smb://server/share`, `\\server\share`) without GVfs: browsing, copy/move, login dialog |
 | FreeType | the font hinting modes the Options dialog offers |
 
 On a Debian-ish box:
 
-    apt install cmake g++ libcurl4-openssl-dev libfreetype-dev
+    apt install cmake g++ libcurl4-openssl-dev libsmbclient-dev libfreetype-dev
 
 SDL3 is the one dependency that may not be packaged. Ubuntu 24.04, which is
 what GitHub's `ubuntu-latest` runner is, has no `libsdl3-dev` at all. Check
@@ -188,7 +189,7 @@ Ten suites, a little over 3,100 checks between them:
 | `version` | `immc --version`, which runs before SDL is initialised |
 
 Three of them skip half their work rather than failing for want of an environment,
-and say so on the way out: `remote` without libcurl or a startable fixture, `img` and
+and say so on the way out: `remote` without libcurl or a startable fixture (the SMB half needs `smbd` and `pdbedit` from the samba package), `img` and
 `panes` without the fetched decoder, `texture` and `gl-preview` without a display. A
 check that cannot run announces itself. The no-libcurl configuration is verified as a
 first-class build, not assumed:
@@ -278,7 +279,9 @@ runs it and puts its output in the console.
 | `Alt+PgUp` `Alt+PgDn` | walk the history |
 | `Ctrl+P` | put the pane's path in the console |
 | `Alt+C` | open it with `cd ` already typed |
-| `cd` `pwd` `clear` `history` `exit` | builtins. `cd` moves the console only, not the panes; until the first `cd`, commands run in the focused pane's directory. The line at the top of the window says where the next command runs |
+| `Tab` | complete the word under the caret: a command (the builtins and programs on `PATH`) as the first word, a file or folder name after it. Several matches fill in what they share and are listed under the transcript |
+| mouse, `Ctrl+A`, `Ctrl+C` | the transcript is text: drag over it (or click it and `Ctrl+A`) and `Ctrl+C` copies |
+| `cd` `pwd` `clear` `history` `exit` | builtins. `exit` (or `quit`) closes the console, not immc. `cd` moves the console only, not the panes; `cd` moves the console only, not the panes; until the first `cd`, commands run in the focused pane's directory. The line at the top of the window says where the next command runs |
 
 Anything else goes to `/bin/sh`, so pipes and redirection work. A command runs on a
 worker thread: a `find` that takes a minute shows its results during the minute and
@@ -297,7 +300,7 @@ the panes keep answering underneath it.
 
 | | |
 | --- | --- |
-| `Ctrl+F3`…`Ctrl+F7` | sort by name, extension, date, size, unsorted; the same key again reverses the order. Clicking a column header (Name, Ext, Size, Date) does the same, and an arrow marks the column and direction. Dates and sizes start newest and biggest first |
+| `Ctrl+F3`…`Ctrl+F7` | sort by name, extension, date, size, unsorted; the same key again reverses the order. Clicking a column header (Name, Ext, Size, Date) does the same, and an arrow marks the column and direction. Dates and sizes start newest and biggest first. Each pane keeps its own sort order. Drag the edge of a column header to change that column's width (kept per pane in the config) |
 | `Ctrl+S` | quick filter; `Ctrl+F10` clears it, `Ctrl+F11` is executables only, `Ctrl+F12` is the saved filter |
 | `Ctrl+B` | branch view: the subtree flattened into the pane |
 | `Ctrl+F8` `Alt+F10` | the directory tree |
@@ -321,7 +324,7 @@ the panes keep answering underneath it.
 | `Commands → Connection log` | every command sent to a server and every reply, with passwords blanked; it opens by itself on a connect |
 | `Commands → Verify SFV` | check the focused pane's directory against the `.sfv` in it |
 | `cd ftp://…` | go there in the active pane |
-| `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux they go through GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
+| `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux immc speaks SMB itself through libsmbclient: it tries the guest account first, and a share that turns it away brings up a login dialog (user, domain, password, and "remember", which saves it with the remote sites; `Ctrl+F` can also add SMB sites). Copy, move, delete, rename and quick view work as on an FTP site. A build without libsmbclient falls back to GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
 | `Alt+F5` | pack the marked entries into an archive |
 | `Alt+F6` | extract an archive into the other pane |
 | `Alt+F9` | test an archive |
@@ -367,15 +370,19 @@ the answer is Resume / Start over / Skip (`R / S / Esc`), and a resumed download
 up from the `<name>.part` beside the target rather than from the beginning.
 
 When a target already exists the question has three answers — **Overwrite**, **Skip**,
-**Rename** (`Y / N / R`, `Esc` cancels the whole operation). Rename writes beside the
+**Rename** (`Y / N / R`, `Esc` cancels the whole operation). As in every question
+dialog, the arrow keys and `Tab` move between the buttons and `Enter` presses the
+outlined one. Rename writes beside the
 existing file: `name.ext` becomes `name (2).ext`, then `(3)`.
 
 A download that lands in a folder holding a `.sfv` offers to verify against it:
 **Verify / Not now / Always** (`V / N / A`). Verification runs on a thread, counts up
 in the strip, and reports mismatched and missing files in a window. `Commands →
 Verify SFV` runs the same check on the focused pane's directory with no fetching
-involved, and the report's **Re-fetch the bad ones** rebuilds the failed names out of
-the transfer that fetched them. The behaviour after a download is a line in the config
+involved; right-clicking a `.sfv` file and choosing **Verify files against this SFV**
+checks against that one in particular. A clean result is just a line in the status
+bar; problems open the report, whose **Re-fetch the bad ones** rebuilds the failed
+names out of the transfer that fetched them. The behaviour after a download is a line in the config
 file:
 
     sfv_verify = ask      # ask | always | never

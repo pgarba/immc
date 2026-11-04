@@ -350,7 +350,36 @@ static const NetSite* net_site_for(const std::string& root) {
             loose = &s;
         }
     }
-    return loose;
+    // An SMB guest entry is only the fallback: a login for that server, once
+    // given, is what a path with no user means from then on.
+    if (loose && !(loose->proto == NET_SMB && loose->user.empty())) return loose;
+    // An SMB path names no login more often than not - \\server\share typed, a
+    // hotlist entry, a restored tab - and Windows answers that with the login it
+    // already has for the server. So does this: a site for the same server, a
+    // saved one first. With none, the server is asked for its guest account, and a
+    // refusal brings up the login dialog (smb_login_ask).
+    NetSite want;
+    std::string err;
+    if (strncasecmp(root.c_str(), "smb://", 6) || !net_parse_url(root.c_str(), &want, &err) ||
+        !want.user.empty())
+        return loose;
+    for (const std::vector<NetSite>* list : lists) {
+        if (!list) continue;
+        for (const NetSite& s : *list)
+            if (s.proto == NET_SMB && !s.user.empty() &&
+                !strcasecmp(s.host.c_str(), want.host.c_str()) &&
+                net_site_port(s) == net_site_port(want))
+                return &s;
+    }
+    if (loose) return loose;
+    // Guests live as long as the program: the pointer handed out has to stay valid
+    // for as long as a caller holds it, which a deque that only grows guarantees.
+    static std::deque<NetSite> guests;
+    for (const NetSite& g : guests)
+        if (net_site_root(g) == root) return &g;
+    want.path.clear();
+    guests.push_back(want);
+    return &guests.back();
 }
 
 // Build the rows for one directory on a site. The listing arrives with names,
@@ -966,7 +995,7 @@ static bool smb_resolve(const std::string& url, std::string* local,
 // nothing above it: that goes home.
 static void pane_parent(const char* dir, char* out, size_t n) {
 #ifndef _WIN32
-    if (smb_is_url(dir)) {
+    if (smb_is_url(dir) && !net_is_remote(dir)) {
         snprintf(out, n, "%s", plat_home_dir().c_str());
         return;
     }
@@ -1039,7 +1068,15 @@ static void normalize_pane_path(const char* in, char* out, size_t n) {
     snprintf(out, n, "%s", r.c_str());
 }
 
+// The listing helpers (list_directory, compare_files) read the sort key from
+// filesystem.cpp; each pane has its own, so it is handed over before every sort.
+static void use_pane_sort(const Pane* pane) {
+    fs_set_sort_mode(pane->sort_mode);
+    fs_set_sort_desc(pane->sort_desc);
+}
+
 void refresh_pane(Pane* pane, const char* path) {
+    use_pane_sort(pane);
     // Every path a pane holds comes through this one door, which is the only place
     // the spelling has to be fixed once. `path` is often `pane->current_dir` itself,
     // so the result goes into its own buffer rather than being written back.
@@ -1084,7 +1121,9 @@ void refresh_pane(Pane* pane, const char* path) {
     pane->rel.clear();
     bool smb_listed = false;   // the listing is a server's shares, or a failure to reach it
 #ifndef _WIN32
-    if (smb_is_url(norm)) {
+    // GVfs is the fallback for a build without libsmbclient; with it, smb:// is a
+    // site like any other and net_split_virtual() below takes it.
+    if (smb_is_url(norm) && !net_is_remote(norm)) {
         std::string local, err;
         std::vector<std::string> shares;
         if (!smb_resolve(norm, &local, &shares, &err)) {
@@ -1938,9 +1977,16 @@ static void console_run(AppPanes* app) {
     Pane& active = app->left_focus ? app->left : app->right;
     const std::string cwd = console_cwd(app);
 
+    // `exit` leaves the console, as it leaves a shell - not the file manager the
+    // console is a window of. Alt+F4 is what quits immc.
     if (strcmp(c, "exit") == 0 || strcmp(c, "quit") == 0) {
-        console_push(app, cwd, c, "", -1, true);
-        app->quit_request = true;
+        app->console_open = false;
+        app->console_field_active = false;
+        app->console_view_active = false;
+        app->console_hist_open = false;
+        if (ImGui::GetCurrentContext()) ImGui::ClearActiveID();
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Console closed (Ctrl+Enter opens it again, Alt+F4 quits immc)");
         return;
     }
     if (strcmp(c, "clear") == 0) {
@@ -5069,6 +5115,7 @@ void app_panes_run_pending(AppPanes* app) {
         app->choice = CHOICE_NONE;
         app->choice_transfer = nullptr;
         app->choice_pick = -1;
+        app->choice_focus = 0;      // the next question starts on its first button
         app->choice_text[0] = '\0';
         if (pick == 0) bg_resume_remote(app, t, false);
         else if (pick == 1) bg_resume_remote(app, t, true);
@@ -5077,6 +5124,7 @@ void app_panes_run_pending(AppPanes* app) {
     if (app->pending_confirm_answer != CONF_ANS_NONE) {
         int answer = app->pending_confirm_answer;
         app->pending_confirm_answer = CONF_ANS_NONE;
+        app->confirm_focus = 0;     // the next question starts on its first button
         confirm_answer(app, answer);
     }
     if (!app->pending_op) return;
@@ -5324,6 +5372,28 @@ static void open_with_default(AppPanes* app, const char* fullpath) {
     snprintf(app->status_msg, sizeof(app->status_msg), "Open with default: %s", fullpath);
 }
 
+// The ".." row, Backspace and Ctrl+PgUp: one level up.
+static void go_up(AppPanes* app, Pane& pane) {
+    if (in_remote(pane)) {
+        // Up inside a site is one path component; up out of the site itself
+        // leaves it, back to wherever the pane was before the connect. The
+        // question is "is this the site root", not "is the path non-empty":
+        // net_path_parent() answers "" for the root, so a non-empty path one
+        // level down would otherwise step to the root and then sit there.
+        if (!net_path_is_root(pane.remote_path)) {
+            std::string up = net_path_parent(pane.remote_path);
+            navigate_to(app, &pane, net_virtual_path(pane.remote_root, up).c_str());
+        } else {
+            navigate_to(app, &pane, pane.remote_came_from[0] ? pane.remote_came_from
+                                                             : plat_home_dir().c_str());
+        }
+        return;
+    }
+    char parent[4096];
+    pane_parent(pane.current_dir, parent, sizeof(parent));
+    navigate_to(app, &pane, parent);
+}
+
 static void activate_entry(AppPanes* app, Pane& pane, int idx) {
     if (idx < 0 || idx >= pane.entry_count) return;
     FileEntry* e = pane.entries[idx];
@@ -5331,24 +5401,15 @@ static void activate_entry(AppPanes* app, Pane& pane, int idx) {
     char full[4100];
     snprintf(full, sizeof(full), "%s/%s", pane.current_dir, rel);
     if (strcmp(e->name, "..") == 0) {
+        go_up(app, pane);
+    } else if (is_directory(e->name, e->mode)) {
+        // On a site the join goes through the path rules: at the server root the
+        // pane's path ends in '/', and a second one would name a different place.
         if (in_remote(pane)) {
-            // Up inside a site is one path component; up out of the site itself
-            // leaves it, back to wherever the pane was before the connect. The
-            // question is "is this the site root", not "is the path non-empty":
-            // net_path_parent() answers "" for the root, so a non-empty path one
-            // level down would otherwise step to the root and then sit there.
-            if (!net_path_is_root(pane.remote_path)) {
-                std::string up = net_path_parent(pane.remote_path);
-                navigate_to(app, &pane, net_virtual_path(pane.remote_root, up).c_str());
-            } else {
-                navigate_to(app, &pane, pane.remote_came_from[0] ? pane.remote_came_from : "/");
-            }
+            std::string to = net_virtual_path(pane.remote_root, net_join_remote(pane.remote_path, rel));
+            navigate_to(app, &pane, to.c_str());
             return;
         }
-        char parent[4096];
-        pane_parent(pane.current_dir, parent, sizeof(parent));
-        navigate_to(app, &pane, parent);
-    } else if (is_directory(e->name, e->mode)) {
         char path[4100];
         snprintf(path, sizeof(path), "%s/%s", pane.current_dir, rel);
         navigate_to(app, &pane, path);
@@ -5695,6 +5756,27 @@ static const char* tab_label(const char* dir, char* buf, size_t n) {
     return buf;
 }
 
+static void open_properties(AppPanes* app, Pane& pane);
+
+// Is this row an .sfv checksum list, one the verifier can read from disk.
+static bool row_is_local_sfv(const Pane& pane, const FileEntry* e) {
+    if (in_remote(pane) || in_archive(pane) || S_ISDIR(e->mode)) return false;
+    size_t n = strlen(e->name);
+    return n > 4 && !strcasecmp(e->name + n - 4, ".sfv");
+}
+
+// Right-click on an .sfv: check the files it lists, in the folder it sits in,
+// against the CRC-32 it records. It runs on a thread; a clean result is a status
+// line, and missing or damaged files open the report window.
+static void sfv_verify_row(AppPanes* app, Pane& pane, int idx) {
+    char full[4300];
+    snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, idx));
+    std::string dir = full;
+    size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? std::string(pane.current_dir) : dir.substr(0, slash);
+    sfv_job_start(app, dir, full, nullptr, nullptr);
+}
+
 // Items shared by the right-click context menu and the F9 pane menu.
 static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     FileEntry* e = (pane.selected >= 0 && pane.selected < pane.entry_count)
@@ -5705,6 +5787,8 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     }
     if (ImGui::MenuItem("Open")) activate_entry(app, pane, pane.selected);
     if (ImGui::MenuItem("View")) view_entry(app, pane, pane.selected);
+    if (row_is_local_sfv(pane, e) && ImGui::MenuItem("Verify files against this SFV"))
+        sfv_verify_row(app, pane, pane.selected);
     if (!in_remote(pane) && !in_archive(pane) && ImGui::MenuItem("Add to launch bar")) {
         char full[4300];
         snprintf(full, sizeof(full), "%s/%s", pane.current_dir, entry_rel(pane, pane.selected));
@@ -5722,6 +5806,8 @@ static void render_entry_menu_items(AppPanes* app, Pane& pane) {
     if (ImGui::MenuItem("Delete")) request_delete(app, false);
     if (ImGui::MenuItem(app->trash_mode ? "Deletes go to trash" : "Deletes are always direct"))
         app->trash_mode = app->trash_mode ? 0 : 1;
+    ImGui::Separator();
+    if (ImGui::MenuItem("Properties", "Alt+Enter")) open_properties(app, pane);
 }
 
 // Both panes draw their strip into the same window, so the strip has to carry
@@ -6386,6 +6472,33 @@ enum FileCol { COL_NAME, COL_EXT, COL_SIZE, COL_DATE, COL_PERMS, COL_TYPE, COL_N
 static const char* k_col_key[COL_N]   = { "name", "ext", "size", "date", "perms", "type" };
 static const char* k_col_label[COL_N] = { "Name", "Ext", "Size", "Date", "Perms", "Type" };
 static const float k_col_width[COL_N] = { 0.0f, 70.0f, 75.0f, 100.0f, 80.0f, 55.0f };
+static_assert(COL_N == PANE_MAX_COLS, "Pane::col_w is indexed by FileCol");
+
+// The width a fixed column of `pane` is drawn at: what the user dragged it to,
+// else the built-in width.
+static float col_width(const Pane& pane, int c) {
+    return pane.col_w[c] > 0.0f ? pane.col_w[c] : k_col_width[c];
+}
+
+// Config form of a pane's column widths: "ext,size,date,perms,type" in pixels,
+// 0 for one never resized.
+static void col_widths_format(const Pane& pane, char* out, size_t n) {
+    size_t at = 0;
+    out[0] = '\0';
+    for (int c = 1; c < COL_N && at < n; c++)
+        at += (size_t)snprintf(out + at, n - at, "%s%d", c > 1 ? "," : "", (int)(pane.col_w[c] + 0.5f));
+}
+
+static void col_widths_parse(const char* spec, Pane& pane) {
+    for (int c = 0; c < COL_N; c++) pane.col_w[c] = 0.0f;
+    const char* p = spec;
+    for (int c = 1; c < COL_N && p && *p; c++) {
+        float w = (float)atof(p);
+        if (w >= 10.0f && w <= 2000.0f) pane.col_w[c] = w;
+        p = strchr(p, ',');
+        if (p) p++;
+    }
+}
 
 static void columns_parse(const char* spec, bool* on) {
     for (int c = 0; c < COL_N; c++) on[c] = false;
@@ -6548,25 +6661,30 @@ static float draw_row_icon(const AppPanes* app, const Pane& pane, int i, bool is
     return s + gap;
 }
 
-// Sort both panes by `mode` (an FsSortMode). Asking for the key already in use
-// flips its direction, as a second click on a Total Commander column header or a
-// second Ctrl+F5 does. A new key starts the way it is usually wanted: names and
-// extensions A to Z, dates newest first, sizes biggest first.
-static void set_sort(AppPanes* app, int mode) {
+// Sort `pane` by `mode` (an FsSortMode); the other pane keeps its own order.
+// Asking for the key already in use flips its direction, as a second click on a
+// Total Commander column header or a second Ctrl+F5 does. A new key starts the way
+// it is usually wanted: names and extensions A to Z, dates newest first, sizes
+// biggest first.
+static void set_sort(AppPanes* app, Pane* pane, int mode) {
     static const char* names[5] = { "name", "ext", "size", "date", "unsorted" };
-    if (mode == fs_get_sort_mode() && mode != FS_SORT_NONE) {
-        fs_set_sort_desc(!fs_get_sort_desc());
+    if (mode == pane->sort_mode && mode != FS_SORT_NONE) {
+        pane->sort_desc = !pane->sort_desc;
     } else {
-        fs_set_sort_mode(mode);
-        fs_set_sort_desc(mode == FS_SORT_DATE || mode == FS_SORT_SIZE);
+        pane->sort_mode = mode;
+        pane->sort_desc = (mode == FS_SORT_DATE || mode == FS_SORT_SIZE);
     }
     if (mode == FS_SORT_NONE)
         snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: unsorted");
     else
         snprintf(app->status_msg, sizeof(app->status_msg), "Sort by: %s, %s", names[mode],
-                 fs_get_sort_desc() ? "descending" : "ascending");
-    app_panes_refresh_left(app);
-    app_panes_refresh_right(app);
+                 pane->sort_desc ? "descending" : "ascending");
+    refresh_pane(pane, pane->current_dir);
+}
+
+// The focused pane: what the sort keys and the Sort by menu act on.
+static void set_sort(AppPanes* app, int mode) {
+    set_sort(app, app->left_focus ? &app->left : &app->right, mode);
 }
 
 // The sort key a long-view column header stands for, -1 for one that sorts nothing.
@@ -6583,7 +6701,7 @@ static int col_sort_key(int col) {
 // The header row of the long and mid views: one button per column. A click sorts
 // by that column, a second click reverses it, and the column the panes are sorted
 // by carries a small arrow pointing the way the order runs.
-static void render_sort_headers(AppPanes* app, const int* col_order, int ncols) {
+static void render_sort_headers(AppPanes* app, Pane& pane, const int* col_order, int ncols) {
     // The file rows blank the Header colors so hovering a row does not paint it;
     // the header buttons want the real ones back to show they can be pressed.
     const ImGuiStyle& st = ImGui::GetStyle();
@@ -6596,17 +6714,20 @@ static void render_sort_headers(AppPanes* app, const int* col_order, int ncols) 
         int key = col_sort_key(col_order[k]);
         ImGui::PushID(k);
         ImGui::TableHeader(k_col_label[col_order[k]]);   // a button with no return value
-        if (key >= 0 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) set_sort(app, key);
+        if (key >= 0 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            app->left_focus = (&pane == &app->left);
+            set_sort(app, &pane, key);
+        }
         if (key >= 0 && ImGui::IsItemHovered())
-            ImGui::SetTooltip(key == fs_get_sort_mode() ? "Click to reverse the order"
-                                                        : "Click to sort by this column");
-        if (key >= 0 && key == fs_get_sort_mode()) {
+            ImGui::SetTooltip(key == pane.sort_mode ? "Click to reverse the order"
+                                                    : "Click to sort by this column");
+        if (key >= 0 && key == pane.sort_mode) {
             ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
             float h = ImGui::GetFontSize() * 0.35f;
             float cx = mx.x - h - st.CellPadding.x, cy = (mn.y + mx.y) * 0.5f;
             ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            if (fs_get_sort_desc())
+            if (pane.sort_desc)
                 dl->AddTriangleFilled(ImVec2(cx - h, cy - h * 0.5f), ImVec2(cx + h, cy - h * 0.5f),
                                       ImVec2(cx, cy + h * 0.6f), col);
             else
@@ -6683,15 +6804,37 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
         // the top while the rows move under it. It fills the child, leaving a line
         // for the "no entries match" note when the filter hides everything.
         float table_h = pane.view.empty() ? -row_h : 0.0f;
-        if (ImGui::BeginTable("##filetable", ncols,
+        // One table per column set, so switching views or editing the set never
+        // hands a column the width of whichever one used to sit at its index.
+        char table_id[32];
+        unsigned col_mask = 0;
+        for (int k = 0; k < ncols; k++) col_mask |= 1u << col_order[k];
+        snprintf(table_id, sizeof(table_id), "##filetable%x", col_mask);
+        if (ImGui::BeginTable(table_id, ncols,
                               ImGuiTableFlags_NoBordersInBody | ImGuiTableFlags_SizingStretchProp |
-                              ImGuiTableFlags_ScrollY, ImVec2(0.0f, table_h))) {
+                              ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                              ImVec2(0.0f, table_h))) {
             for (int k = 0; k < ncols; k++) {
                 int c = col_order[k];
                 if (c == COL_NAME)
                     ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthStretch, 0.42f);
                 else
-                    ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthFixed, k_col_width[c]);
+                    ImGui::TableSetupColumn(k_col_label[c], ImGuiTableColumnFlags_WidthFixed, col_width(pane, c));
+            }
+            // Column widths: the pane holds them, so the mid and long views agree
+            // and the config can keep them. A border dragged this frame (ImGui has
+            // just applied it) is copied into the pane; otherwise the pane's widths
+            // are pushed into the table, which matters for a table built earlier
+            // for another view and resized since.
+            if (ImGuiTable* t = ImGui::GetCurrentTable()) {
+                bool dragged = t->LastResizedColumn >= 0;
+                for (int k = 0; k < ncols && k < t->ColumnsCount; k++) {
+                    int c = col_order[k];
+                    if (c == COL_NAME) continue;
+                    ImGuiTableColumn& col = t->Columns[k];
+                    if (dragged) pane.col_w[c] = col.WidthRequest;
+                    else         col.WidthRequest = col_width(pane, c);
+                }
             }
             ImGui::TableSetupScrollFreeze(0, 1);
             // A page is what fits under the header in the table's own window.
@@ -6699,7 +6842,7 @@ static void render_file_list_body(AppPanes* app, Pane& pane, bool focused) {
                 pane.page_size = (int)(ImGui::GetWindowSize().y / row_h) - 1;
                 if (pane.page_size < 1) pane.page_size = 1;
             }
-            render_sort_headers(app, col_order, ncols);
+            render_sort_headers(app, pane, col_order, ncols);
 
             for (int r = 0; r < (int)pane.view.size(); r++) {
                 int i = pane.view[r];
@@ -7230,6 +7373,212 @@ static void render_netlog(AppPanes* app) {
 // transcript is still there when it comes back, in another directory or after a
 // restart.
 
+// ---- Tab completion in the console ----
+// The word under the caret is completed the way a shell would: the first word of
+// the line is a command (the console's own, then programs on PATH), any later word
+// is a path, relative to the directory the console runs in. One match is put in
+// whole; several put in what they share and, on a Tab that adds nothing, are
+// listed under the transcript.
+
+static const char* const k_console_builtins[] = { "cd", "clear", "exit", "history", "pwd", "quit" };
+
+// The programs on PATH, read once: a Tab has to answer at once, and PATH does not
+// change under a running program.
+static const std::vector<std::string>& console_path_commands() {
+    static std::vector<std::string> cmds;
+    static bool loaded = false;
+    if (loaded) return cmds;
+    loaded = true;
+    const char* path = getenv("PATH");
+    if (!path) return cmds;
+#ifdef _WIN32
+    const char sep = ';';
+#else
+    const char sep = ':';
+#endif
+    std::set<std::string> seen;
+    std::string p = path;
+    size_t at = 0;
+    while (at <= p.size()) {
+        size_t end = p.find(sep, at);
+        if (end == std::string::npos) end = p.size();
+        std::string dir = p.substr(at, end - at);
+        at = end + 1;
+        if (dir.empty()) continue;
+        DIR* d = opendir(dir.c_str());
+        if (!d) continue;
+        while (struct dirent* de = readdir(d)) {
+            std::string name = de->d_name;
+            if (name.empty() || name[0] == '.') continue;
+#ifdef _WIN32
+            size_t dot = name.rfind('.');
+            if (dot == std::string::npos) continue;
+            std::string ext = name.substr(dot);
+            for (char& ch : ext) ch = (char)tolower((unsigned char)ch);
+            if (ext != ".exe" && ext != ".bat" && ext != ".cmd" && ext != ".com") continue;
+            name = name.substr(0, dot);
+#else
+            std::string full = dir + "/" + name;
+            struct stat st;
+            if (stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || access(full.c_str(), X_OK) != 0)
+                continue;
+#endif
+            seen.insert(name);
+        }
+        closedir(d);
+    }
+    cmds.assign(seen.begin(), seen.end());
+    return cmds;
+}
+
+// A name as it has to be typed: a space or a shell character is escaped.
+static std::string console_shell_escape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+#ifndef _WIN32
+        if (strchr(" \t'\"\\$`&;|<>()*?[]!#~{}", c)) out += '\\';
+#endif
+        out += c;
+    }
+    return out;
+}
+
+// The typed word with its escapes taken out, so it can be compared with names.
+static std::string console_shell_unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+#ifndef _WIN32
+        if (s[i] == '\\' && i + 1 < s.size()) { out += s[++i]; continue; }
+#endif
+        if (s[i] == '"' || s[i] == '\'') continue;
+        out += s[i];
+    }
+    return out;
+}
+
+static bool console_starts_with(const std::string& s, const std::string& prefix) {
+#ifdef _WIN32
+    return s.size() >= prefix.size() && !strncasecmp(s.c_str(), prefix.c_str(), prefix.size());
+#else
+    return s.compare(0, prefix.size(), prefix) == 0;
+#endif
+}
+
+// Complete `line` with the caret at `cursor`. Returns the new line and moves
+// `cursor`; fills `listed` with the candidates when there is more than one.
+static std::string console_complete(AppPanes* app, const std::string& line, int* cursor,
+                                    std::vector<std::string>* listed) {
+    listed->clear();
+    int cur = *cursor;
+    if (cur < 0 || cur > (int)line.size()) cur = (int)line.size();
+    // The word under the caret starts after the last unescaped blank before it.
+    int start = cur;
+    while (start > 0) {
+        char ch = line[(size_t)start - 1];
+        if ((ch == ' ' || ch == '\t') && !(start >= 2 && line[(size_t)start - 2] == '\\')) break;
+        start--;
+    }
+    bool first_word = true;
+    for (int i = 0; i < start; i++)
+        if (line[(size_t)i] != ' ' && line[(size_t)i] != '\t') { first_word = false; break; }
+    const std::string typed = console_shell_unescape(line.substr((size_t)start, (size_t)(cur - start)));
+
+    std::vector<std::string> cands;   // full replacements for the word, unescaped
+    std::vector<bool> is_dir;
+    const bool pathish = typed.find('/') != std::string::npos || typed.rfind("~", 0) == 0 ||
+                         typed.rfind(".", 0) == 0;
+    if (first_word && !pathish) {
+        std::set<std::string> seen;
+        for (const char* b : k_console_builtins)
+            if (console_starts_with(b, typed)) seen.insert(b);
+        for (const std::string& c : console_path_commands())
+            if (console_starts_with(c, typed)) seen.insert(c);
+        for (const std::string& c : seen) { cands.push_back(c); is_dir.push_back(false); }
+    }
+    if (cands.empty()) {
+        // A path: the directory part is kept as typed, the last component completed.
+        std::string dir_part, base;
+        size_t slash = typed.rfind('/');
+        if (slash != std::string::npos) { dir_part = typed.substr(0, slash + 1); base = typed.substr(slash + 1); }
+        else base = typed;
+        std::string look = dir_part;
+        if (look.rfind("~/", 0) == 0 || look == "~") look = plat_home_dir() + look.substr(1);
+        if (look.empty() || !plat_path_is_absolute(look.c_str())) look = console_cwd(app) + "/" + look;
+        if (DIR* d = opendir(look.c_str())) {
+            std::vector<std::pair<std::string, bool>> found;
+            while (struct dirent* de = readdir(d)) {
+                std::string name = de->d_name;
+                if (name == "." || name == "..") continue;
+                if (name[0] == '.' && (base.empty() || base[0] != '.')) continue;   // dotfiles when asked for
+                if (!console_starts_with(name, base)) continue;
+                struct stat st;
+                bool dir = stat((look + "/" + name).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+                found.push_back({ name, dir });
+            }
+            closedir(d);
+            std::sort(found.begin(), found.end());
+            for (auto& f : found) { cands.push_back(dir_part + f.first); is_dir.push_back(f.second); }
+        }
+    }
+    if (cands.empty()) return line;
+
+    std::string insert;
+    if (cands.size() == 1) {
+        insert = console_shell_escape(cands[0]) + (is_dir[0] ? "/" : " ");
+    } else {
+        // What every candidate shares.
+        std::string common = cands[0];
+        for (const std::string& c : cands) {
+            size_t n = 0;
+            while (n < common.size() && n < c.size() &&
+#ifdef _WIN32
+                   tolower((unsigned char)common[n]) == tolower((unsigned char)c[n])
+#else
+                   common[n] == c[n]
+#endif
+                  ) n++;
+            common.resize(n);
+        }
+        if (common.size() < typed.size()) common = typed;
+        insert = console_shell_escape(common);
+        for (size_t i = 0; i < cands.size(); i++) {
+            std::string shown = cands[i];
+            size_t slash = shown.rfind('/');
+            if (slash != std::string::npos) shown = shown.substr(slash + 1);
+            listed->push_back(shown + (is_dir[i] ? "/" : ""));
+        }
+    }
+    std::string out = line.substr(0, (size_t)start) + insert + line.substr((size_t)cur);
+    *cursor = start + (int)insert.size();
+    return out;
+}
+
+static int console_input_cb(ImGuiInputTextCallbackData* data) {
+    AppPanes* app = (AppPanes*)data->UserData;
+    if (data->EventFlag != ImGuiInputTextFlags_CallbackCompletion) return 0;
+    std::string line(data->Buf, (size_t)data->BufTextLen);
+    int cursor = data->CursorPos;
+    std::vector<std::string> listed;
+    std::string out = console_complete(app, line, &cursor, &listed);
+    if (out != line && (int)out.size() < data->BufSize) {
+        data->DeleteChars(0, data->BufTextLen);
+        data->InsertChars(0, out.c_str());
+        data->CursorPos = cursor;
+        data->SelectionStart = data->SelectionEnd = cursor;
+    }
+    // Several matches: say which. Shown until the line changes.
+    if (listed.size() > 1) {
+        std::string hint;
+        const size_t kMax = 60;
+        for (size_t i = 0; i < listed.size() && i < kMax; i++) hint += (i ? "  " : "") + listed[i];
+        if (listed.size() > kMax) hint += "  ... (" + std::to_string(listed.size()) + " in all)";
+        app->console_hint = hint;
+    } else {
+        app->console_hint.clear();
+    }
+    return 0;
+}
+
 static void render_console(AppPanes* app) {
     if (!app->console_open) return;
 
@@ -7256,34 +7605,57 @@ static void render_console(AppPanes* app) {
 
     // The transcript, with the input line left a row of space at the bottom of the
     // window by asking the child for everything except that row.
-    const float line_h = ImGui::GetTextLineHeightWithSpacing() +
-                         ImGui::GetStyle().FramePadding.y * 2.0f;
+    float line_h = ImGui::GetTextLineHeightWithSpacing() +
+                   ImGui::GetStyle().FramePadding.y * 2.0f;
+    if (!app->console_hint.empty()) line_h += ImGui::GetTextLineHeightWithSpacing();
     ImGui::BeginChild("##console_log", ImVec2(0.0f, -line_h), true);
     if (app->console_hist_open) {
         render_console_hist(app);
     } else {
-        if (app->console_log.empty())
-            ImGui::TextDisabled("(nothing yet - type a command and press Enter)");
+        // The whole transcript is one read-only text, so any of it can be marked
+        // with the mouse (or Ctrl+A) and copied with Ctrl+C, as in a terminal.
+        std::string& v = app->console_view;
+        v.clear();
         for (size_t i = 0; i < app->console_log.size(); i++) {
             const ConsoleEntry& e = app->console_log[i];
-            ImGui::PushID((int)i);
             // The directory, but only where it changes. A backlog that spans three
             // directories has to say which command ran where, and repeating the same
             // path above every command says it so often it stops being read.
-            if (i == 0 || app->console_log[i - 1].cwd != e.cwd)
-                ImGui::TextDisabled("# %s", e.cwd.c_str());
-            ImGui::TextDisabled("$ %s", e.cmd.c_str());
-            if (!e.out.empty()) ImGui::TextUnformatted(e.out.c_str());
-            ImGui::Spacing();
-            ImGui::PopID();
+            if (i == 0 || app->console_log[i - 1].cwd != e.cwd) v += "# " + e.cwd + "\n";
+            v += "$ " + e.cmd + "\n";
+            if (!e.out.empty()) {
+                v += e.out;
+                if (v.back() != '\n') v += '\n';
+            }
+            v += '\n';
         }
         // The command still running, whose output arrives while it goes. That is
         // what the worker thread is for: a `find` that takes a minute shows its
         // results during the minute, and the panes keep answering in the meantime.
         if (app->console_job) {
-            std::string live;
-            { std::lock_guard<std::mutex> lk(app->console_job->mu); live = app->console_job->out; }
-            if (!live.empty()) ImGui::TextUnformatted(live.c_str());
+            std::lock_guard<std::mutex> lk(app->console_job->mu);
+            v += app->console_job->out;
+        }
+        if (v.empty()) {
+            ImGui::TextDisabled("(nothing yet - type a command and press Enter)");
+            app->console_view_active = false;
+        } else {
+            while (v.size() > 1 && v[v.size() - 1] == '\n' && v[v.size() - 2] == '\n') v.pop_back();
+            // Tall enough for all of it, so the child around it is what scrolls and
+            // the follow-the-tail rule below keeps working; wrapped to the width.
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const float w = ImGui::GetContentRegionAvail().x;
+            const float text_h = ImGui::CalcTextSize(v.c_str(), v.c_str() + v.size(), false,
+                                                     w - st.FramePadding.x * 2.0f).y;
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+            ImGui::InputTextMultiline("##console_text", v.data(), v.size() + 1,
+                                      ImVec2(-1.0f, text_h + st.FramePadding.y * 2.0f +
+                                                    ImGui::GetTextLineHeight()),
+                                      ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_WordWrap |
+                                      ImGuiInputTextFlags_NoHorizontalScroll);
+            ImGui::PopStyleColor();
+            app->console_view_active = ImGui::IsItemActive();
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
         }
     }
     // Follow the tail of a running command unless the user scrolled up to read
@@ -7294,6 +7666,12 @@ static void render_console(AppPanes* app) {
     if (!app->console_scroll_lock) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
 
+    // What the last Tab could not decide between.
+    if (!app->console_hint.empty()) {
+        ImGui::PushTextWrapPos(-1.0f);
+        ImGui::TextDisabled("%s", app->console_hint.c_str());
+        ImGui::PopTextWrapPos();
+    }
     if (app->console_focus_request) {
         ImGui::SetKeyboardFocusHere();
         app->console_focus_request = false;
@@ -7307,7 +7685,9 @@ static void render_console(AppPanes* app) {
             st->ReloadUserBufAndMoveToEnd();
     }
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("##console", app->console_input, sizeof(app->console_input));
+    if (ImGui::InputText("##console", app->console_input, sizeof(app->console_input),
+                         ImGuiInputTextFlags_CallbackCompletion, console_input_cb, app))
+        app->console_hint.clear();          // the list was about the old line
     // The claim is what decides who owns the keyboard: a click onto a pane row hands
     // it back to the panes and the window stays as a transcript that is still readable.
     app->console_field_active = ImGui::IsItemActive();
@@ -7613,14 +7993,63 @@ static void render_choice(AppPanes* app) {
     ImGui::Spacing();
     // The partial is the useful default and the one that needs no explanation, so
     // it is first and it is what Enter answers.
-    if (ImGui::Button("Resume")) app->choice_pick = 0;
-    ImGui::SameLine();
-    if (ImGui::Button("Start over")) app->choice_pick = 1;
-    ImGui::SameLine();
-    if (ImGui::Button("Skip")) app->choice_pick = 2;
+    static const char* const labels[3] = { "Resume", "Start over", "Skip" };
+    if (app->choice_focus < 0 || app->choice_focus > 2) app->choice_focus = 0;
+    for (int i = 0; i < 3; i++) {
+        if (i) ImGui::SameLine();
+        if (ImGui::Button(labels[i])) app->choice_pick = i;
+        if (i == app->choice_focus) op_focus_ring();
+    }
     ImGui::SameLine();
     ImGui::TextUnformatted("(press R / S / Esc)");
     ImGui::End();
+}
+
+// The confirm dialog's buttons, left to right, as the answers they give. The keys
+// and the drawing both read this, so a button the keyboard can reach is exactly a
+// button on screen.
+static int confirm_answers(const AppPanes* app, int* out) {
+    int n = 0;
+    if (app->confirm == CONF_SFV_VERIFY) {
+        out[n++] = CONF_ANS_VERIFY; out[n++] = CONF_ANS_NOT_NOW; out[n++] = CONF_ANS_ALWAYS;
+    } else if (confirm_is_overwrite(app->confirm)) {
+        out[n++] = CONF_ANS_OVERWRITE; out[n++] = CONF_ANS_SKIP;
+        // An archive extraction gets two answers and not three. The names inside an
+        // archive are the extractor's to write, and it writes them where the archive
+        // says they go: "write beside" is not something it can be asked for a
+        // subtree, so the dialog does not offer a promise the tool cannot keep.
+        if (app->confirm != CONF_OVERWRITE_EXTRACT) out[n++] = CONF_ANS_RENAME;
+    } else {
+        out[n++] = CONF_ANS_YES; out[n++] = CONF_ANS_NO;
+    }
+    return n;
+}
+
+static const char* confirm_label(int answer) {
+    switch (answer) {
+    case CONF_ANS_YES:       return "Yes";
+    case CONF_ANS_NO:        return "No";
+    case CONF_ANS_OVERWRITE: return "Overwrite";
+    case CONF_ANS_SKIP:      return "Skip";
+    case CONF_ANS_RENAME:    return "Rename";
+    case CONF_ANS_VERIFY:    return "Verify";
+    case CONF_ANS_NOT_NOW:   return "Not now";
+    case CONF_ANS_ALWAYS:    return "Always";
+    default:                 return "?";
+    }
+}
+
+// Left/Up/Shift+Tab and Right/Down/Tab on a row of `n` buttons: true when `key`
+// was one of them, with `*focus` moved and wrapped.
+static bool button_row_key(SDL_Keycode key, bool shift, int n, int* focus) {
+    if (n <= 0) return false;
+    int step = 0;
+    if (key == SDLK_LEFT || key == SDLK_UP || (key == SDLK_TAB && shift)) step = -1;
+    else if (key == SDLK_RIGHT || key == SDLK_DOWN || key == SDLK_TAB) step = 1;
+    else return false;
+    if (*focus < 0 || *focus >= n) *focus = 0;
+    *focus = (*focus + step + n) % n;
+    return true;
 }
 
 static void render_confirm(AppPanes* app) {
@@ -7633,41 +8062,21 @@ static void render_confirm(AppPanes* app) {
                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
     ImGui::TextWrapped("%s", app->confirm_text);
     ImGui::Spacing();
-    const bool overwrite_confirm = confirm_is_overwrite(app->confirm);
-    if (app->confirm == CONF_SFV_VERIFY) {
-        if (ImGui::Button("Verify")) app->pending_confirm_answer = CONF_ANS_VERIFY;
-        ImGui::SameLine();
-        if (ImGui::Button("Not now")) app->pending_confirm_answer = CONF_ANS_NOT_NOW;
-        ImGui::SameLine();
-        if (ImGui::Button("Always")) app->pending_confirm_answer = CONF_ANS_ALWAYS;
-        ImGui::SameLine();
-        ImGui::TextUnformatted("(press V / N / A)");
-        ImGui::End();
-        return;
+    int answers[4];
+    const int n = confirm_answers(app, answers);
+    if (app->confirm_focus < 0 || app->confirm_focus >= n) app->confirm_focus = 0;
+    for (int i = 0; i < n; i++) {
+        if (i) ImGui::SameLine();
+        if (ImGui::Button(confirm_label(answers[i]))) app->pending_confirm_answer = answers[i];
+        if (i == app->confirm_focus) op_focus_ring();
     }
-    // An archive extraction gets two answers and not three. The names inside an
-    // archive are the extractor's to write, and it writes them where the archive
-    // says they go: "write beside" is not something it can be asked for a subtree,
-    // so the dialog does not offer a promise the tool cannot keep.
-    const bool rename_too = overwrite_confirm && app->confirm != CONF_OVERWRITE_EXTRACT;
-    if (overwrite_confirm) {
-        if (ImGui::Button("Overwrite")) app->pending_confirm_answer = CONF_ANS_OVERWRITE;
-        ImGui::SameLine();
-        if (ImGui::Button("Skip")) app->pending_confirm_answer = CONF_ANS_SKIP;
-        if (rename_too) {
-            ImGui::SameLine();
-            if (ImGui::Button("Rename")) app->pending_confirm_answer = CONF_ANS_RENAME;
-        }
-        ImGui::SameLine();
-        ImGui::TextUnformatted(rename_too ? "(press Y / N / R - Esc cancels the operation)"
-                                          : "(press Y / N - Esc cancels the operation)");
-    } else {
-        if (ImGui::Button("Yes")) app->pending_confirm_answer = CONF_ANS_YES;
-        ImGui::SameLine();
-        if (ImGui::Button("No")) app->pending_confirm_answer = CONF_ANS_NO;
-        ImGui::SameLine();
-        ImGui::TextUnformatted("(press Y / N)");
-    }
+    ImGui::SameLine();
+    const char* hint = "(press Y / N)";
+    if (app->confirm == CONF_SFV_VERIFY) hint = "(press V / N / A)";
+    else if (confirm_is_overwrite(app->confirm))
+        hint = n == 3 ? "(press Y / N / R - Esc cancels the operation)"
+                      : "(press Y / N - Esc cancels the operation)";
+    ImGui::TextUnformatted(hint);
     ImGui::End();
 }
 
@@ -8410,6 +8819,7 @@ struct NetForm {
     char name[256];
     char host[256];
     char user[256];
+    char domain[256];          // SMB only
     char pass[256];
     char path[1024];
     int  proto;
@@ -8427,6 +8837,7 @@ static void remote_form_blank(void) {
     g_net_form.name[0] = '\0';
     g_net_form.host[0] = '\0';
     g_net_form.user[0] = '\0';
+    g_net_form.domain[0] = '\0';
     g_net_form.pass[0] = '\0';
     g_net_form.path[0] = '\0';
     g_net_form.proto = NET_FTP;
@@ -8443,6 +8854,7 @@ static void remote_form_fill(const NetSite& s) {
     snprintf(g_net_form.name, sizeof(g_net_form.name), "%s", s.name.c_str());
     snprintf(g_net_form.host, sizeof(g_net_form.host), "%s", s.host.c_str());
     snprintf(g_net_form.user, sizeof(g_net_form.user), "%s", s.user.c_str());
+    snprintf(g_net_form.domain, sizeof(g_net_form.domain), "%s", s.domain.c_str());
     snprintf(g_net_form.pass, sizeof(g_net_form.pass), "%s", s.password.c_str());
     snprintf(g_net_form.path, sizeof(g_net_form.path), "%s", s.path.c_str());
     g_net_form.proto = (int)s.proto;
@@ -8466,6 +8878,7 @@ static bool remote_form_site(AppPanes* app, NetSite* out, const NetSite* base) {
     out->host = g_net_form.host;
     out->port = g_net_form.port;
     out->user = g_net_form.user;
+    out->domain = out->proto == NET_SMB ? g_net_form.domain : "";
     if (g_net_form.pass[0]) out->password = g_net_form.pass;
     out->path = g_net_form.path;
     out->remember = g_net_form.remember;
@@ -8483,6 +8896,7 @@ static bool remote_form_site(AppPanes* app, NetSite* out, const NetSite* base) {
         out->host = parsed.host;
         if (parsed.port) out->port = parsed.port;
         if (!parsed.user.empty()) out->user = parsed.user;
+        if (!parsed.domain.empty()) out->domain = parsed.domain;
         if (!parsed.path.empty()) out->path = parsed.path;
         out->proto = parsed.proto;
     }
@@ -8511,10 +8925,11 @@ static void remote_remember(AppPanes* app, const NetSite& site) {
 // was already looking at.
 static void remote_open(AppPanes* app, const NetSite& site) {
     Pane& active = app->left_focus ? app->left : app->right;
-    if (!net_available()) {
-        char what[128];
+    if (!net_proto_available(site.proto)) {
+        char what[256];
         net_what(what, sizeof(what));
-        snprintf(app->status_msg, sizeof(app->status_msg), "%s", what);
+        snprintf(app->status_msg, sizeof(app->status_msg), "No %s in this build (%s)",
+                 net_proto_name(site.proto), what);
         return;
     }
     std::string target = net_virtual_path(net_site_root(site), site.path);
@@ -8522,8 +8937,9 @@ static void remote_open(AppPanes* app, const NetSite& site) {
     snprintf(back, sizeof(back), "%s", active.current_dir);
     remote_remember(app, site);
     // Watching the conversation is the point of the log, and the connect is where
-    // a server is most often slow, so the window comes up with it.
-    app->netlog_open = true;
+    // a server is most often slow, so the window comes up with it. Not for a share
+    // on the local network: that is a folder opening, as it is in Explorer.
+    if (site.proto != NET_SMB) app->netlog_open = true;
     navigate_to(app, &active, target.c_str());
     // The listing is on its way from the worker. Whether the connect worked is
     // known when it arrives, and remote_connect_done() finishes the job then.
@@ -8561,6 +8977,121 @@ static void remote_connect_done(AppPanes* app, Pane* pane, bool ok) {
     app->remote_note[0] = '\0';
 }
 
+// ---------------------------------------------------------------------------
+// The SMB login dialog
+// ---------------------------------------------------------------------------
+
+// A share said no to the login `pane` tried on `dir` (a virtual smb:// path).
+// The fields start from that login, so a mistyped password is one field to fix.
+static void smb_login_ask(AppPanes* app, Pane* pane, const std::string& dir,
+                          const std::string& why) {
+    std::string root, rpath;
+    if (!net_split_virtual(dir.c_str(), &root, &rpath)) return;
+    const NetSite* site = net_site_for(root);
+    app->left_focus = (pane == &app->left);
+    app->smb_login_open = true;
+    app->smb_login_focus = true;
+    app->smb_login_target = dir;
+    app->smb_login_reason = why;
+    snprintf(app->smb_login_user, sizeof app->smb_login_user, "%s", site ? site->user.c_str() : "");
+    snprintf(app->smb_login_domain, sizeof app->smb_login_domain, "%s", site ? site->domain.c_str() : "");
+    app->smb_login_pass[0] = '\0';
+    app->smb_login_remember = site && site->remember;
+}
+
+// Open the share again with the login typed into the dialog. The pane's path
+// changes to carry the user (smb://user@server/share), the same way an FTP login
+// shows in the path, so the next folder on that server uses the same login.
+static void smb_login_commit(AppPanes* app) {
+    NetSite site;
+    std::string err, root, rpath;
+    if (!net_split_virtual(app->smb_login_target.c_str(), &root, &rpath) ||
+        !net_parse_url(root.c_str(), &site, &err)) {
+        app->smb_login_open = false;
+        return;
+    }
+    std::string user = app->smb_login_user;
+    std::string domain = app->smb_login_domain;
+    // DOMAIN\user is how a Windows login is usually typed.
+    size_t sep = user.find_first_of("\\;");
+    if (sep != std::string::npos) { domain = user.substr(0, sep); user = user.substr(sep + 1); }
+    site.user = user;
+    site.domain = domain;
+    site.password = app->smb_login_pass;
+    site.remember = app->smb_login_remember;
+    site.path = rpath;
+    if (site.remember) {
+        // Saved, so the next session opens the share without asking.
+        std::string key = net_site_root(site);
+        bool found = false;
+        for (NetSite& s : app->remote_sites) {
+            if (net_site_root(s) != key) continue;
+            remote_forget(&s);
+            std::string name = s.name;
+            s = site;
+            s.name = name;
+            found = true;
+        }
+        if (!found) app->remote_sites.push_back(site);
+        remote_sites_write(app);
+    }
+    app->smb_login_open = false;
+    app->smb_login_pass[0] = '\0';
+    remote_open(app, site);
+}
+
+static void render_smb_login(AppPanes* app) {
+    if (!app->smb_login_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.4f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    ImGui::Begin("Log in to a share", &open,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    std::string root, rpath;
+    net_split_virtual(app->smb_login_target.c_str(), &root, &rpath);
+    NetSite shown;
+    std::string perr;
+    net_parse_url(root.c_str(), &shown, &perr);
+    std::string unc = "\\\\" + shown.host + rpath;
+    for (char& c : unc) if (c == '/') c = '\\';
+    ImGui::TextWrapped("%s needs a login.", unc.c_str());
+    if (!app->smb_login_reason.empty())
+        ImGui::TextDisabled("The server said: %s", app->smb_login_reason.c_str());
+    ImGui::Spacing();
+    bool enter = false;
+    const float w = 300.0f;
+    if (app->smb_login_focus && !app->smb_login_user[0]) { claim_focus(app); app->smb_login_focus = false; }
+    ImGui::SetNextItemWidth(w);
+    enter |= ImGui::InputText("user", app->smb_login_user, sizeof app->smb_login_user,
+                              ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Your user name on the server. DOMAIN\\user works too.");
+    ImGui::SetNextItemWidth(w);
+    enter |= ImGui::InputText("domain", app->smb_login_domain, sizeof app->smb_login_domain,
+                              ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The Windows domain or workgroup. Usually empty for a NAS or a home PC.");
+    if (app->smb_login_focus) { claim_focus(app); app->smb_login_focus = false; }
+    ImGui::SetNextItemWidth(w);
+    enter |= ImGui::InputText("password", app->smb_login_pass, sizeof app->smb_login_pass,
+                              ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::Checkbox("remember this login", &app->smb_login_remember);
+    if (app->smb_login_remember)
+        ImGui::TextDisabled("saved as plain text in %s, readable only by you",
+                            net_sites_path().c_str());
+    ImGui::Spacing();
+    if (ImGui::Button("Log in") || enter) smb_login_commit(app);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) open = false;
+    if (!open) {
+        app->smb_login_open = false;
+        app->smb_login_pass[0] = '\0';
+    }
+    ImGui::End();
+}
+
 // Put the listings the worker finished since the last frame into their panes. A
 // result is only used when its pane still wants it and is still on the
 // directory it was asked for; anything else is a listing the user walked away
@@ -8578,6 +9109,13 @@ static void browse_reap(AppPanes* app) {
             // into, the old rows for a reread.
             g_net_note = d.err;
             if (connecting) remote_connect_done(app, p, false);
+            // A share that turned the login away gets asked again with a dialog,
+            // which is what Windows does for \\server\share.
+            // One dialog at a time: a failed connect also puts the pane back where
+            // it was, and that listing can be refused too - the first ask stands.
+            if (net_login_refused(d.err) && !strncasecmp(d.dir.c_str(), "smb://", 6) &&
+                !app->smb_login_open)
+                smb_login_ask(app, p, d.dir, d.err);
             continue;
         }
         // A reread keeps the cursor on the file it was on; a directory just
@@ -8586,6 +9124,7 @@ static void browse_reap(AppPanes* app) {
         if (p->entry_count > 1 && p->selected > 0 && p->selected < p->entry_count)
             keep = p->entries[p->selected]->name;
         free_entries(p->entries, p->entry_count);
+        use_pane_sort(p);
         remote_rows_to_entries(d.rows, &p->entries, &p->entry_count);
         p->selected = 0;
         p->anchor = 0;
@@ -8658,7 +9197,7 @@ static void remote_open_url(AppPanes* app, const char* url) {
     }
     const NetSite* known = net_site_for(net_site_root(site));
     if (known) {
-        if (site.user.empty()) site.user = known->user;
+        if (site.user.empty()) { site.user = known->user; site.domain = known->domain; }
         if (site.password.empty()) site.password = known->password;
         site.remember = known->remember;
         site.verify_tls = known->verify_tls;
@@ -8680,7 +9219,7 @@ static void remote_quick_commit(AppPanes* app) {
     // anonymously: whatever the saved entry knows fills the gaps the URL left.
     const NetSite* saved = net_sites_find(app->remote_sites, net_site_root(site));
     if (saved) {
-        if (site.user.empty()) site.user = saved->user;
+        if (site.user.empty()) { site.user = saved->user; site.domain = saved->domain; }
         if (site.password.empty()) site.password = saved->password;
         site.remember = saved->remember;
         site.verify_tls = saved->verify_tls;
@@ -8886,7 +9425,8 @@ static void render_remote_manager(AppPanes* app) {
         char label[768];
         snprintf(label, sizeof(label), "%s  %s%s", s.name.empty() ? root.c_str() : s.name.c_str(),
                  s.name.empty() ? "" : root.c_str(),
-                 s.verify_tls || s.proto == NET_SFTP ? "" : "  [certificate not verified]");
+                 s.verify_tls || s.proto == NET_SFTP || s.proto == NET_SMB
+                     ? "" : "  [certificate not verified]");
         // The row has to stop where the buttons begin. A Selectable with no size
         // spans the whole content width, so it sat on top of all three buttons and
         // took their click: pressing "connect" only ever selected the row, which
@@ -8955,7 +9495,8 @@ static void render_remote_manager(AppPanes* app) {
         ImGui::SetNextItemWidth(300);
         ImGui::InputText("host", g_net_form.host, sizeof(g_net_form.host));
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("A bare host, or a whole URL: ftp://host, ftps://host:990, sftp://host");
+            ImGui::SetTooltip("A bare host, or a whole URL: ftp://host, ftps://host:990, sftp://host, "
+                              "smb://server/share");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
         ImGui::InputInt("port", &g_net_form.port, 0, 0);
@@ -8965,10 +9506,19 @@ static void render_remote_manager(AppPanes* app) {
         ImGui::SetNextItemWidth(200);
         ImGui::InputText("password", g_net_form.pass, sizeof(g_net_form.pass),
                          ImGuiInputTextFlags_Password);
+        if (g_net_form.proto == NET_SMB) {
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("domain", g_net_form.domain, sizeof(g_net_form.domain));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The Windows domain or workgroup of the user. Usually empty "
+                                  "for a NAS or a home PC.\nAn empty user logs in as a guest.");
+        }
         ImGui::SetNextItemWidth(420);
         ImGui::InputText("start in", g_net_form.path, sizeof(g_net_form.path));
         const char* proto_names[] = { "FTP (upgrade if offered)", "FTPS (explicit TLS)",
-                                      "FTPS (implicit, port 990)", "SFTP (SSH)" };
+                                      "FTPS (implicit, port 990)", "SFTP (SSH)",
+                                      "SMB (Windows / Samba share)" };
+        static_assert(IM_ARRAYSIZE(proto_names) == NET_PROTO_COUNT, "one name per protocol");
         ImGui::SetNextItemWidth(300);
         ImGui::Combo("protocol", &g_net_form.proto, proto_names, IM_ARRAYSIZE(proto_names));
         ImGui::SetNextItemWidth(200);
@@ -8983,15 +9533,26 @@ static void render_remote_manager(AppPanes* app) {
             ImGui::SetTooltip("A RAR set goes volume by volume - .rar, .r00, .r01 ... .s00, or "
                               ".part1.rar, .part2.rar - after the folder's other files, "
                               "instead of in the order the listing gives.");
-        ImGui::Checkbox("passive mode", &g_net_form.passive);
-        if (g_net_form.proto != NET_SFTP) {
-            ImGui::SameLine();
-            ImGui::Checkbox("verify the certificate", &g_net_form.verify_tls);
-            if (!g_net_form.verify_tls)
-                ImGui::TextDisabled("certificate not verified: anyone on the path can pose as "
-                                    "this server");
+        if (g_net_form.proto == NET_SMB) {
+            // Passive mode and certificates are FTP's; a share has neither.
+            ImGui::TextDisabled("\"start in\" is /share or /share/folder; empty lists the shares");
+            if (!net_proto_available(NET_SMB))
+#ifdef _WIN32
+                ImGui::TextDisabled("On Windows a share opens as \\\\server\\share in the path bar.");
+#else
+                ImGui::TextDisabled("This build has no libsmbclient: install it and rebuild.");
+#endif
         } else {
-            ImGui::TextDisabled("SFTP trusts the server's host key the first time it is seen");
+            ImGui::Checkbox("passive mode", &g_net_form.passive);
+            if (g_net_form.proto != NET_SFTP) {
+                ImGui::SameLine();
+                ImGui::Checkbox("verify the certificate", &g_net_form.verify_tls);
+                if (!g_net_form.verify_tls)
+                    ImGui::TextDisabled("certificate not verified: anyone on the path can pose as "
+                                        "this server");
+            } else {
+                ImGui::TextDisabled("SFTP trusts the server's host key the first time it is seen");
+            }
         }
         ImGui::Checkbox("remember this password", &g_net_form.remember);
         if (g_net_form.remember)
@@ -9197,7 +9758,8 @@ static void render_options_items(AppPanes* app) {
         static const char*       names[5] = { "Name", "Extension", "Date", "Size", "Unsorted" };
         static const char*       hints[5] = { "Ctrl+F3", "Ctrl+F4", "Ctrl+F5", "Ctrl+F6", "Ctrl+F7" };
         for (int i = 0; i < 5; i++) {
-            if (ImGui::MenuItem(names[i], hints[i], fs_get_sort_mode() == keys[i]))
+            if (ImGui::MenuItem(names[i], hints[i],
+                                (app->left_focus ? app->left : app->right).sort_mode == keys[i]))
                 set_sort(app, keys[i]);
         }
         ImGui::EndMenu();
@@ -9768,6 +10330,7 @@ void app_panes_render(AppPanes* app) {
     render_remote_manager(app);
     render_fz_import(app);
     render_remote_quick(app);
+    render_smb_login(app);
 
     // The close request is a one-frame signal and every popup above has had its
     // chance to consume it. Left standing, it closes the next popup on the very
@@ -9819,8 +10382,12 @@ void app_panes_save_state(AppPanes* app, MCConfig* cfg) {
     cfg->show_icons = app->show_icons ? 1 : 0;
     cfg->show_launchbar = app->show_launchbar ? 1 : 0;
     cfg->trash = app->trash_mode ? 1 : 0;
-    cfg->sort_mode = fs_get_sort_mode();
-    cfg->sort_desc = fs_get_sort_desc() ? 1 : 0;
+    cfg->sort_mode = app->left.sort_mode;
+    cfg->sort_desc = app->left.sort_desc ? 1 : 0;
+    cfg->right_sort_mode = app->right.sort_mode;
+    cfg->right_sort_desc = app->right.sort_desc ? 1 : 0;
+    col_widths_format(app->left, cfg->left_col_widths, sizeof(cfg->left_col_widths));
+    col_widths_format(app->right, cfg->right_col_widths, sizeof(cfg->right_col_widths));
     snprintf(cfg->filter_preset, sizeof(cfg->filter_preset), "%s", app->filter_preset);
     snprintf(cfg->columns, sizeof(cfg->columns), "%s", app->columns);
     // The F3 window's size, so the preview is as big as the user left it. Its
@@ -9904,8 +10471,21 @@ void app_panes_apply_state(AppPanes* app, const MCConfig* cfg) {
     app->show_launchbar = cfg->show_launchbar != 0;
     app->trash_mode = cfg->trash != 0;
     fs_set_show_hidden(app->show_hidden);
-    if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) fs_set_sort_mode(cfg->sort_mode);
-    fs_set_sort_desc(cfg->sort_desc != 0);
+    // Each pane's own sort key, then a reread so a pane with no saved tabs (which
+    // the tab restore below would otherwise list again) shows it too.
+    if (cfg->sort_mode >= FS_SORT_NAME && cfg->sort_mode <= FS_SORT_NONE) app->left.sort_mode = cfg->sort_mode;
+    app->left.sort_desc = cfg->sort_desc != 0;
+    if (cfg->right_sort_mode >= FS_SORT_NAME && cfg->right_sort_mode <= FS_SORT_NONE) {
+        app->right.sort_mode = cfg->right_sort_mode;
+        app->right.sort_desc = cfg->right_sort_desc > 0;
+    } else {
+        app->right.sort_mode = app->left.sort_mode;
+        app->right.sort_desc = app->left.sort_desc;
+    }
+    col_widths_parse(cfg->left_col_widths, app->left);
+    col_widths_parse(cfg->right_col_widths, app->right);
+    if (cfg->left_tab_count <= 0) refresh_pane(&app->left, app->left.current_dir);
+    if (cfg->right_tab_count <= 0) refresh_pane(&app->right, app->right.current_dir);
     snprintf(app->filter_preset, sizeof(app->filter_preset), "%s", cfg->filter_preset);
     // "ask" | "always" | "never", already validated by mc_config_load: a value it did
     // not recognise came back as "ask".
@@ -10517,7 +11097,7 @@ bool app_key_is_special(SDL_Keycode key, SDL_Keymod mod, AppPanes* app) {
     // text fields, so arrows, Home, End and Delete belong to the caret inside
     // them; without this the caret never moves and the pane behind the dialog
     // walks instead, which reads as the dialog ignoring what was typed.
-    if (app && (app->remote_quick_open ||
+    if (app && (app->remote_quick_open || app->smb_login_open ||
                 (app->remote_mgr_open && g_net_form.open && !g_fz.open))) {
         switch (key) {
         case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
@@ -10584,7 +11164,9 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     // every other key is swallowed: while this is up a stray letter is an answer,
     // not a command to the panes behind it.
     if (app->choice != CHOICE_NONE) {
-        if (key == SDLK_R || key == SDLK_RETURN || key == SDLK_KP_ENTER) app->choice_pick = 0;
+        if (button_row_key(key, shift, 3, &app->choice_focus)) return;
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) app->choice_pick = app->choice_focus;
+        else if (key == SDLK_R) app->choice_pick = 0;
         else if (key == SDLK_S) app->choice_pick = 1;
         else if (key == SDLK_ESCAPE || key == SDLK_N) app->choice_pick = 2;
         return;
@@ -10597,6 +11179,16 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (app->confirm != CONF_NONE) {
         const bool overwrite_confirm = confirm_is_overwrite(app->confirm);
         const bool sfv_confirm = app->confirm == CONF_SFV_VERIFY;
+        // The arrows and Tab walk the buttons, Enter presses the one they are on;
+        // the letters answer directly as before.
+        int answers[4];
+        const int n = confirm_answers(app, answers);
+        if (button_row_key(key, shift, n, &app->confirm_focus)) return;
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+            if (app->confirm_focus < 0 || app->confirm_focus >= n) app->confirm_focus = 0;
+            app->pending_confirm_answer = answers[app->confirm_focus];
+            return;
+        }
         if (sfv_confirm) {
             // V starts the check, N leaves the files exactly as they are, A changes
             // the behaviour for the rest of this session. Esc is N: the question was
@@ -10675,6 +11267,14 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
                       : app->right.remote_req == app->remote_connect_req ? &app->right : nullptr;
         if (waiting && browse_cancel_pane(app, waiting)) return;
         app->remote_connect_req = 0;
+    }
+    if (app->smb_login_open) {
+        // Enter is the field's own (EnterReturnsTrue logs in); Esc gives up.
+        if (key == SDLK_ESCAPE) {
+            app->smb_login_open = false;
+            app->smb_login_pass[0] = '\0';
+        }
+        return;
     }
     if (app->remote_quick_open) {
         if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { remote_quick_commit(app); return; }
@@ -11001,9 +11601,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
 
     // ---- TC Ctrl+PgUp = parent directory, Ctrl+PgDn = open entry under cursor ----
     if ((mod & SDL_KMOD_CTRL) && key == SDLK_PAGEUP) {
-        char parent[4096];
-        pane_parent(active.current_dir, parent, sizeof(parent));
-        navigate_to(app, &active, parent);
+        go_up(app, active);
         return;
     }
     if ((mod & SDL_KMOD_CTRL) && key == SDLK_PAGEDOWN) {
@@ -11351,9 +11949,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
     if (key == SDLK_TAB && shift) { tree_mode_toggle(app, active, TREE_SPLIT); return; }
     if (key == SDLK_TAB) { app->left_focus = !app->left_focus; return; }
     if (key == SDLK_BACKSPACE) {
-        char parent[4096];
-        pane_parent(active.current_dir, parent, sizeof(parent));
-        navigate_to(app, &active, parent);
+        go_up(app, active);
         return;
     }
     // TC Alt+Shift+Enter: compute the size of every directory on screen.
@@ -11438,6 +12034,7 @@ void app_panes_handle_key(AppPanes* app, SDL_Keycode key, SDL_Keymod mod) {
             }
             app->console_open = false;
             app->console_field_active = false;
+            app->console_view_active = false;
             app->console_hist_open = false;
             ImGui::ClearActiveID();   // the field loses the keyboard with the window
             return;

@@ -17,6 +17,7 @@
 static const int MAX_TABS = 8;
 static const int MAX_DIR_HISTORY = 32;
 static const int MAX_SEL_MEMORY = 64;
+static const int PANE_MAX_COLS = 6;   // the long view's column set (FileCol in panes.cpp)
 
 // Console limits. The backlog is the feature, so it is bounded where the data is
 // appended rather than where it is drawn: a session of `ls` and one `cat` of a
@@ -103,6 +104,14 @@ struct Pane {
     int qv_line = 0;
     int qv_row = -1;
     int list_mode = LIST_NORMAL;  // LIST_NORMAL | LIST_BRANCH
+    // Each pane is sorted on its own: a column header click, Ctrl+F3..F7 or the
+    // Sort by menu changes the pane it was aimed at and leaves the other alone.
+    int  sort_mode = FS_SORT_NAME;   // FsSortMode in filesystem.h
+    bool sort_desc = false;
+    // Widths in pixels of the long/mid view's fixed columns, indexed like the
+    // column set (name, ext, size, date, perms, type); 0 = the built-in width.
+    // Dragging a header border changes them; they are saved with the config.
+    float col_w[PANE_MAX_COLS] = {};
     // TC tree panel (Ctrl+Shift+F8 embeds it, Shift+Tab splits the panel).
     // Each pane owns its model: the floating Alt+F10 window edits the target
     // pane's model too, so both views stay in sync.
@@ -460,6 +469,14 @@ public:
     bool console_field_active;   // the field is the active item this frame
     bool console_focus_request;  // one-shot: focus the field next frame
     char console_input[512];     // the line being typed
+    // The transcript drawn as read-only text, so it can be marked with the mouse
+    // and copied; rebuilt each frame from console_log. While that text holds the
+    // keyboard, Ctrl+C and Ctrl+A belong to it and not to the panes.
+    std::string console_view;
+    bool console_view_active = false;
+    // Tab completion: what the last Tab offered when it could not decide, shown
+    // under the transcript until the line changes.
+    std::string console_hint;
     // One-shot: the line was written from outside the text field, so the field has
     // to reload its own copy of it. See console_set_input().
     bool console_input_reload;
@@ -515,6 +532,17 @@ public:
     uint64_t remote_connect_req = 0;
     char remote_connect_back[4096] = "";
     std::string remote_connect_target;
+    // The SMB login dialog: a share refused the login a pane went in with (a guest,
+    // or a wrong password), and these are the fields that ask for a better one.
+    // `smb_login_target` is the virtual path to open once it is given.
+    bool smb_login_open = false;
+    bool smb_login_focus = false;     // put the caret in the first empty field
+    std::string smb_login_target;
+    std::string smb_login_reason;     // what the server said, shown above the fields
+    char smb_login_user[256] = "";
+    char smb_login_domain[256] = "";
+    char smb_login_pass[256] = "";
+    bool smb_login_remember = false;
     // The connection log window, and the lines it has copied out of remote.cpp's
     // log so far (it asks only for newer ones each frame).
     bool netlog_open = false;
@@ -656,6 +684,11 @@ public:
     // an overwrite confirm's Overwrite, Skip, Rename and the Esc that cancels the
     // whole operation. Consumed between frames, where an operation may start.
     int pending_confirm_answer = CONF_ANS_NONE;
+    // The button the keyboard is on in the confirm and three-answer dialogs, as an
+    // index into their row of buttons. The arrows and Tab move it, Enter presses
+    // it, and it starts on the first button - the answer Enter always gave.
+    int confirm_focus = 0;
+    int choice_focus = 0;
     // "Always" in the verify-after-download offer. It changes behaviour for this
     // session and does not write the config file, so a user who clicked it once is
     // not stuck with it next time the app starts.

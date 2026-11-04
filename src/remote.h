@@ -27,6 +27,7 @@ enum NetProto {
     NET_FTPS,           // ftps://  explicit FTPS, required
     NET_FTPS_IMPLICIT,  // ftps://  TLS from the first byte, conventionally on 990
     NET_SFTP,           // sftp://  or ssh://, over libssh2
+    NET_SMB,            // smb://   a Windows / Samba share, over libsmbclient
     NET_PROTO_COUNT
 };
 
@@ -38,6 +39,7 @@ struct NetSite {
     std::string host;
     int port = 0;           // 0 = the protocol's default port
     std::string user;
+    std::string domain;     // SMB only: the Windows domain or workgroup of `user`
     std::string password;
     bool remember = false;  // only then is `password` saved
     std::string path;       // the directory to open on connect
@@ -57,10 +59,10 @@ struct NetSite {
 
 // Protocol vocabulary. `net_proto_key` is the name written in the sites file and
 // `net_proto_of` reads it back, so a hand-edited file says what the dialog shows.
-const char* net_proto_name(NetProto p);     // "FTP", "FTPS", "FTPS (implicit)", "SFTP"
-const char* net_proto_key(NetProto p);      // "ftp", "ftps", "ftps-implicit", "sftp"
-const char* net_proto_scheme(NetProto p);   // "ftp://", "ftps://", "sftp://"
-int  net_proto_port(NetProto p);            // 21, 21, 990, 22
+const char* net_proto_name(NetProto p);     // "FTP", "FTPS", "FTPS (implicit)", "SFTP", "SMB"
+const char* net_proto_key(NetProto p);      // "ftp", "ftps", "ftps-implicit", "sftp", "smb"
+const char* net_proto_scheme(NetProto p);   // "ftp://", "ftps://", "sftp://", "smb://"
+int  net_proto_port(NetProto p);            // 21, 21, 990, 22, 445
 bool net_proto_of(const char* name, NetProto* out);
 // The port a site actually connects to: its own if set, else the default.
 int net_site_port(const NetSite& s);
@@ -131,9 +133,12 @@ bool net_filezilla_parse(const std::string& xml, std::vector<NetImported>* out,
 bool net_filezilla_load(const std::string& path, std::vector<NetImported>* out,
                         int* skipped, std::string* err);
 
-// Transport. net_available() is false in a build without libcurl; net_what()
-// is the line About and --version print.
+// Transport. net_available() is false in a build with neither libcurl nor
+// libsmbclient; net_proto_available() asks about one protocol (SMB needs
+// libsmbclient, and is never available on Windows, where a share is a UNC path the
+// system opens itself). net_what() is the line About and --version print.
 bool net_available();
+bool net_proto_available(NetProto p);
 void net_what(char* out, size_t n);
 // Release the cached handles. Called when a site is edited or removed, so an
 // old login is not reused after its password changed. The cache is per thread:
@@ -276,6 +281,12 @@ bool net_rename(const NetSite& site, const std::string& rpath, const char* new_n
 // SITE CHMOD. Not every server implements it; the server's own reply is what
 // ends up in `err`, rather than a generic failure.
 bool net_chmod(const NetSite& site, const std::string& rpath, int mode, std::string* err);
+
+// A failure the server gave because of the login: wrong user or password, or a
+// guest that is not let in. The UI answers it with a login dialog rather than a
+// status line, so the backends start such an error with this text.
+extern const char* const kNetLoginRefused;
+bool net_login_refused(const std::string& err);
 
 // Listing line parsers, exposed for the tests. Each fills name, mode, size and
 // mtime from one line of a listing.

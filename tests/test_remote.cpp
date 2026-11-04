@@ -11,6 +11,7 @@
 #include "../src/remote.h"
 #include "../src/xfer.h"
 #include "test_os.h"
+#include "smb_fixture.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -1646,10 +1647,153 @@ static void test_unreachable_asks_once(void) {
 // a build without libcurl
 // ---------------------------------------------------------------------------
 
+// SMB's vocabulary and URL grammar: smb://[DOMAIN;]user@server/share, a guest
+// when no user is named, and the domain kept with the login in the sites file.
+static void test_smb_urls(void) {
+    CHECK(net_proto_port(NET_SMB) == 445);
+    CHECK(!strcmp(net_proto_key(NET_SMB), "smb"));
+    CHECK(!strcmp(net_proto_scheme(NET_SMB), "smb://"));
+    if (!net_proto_available(NET_SMB)) {
+        // smb:// is then not a site: the pane hands it to Windows or to GVfs.
+        CHECK(!net_is_remote("smb://server/share"));
+        return;
+    }
+    CHECK(net_is_remote("smb://server/share"));
+    NetSite s;
+    std::string err;
+    CHECK(net_parse_url("smb://nas/Medien/Filme", &s, &err));
+    CHECK(s.proto == NET_SMB && s.host == "nas" && s.user.empty() && s.path == "/Medien/Filme");
+    CHECK(net_site_root(s) == "smb://nas");
+    CHECK(net_parse_url("smb://WORK;bob@fileserver:1445/x", &s, &err));
+    CHECK(s.domain == "WORK" && s.user == "bob" && s.port == 1445);
+    CHECK(net_site_root(s) == "smb://WORK;bob@fileserver:1445");
+    std::string root, rpath;
+    CHECK(net_split_virtual("smb://WORK;bob@fileserver:1445/x/y", &root, &rpath));
+    CHECK(root == "smb://WORK;bob@fileserver:1445" && rpath == "/x/y");
+    CHECK(net_parse_url("smb://WORK%5Cbob:secret@fs/x", &s, &err));   // DOMAIN\user
+    CHECK(s.domain == "WORK" && s.user == "bob" && s.password == "secret");
+    CHECK(net_login_refused(std::string(kNetLoginRefused) + ": access denied"));
+    CHECK(!net_login_refused("no such share, folder or file"));
+
+    // The domain survives the sites file.
+    const std::string home = test_mkdtemp("mc-smb-sites");
+    {
+        TestHome th(home);
+        NetSite site;
+        site.proto = NET_SMB;
+        site.host = "fs";
+        site.user = "bob";
+        site.domain = "WORK";
+        std::vector<NetSite> list = { site }, back;
+        CHECK(net_sites_save(list, &err));
+        CHECK(net_sites_load(&back, &err));
+        CHECK(back.size() == 1 && back[0].proto == NET_SMB && back[0].domain == "WORK");
+    }
+    sh("rm -rf " + q(home));
+}
+
+#ifndef _WIN32
+// Every transport call against a real Samba server: the share list, a guest that
+// may read but not enter priv, a wrong and a right password, and the transfers
+// and mutations the panes make.
+static void test_smb_transport(const SmbFixture& fx) {
+    write_file(fx.pub() + "/hello.txt", "hello smb\n");
+    write_file(fx.pub() + "/sub/a file#1.txt", "nested\n");
+    write_file(fx.priv() + "/secret.txt", "secret\n");
+    NetSite guest;
+    std::string err;
+    CHECK(net_parse_url((fx.url() + "/pub").c_str(), &guest, &err));
+    std::vector<FileEntry> rows;
+
+    CHECK_ERR(net_list(guest, "", &rows, &err), err);           // the server: its shares
+    CHECK(find_row(rows, "pub") && S_ISDIR(find_row(rows, "pub")->mode));
+    CHECK(find_row(rows, "priv") != nullptr);
+    CHECK(!find_row(rows, "IPC$"));
+    CHECK_ERR(net_list(guest, "/pub", &rows, &err), err);
+    CHECK(find_row(rows, "hello.txt") && find_row(rows, "hello.txt")->size == 10);
+    CHECK(find_row(rows, "sub") && S_ISDIR(find_row(rows, "sub")->mode));
+    CHECK(!find_row(rows, ".") && !find_row(rows, ".."));
+    CHECK_ERR(net_list(guest, "/pub/sub", &rows, &err), err);
+    CHECK(find_row(rows, "a file#1.txt") != nullptr);           // escaped in the URL
+
+    std::string pre;
+    CHECK_ERR(net_download_prefix(guest, "/pub/hello.txt", &pre, 5, nullptr, nullptr, &err), err);
+    CHECK(pre == "hello");
+
+    // priv turns the guest away, and a wrong password, with the login marker.
+    CHECK(!net_list(guest, "/priv", &rows, &err));
+    CHECK(net_login_refused(err));
+    NetSite user = guest;
+    user.user = fx.user;
+    user.password = "wrong";
+    CHECK(!net_list(user, "/priv", &rows, &err));
+    CHECK(net_login_refused(err));
+    user.password = kSmbPass;                                   // same site, new password
+    CHECK_ERR(net_list(user, "/priv", &rows, &err), err);
+    CHECK(find_row(rows, "secret.txt") != nullptr);
+    CHECK(!net_list(user, "/nosuch", &rows, &err) && !net_login_refused(err));
+
+    // Transfers, with the login.
+    const std::string local = fx.dir + "/local";
+    sh("mkdir -p " + q(local));
+    std::string big(3 * 1024 * 1024 + 17, '\0');
+    for (size_t i = 0; i < big.size(); i++) big[i] = (char)(i * 7);
+    write_file(local + "/big.bin", big);
+    CHECK_ERR(net_upload(user, "/pub/new/deeper/big.bin", (local + "/big.bin").c_str(),
+                         nullptr, nullptr, &err), err);         // missing folders are made
+    CHECK(read_file(fx.pub() + "/new/deeper/big.bin") == big);
+    // A resumed upload continues past what the share holds, cutting off anything after.
+    sh("truncate -s 1000000 " + q(fx.pub() + "/new/deeper/big.bin"));
+    CHECK_ERR(net_upload(user, "/pub/new/deeper/big.bin", (local + "/big.bin").c_str(),
+                         nullptr, nullptr, &err, 1000000), err);
+    CHECK(read_file(fx.pub() + "/new/deeper/big.bin") == big);
+
+    long long got = 0;
+    CHECK_ERR(net_download(user, "/pub/new/deeper/big.bin", (local + "/down.bin").c_str(),
+                           nullptr, nullptr, &err, 0, &got), err);
+    CHECK(read_file(local + "/down.bin") == big && got == (long long)big.size());
+    CHECK(!exists(local + "/down.bin.part"));
+    // A resumed download continues the sidecar.
+    write_file(local + "/again.bin.part", big.substr(0, 12345));
+    CHECK_ERR(net_download(user, "/pub/new/deeper/big.bin", (local + "/again.bin").c_str(),
+                           nullptr, nullptr, &err, 12345, &got), err);
+    CHECK(read_file(local + "/again.bin") == big && got == (long long)big.size() - 12345);
+
+    // An abort from the progress callback stops it and says so.
+    struct Stop { static bool cb(long long done, long long, int, int, void*) { return done < 1024 * 1024; } };
+    CHECK(!net_download(user, "/pub/new/deeper/big.bin", (local + "/stopped.bin").c_str(),
+                        Stop::cb, nullptr, &err));
+    CHECK(err == "aborted" && !exists(local + "/stopped.bin"));
+
+    FileEntry fe;
+    CHECK_ERR(net_stat(user, "/pub/new/deeper/big.bin", &fe, &err), err);
+    CHECK(fe.size == (off_t)big.size() && S_ISREG(fe.mode) && !strcmp(fe.name, "big.bin"));
+    CHECK_ERR(net_rename(user, "/pub/new/deeper/big.bin", "renamed.bin", &err), err);
+    CHECK(exists(fx.pub() + "/new/deeper/renamed.bin"));
+    CHECK_ERR(net_download_tree(user, "/pub/new", (local + "/tree").c_str(), nullptr, nullptr, &err), err);
+    CHECK(read_file(local + "/tree/deeper/renamed.bin") == big);
+    CHECK_ERR(net_mkdir(user, "/pub/made", &err), err);
+    CHECK(is_dir(fx.pub() + "/made"));
+    CHECK_ERR(net_remove(user, "/pub/made", true, &err), err);
+    CHECK(!exists(fx.pub() + "/made"));
+    CHECK_ERR(net_remove_tree(user, "/pub/new", nullptr, nullptr, &err), err);
+    CHECK(!exists(fx.pub() + "/new"));
+    sh("mkdir -p " + q(local + "/up/inner") + " && printf x > " + q(local + "/up/inner/x.txt"));
+    CHECK_ERR(net_upload_tree(user, (local + "/up").c_str(), "/priv/up", nullptr, nullptr, &err), err);
+    CHECK(read_file(fx.priv() + "/up/inner/x.txt") == "x");
+
+    // A port nothing listens on says so, and is not a login problem.
+    NetSite dead;
+    CHECK(net_parse_url("smb://127.0.0.1:1/x", &dead, &err));
+    CHECK(!net_list(dead, "/x", &rows, &err) && !net_login_refused(err));
+    net_forget(nullptr);
+}
+#endif
+
 static void test_without_curl(void) {
     char what[256];
     net_what(what, sizeof(what));
-    if (net_available()) {
+    if (net_proto_available(NET_FTP)) {
         CHECK(strstr(what, "libcurl") != nullptr);
         return;
     }
@@ -1702,8 +1846,20 @@ int main(void) {
     test_filezilla_import();
     test_rar_order();
     test_without_curl();
+    test_smb_urls();
+#ifndef _WIN32
+    if (net_proto_available(NET_SMB)) {
+        SmbFixture smb;
+        if (smb.start()) {
+            test_smb_transport(smb);
+            smb.stop();
+        } else {
+            printf("smbd is not installed or did not start: the SMB transport tests are skipped (%s)\n", smb.why.c_str());
+        }
+    }
+#endif
 
-    if (!net_available()) {
+    if (!net_proto_available(NET_FTP)) {
         printf("libcurl is not in this build: the transport tests are skipped\n");
         printf("%d checks, %d failures\n", checks, failures);
         return failures ? 1 : 0;

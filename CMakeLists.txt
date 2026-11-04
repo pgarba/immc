@@ -115,13 +115,32 @@ find_package(CURL QUIET)
 # MC_HAVE_CURL define, not the module: panes.cpp links against net_* in both
 # configurations, and without the library the transport half of the module is what
 # answers "this build has no FTP support".
-set(MC_REMOTE_SOURCES src/remote.cpp src/xfer.cpp)
+set(MC_REMOTE_SOURCES src/remote.cpp src/smb.cpp src/xfer.cpp)
+set(MC_REMOTE_LIBS)
 if(CURL_FOUND)
-    set(MC_REMOTE_LIBS CURL::libcurl)
+    list(APPEND MC_REMOTE_LIBS CURL::libcurl)
     add_compile_definitions(MC_HAVE_CURL)
     message(STATUS "remote sites via libcurl: ${CURL_VERSION_STRING}")
 else()
     message(STATUS "no libcurl found: FTP/FTPS/SFTP disabled, the rest of the app is unchanged")
+endif()
+
+# SMB shares (smb://server/share, \\server\share) on Linux go through libsmbclient,
+# Samba's client library, so a share opens without GVfs, a mount or root. Optional
+# in the same way as libcurl: without it smb:// falls back to GVfs's `gio`. Windows
+# opens a share as a UNC path itself and never uses it.
+if (NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(SMBCLIENT QUIET IMPORTED_TARGET smbclient)
+    endif()
+endif()
+if (SMBCLIENT_FOUND)
+    list(APPEND MC_REMOTE_LIBS PkgConfig::SMBCLIENT)
+    add_compile_definitions(MC_HAVE_SMBCLIENT)
+    message(STATUS "SMB shares via libsmbclient: ${SMBCLIENT_VERSION}")
+elseif (NOT WIN32)
+    message(STATUS "no libsmbclient found: smb:// goes through GVfs (gio) instead")
 endif()
 
 # Build the application
@@ -177,7 +196,7 @@ add_test(NAME archive COMMAND test-archive)
 # MLSD and LIST dialects, the login, the transfers and the mutations are all
 # exercised rather than assumed. The test skips the network half when this build
 # has no libcurl, and still checks the parsers and the sites file.
-add_executable(test-remote tests/test_remote.cpp src/remote.cpp src/xfer.cpp src/filesystem.cpp src/platform.cpp
+add_executable(test-remote tests/test_remote.cpp src/remote.cpp src/smb.cpp src/xfer.cpp src/filesystem.cpp src/platform.cpp
     src/proc.cpp)
 target_include_directories(test-remote PRIVATE src)
 mc_platform(test-remote)
