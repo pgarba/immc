@@ -44,7 +44,7 @@ OpenGL 3 implementation. Two optional dependencies change what the app can do:
 | dependency | what it turns on |
 | --- | --- |
 | libcurl | FTP, FTPS and SFTP: browsing sites, and copy/move that runs on a thread |
-| libsmbclient | SMB shares on Linux (`smb://server/share`, `\\server\share`) without GVfs: browsing, copy/move, login dialog |
+| libsmbclient | SMB shares on Linux (`smb://server/share`, `\\server\share`) without GVfs: browsing, copy/move, login dialog. Opened at run time, so it is needed where immc runs, not to start it; the build needs only its header (`libsmbclient-dev`) |
 | FreeType | the font hinting modes the Options dialog offers |
 
 On a Debian-ish box:
@@ -324,7 +324,7 @@ the panes keep answering underneath it.
 | `Commands → Connection log` | every command sent to a server and every reply, with passwords blanked; it opens by itself on a connect |
 | `Commands → Verify SFV` | check the focused pane's directory against the `.sfv` in it |
 | `cd ftp://…` | go there in the active pane |
-| `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux immc speaks SMB itself through libsmbclient: it tries the guest account first, and a share that turns it away brings up a login dialog (user, domain, password, and "remember", which saves it with the remote sites; `Ctrl+F` can also add SMB sites). Copy, move, delete, rename and quick view work as on an FTP site. A build without libsmbclient falls back to GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
+| `\\server`, `\\server\share`, `smb://server/share` | typed alone on the command line (or after `cd`), open a network share: a bare server lists its shares, and `..` at a share's root goes back to that list. On Windows these are ordinary UNC paths, and a share that wants a password brings up Windows' own login prompt. On Linux immc speaks SMB itself through libsmbclient: it tries the guest account first, and a share that turns it away brings up a login dialog (user, domain, password, and "remember", which saves it with the remote sites; `Ctrl+F` can also add SMB sites). Copy, move, delete, rename and quick view work as on an FTP site. Without libsmbclient installed (or in a build without its header) immc falls back to GVfs (`gio`, from the `gvfs` and `gvfs-smb` packages), which mounts the share under `/run/user/…/gvfs` |
 | `Alt+F5` | pack the marked entries into an archive |
 | `Alt+F6` | extract an archive into the other pane |
 | `Alt+F9` | test an archive |

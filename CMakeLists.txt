@@ -128,7 +128,9 @@ endif()
 # SMB shares (smb://server/share, \\server\share) on Linux go through libsmbclient,
 # Samba's client library, so a share opens without GVfs, a mount or root. Optional
 # in the same way as libcurl: without it smb:// falls back to GVfs's `gio`. Windows
-# opens a share as a UNC path itself and never uses it.
+# opens a share as a UNC path itself and never uses it. Only its header is needed
+# at build time: the library is opened at run time (dlopen), so the binary also
+# starts where it is not installed and falls back to gio there.
 if (NOT WIN32)
     find_package(PkgConfig QUIET)
     if (PKG_CONFIG_FOUND)
@@ -136,7 +138,8 @@ if (NOT WIN32)
     endif()
 endif()
 if (SMBCLIENT_FOUND)
-    list(APPEND MC_REMOTE_LIBS PkgConfig::SMBCLIENT)
+    include_directories(${SMBCLIENT_INCLUDE_DIRS})
+    list(APPEND MC_REMOTE_LIBS ${CMAKE_DL_LIBS})
     add_compile_definitions(MC_HAVE_SMBCLIENT)
     message(STATUS "SMB shares via libsmbclient: ${SMBCLIENT_VERSION}")
 elseif (NOT WIN32)

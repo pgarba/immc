@@ -19,6 +19,87 @@
 
 #include <libsmbclient.h>
 
+#include <dlfcn.h>
+#include <mutex>
+
+// libsmbclient is opened at run time rather than linked, so the one binary starts
+// on a machine without Samba's client library and smb:// then goes through GVfs
+// as before. The header gives the types; each function is looked up by name.
+namespace smbdl {
+
+#define MC_SMBC_FUNCS(X) \
+    X(smbc_new_context) X(smbc_init_context) X(smbc_free_context) X(smbc_version) \
+    X(smbc_setDebug) X(smbc_setLogCallback) X(smbc_setTimeout) \
+    X(smbc_setOptionUserData) X(smbc_getOptionUserData) \
+    X(smbc_setFunctionAuthDataWithContext) X(smbc_setOptionNoAutoAnonymousLogin) \
+    X(smbc_setOptionUseKerberos) X(smbc_setOptionFallbackAfterKerberos) \
+    X(smbc_setOptionUseCCache) X(smbc_getFunctionPurgeCachedServers) \
+    X(smbc_getFunctionOpen) X(smbc_getFunctionClose) X(smbc_getFunctionRead) \
+    X(smbc_getFunctionWrite) X(smbc_getFunctionLseek) X(smbc_getFunctionFstat) \
+    X(smbc_getFunctionFtruncate) X(smbc_getFunctionStat) X(smbc_getFunctionOpendir) \
+    X(smbc_getFunctionReaddir) X(smbc_getFunctionReaddirPlus2) X(smbc_getFunctionClosedir) \
+    X(smbc_getFunctionMkdir) X(smbc_getFunctionRmdir) X(smbc_getFunctionUnlink) \
+    X(smbc_getFunctionRename) X(smbc_getFunctionChmod)
+
+#define MC_SMBC_PTR(n) decltype(&::n) n = nullptr;
+MC_SMBC_FUNCS(MC_SMBC_PTR)
+#undef MC_SMBC_PTR
+
+std::string missing;   // why load() failed: the library or a function it lacks
+
+bool load() {
+    static std::once_flag once;
+    static bool ok = false;
+    std::call_once(once, [] {
+        void* h = nullptr;
+        for (const char* name : { "libsmbclient.so.0", "libsmbclient.so" })
+            if ((h = dlopen(name, RTLD_NOW | RTLD_LOCAL))) break;
+        if (!h) { missing = "libsmbclient is not installed"; return; }
+#define MC_SMBC_SYM(n) \
+        if (!(n = (decltype(n))dlsym(h, #n))) { missing = "libsmbclient has no " #n; return; }
+        MC_SMBC_FUNCS(MC_SMBC_SYM)
+#undef MC_SMBC_SYM
+        ok = true;
+    });
+    return ok;
+}
+
+} // namespace smbdl
+
+// From here on each smbc_ call goes through the pointer looked up above.
+#define smbc_new_context smbdl::smbc_new_context
+#define smbc_init_context smbdl::smbc_init_context
+#define smbc_free_context smbdl::smbc_free_context
+#define smbc_version smbdl::smbc_version
+#define smbc_setDebug smbdl::smbc_setDebug
+#define smbc_setLogCallback smbdl::smbc_setLogCallback
+#define smbc_setTimeout smbdl::smbc_setTimeout
+#define smbc_setOptionUserData smbdl::smbc_setOptionUserData
+#define smbc_getOptionUserData smbdl::smbc_getOptionUserData
+#define smbc_setFunctionAuthDataWithContext smbdl::smbc_setFunctionAuthDataWithContext
+#define smbc_setOptionNoAutoAnonymousLogin smbdl::smbc_setOptionNoAutoAnonymousLogin
+#define smbc_setOptionUseKerberos smbdl::smbc_setOptionUseKerberos
+#define smbc_setOptionFallbackAfterKerberos smbdl::smbc_setOptionFallbackAfterKerberos
+#define smbc_setOptionUseCCache smbdl::smbc_setOptionUseCCache
+#define smbc_getFunctionPurgeCachedServers smbdl::smbc_getFunctionPurgeCachedServers
+#define smbc_getFunctionOpen smbdl::smbc_getFunctionOpen
+#define smbc_getFunctionClose smbdl::smbc_getFunctionClose
+#define smbc_getFunctionRead smbdl::smbc_getFunctionRead
+#define smbc_getFunctionWrite smbdl::smbc_getFunctionWrite
+#define smbc_getFunctionLseek smbdl::smbc_getFunctionLseek
+#define smbc_getFunctionFstat smbdl::smbc_getFunctionFstat
+#define smbc_getFunctionFtruncate smbdl::smbc_getFunctionFtruncate
+#define smbc_getFunctionStat smbdl::smbc_getFunctionStat
+#define smbc_getFunctionOpendir smbdl::smbc_getFunctionOpendir
+#define smbc_getFunctionReaddir smbdl::smbc_getFunctionReaddir
+#define smbc_getFunctionReaddirPlus2 smbdl::smbc_getFunctionReaddirPlus2
+#define smbc_getFunctionClosedir smbdl::smbc_getFunctionClosedir
+#define smbc_getFunctionMkdir smbdl::smbc_getFunctionMkdir
+#define smbc_getFunctionRmdir smbdl::smbc_getFunctionRmdir
+#define smbc_getFunctionUnlink smbdl::smbc_getFunctionUnlink
+#define smbc_getFunctionRename smbdl::smbc_getFunctionRename
+#define smbc_getFunctionChmod smbdl::smbc_getFunctionChmod
+
 namespace {
 
 struct SmbLogin {
@@ -85,6 +166,7 @@ SMBCCTX* ctx_for(const NetSite& site, std::string* err) {
         }
         return e.ctx;
     }
+    if (!smbdl::load()) { *err = smbdl::missing; return nullptr; }
     SMBCCTX* ctx = smbc_new_context();
     if (!ctx) { *err = "libsmbclient: cannot create a context"; return nullptr; }
     SmbLogin* login = new SmbLogin{ site.user, site.domain, site.password };
@@ -176,9 +258,12 @@ bool is_server(const std::string& rpath) {
 
 } // namespace
 
-bool smb_available() { return true; }
+bool smb_available() { return smbdl::load(); }
 
-void smb_what(char* out, size_t n) { snprintf(out, n, "libsmbclient %s", smbc_version()); }
+void smb_what(char* out, size_t n) {
+    if (smbdl::load()) snprintf(out, n, "libsmbclient %s", smbc_version());
+    else snprintf(out, n, "no SMB (%s): smb:// goes through GVfs", smbdl::missing.c_str());
+}
 
 void smb_forget(const char* root) {
     SmbCache& c = cache();
