@@ -2773,7 +2773,7 @@ static void test_smb_login(AppPanes* app, const std::string& root) {
 // refusal, from a port nothing listens on - arrives through browse_reap(). A
 // connect that fails puts the pane back where it was; Esc gives up on a wait.
 static void test_remote_async(AppPanes* app, const std::string& root) {
-    if (!net_available()) return;
+    if (!net_proto_available(NET_FTP)) return;   // SMB alone also counts as "net"
     NetSite dead;
     dead.proto = NET_FTP;
     dead.host = "127.0.0.1";
@@ -4950,7 +4950,14 @@ static void test_console_exit_and_complete(AppPanes* app, const std::string& roo
     CHECK(complete("cd do") == "cd docs/");
     CHECK(complete("cat notes.t") == "cat notes.txt ");
     // A space is escaped; the typed escape is understood when completing further.
+#ifdef _WIN32
+    CHECK(complete("cd My") == "cd \"My Folder\"/");   // cmd has no backslash escape
+    CHECK(complete("cd \"My Fo") == "cd \"My Folder\"/");
+#else
     CHECK(complete("cd My") == "cd My\\ Folder/");
+    CHECK(complete("cd 'My Fo") == "cd My\\ Folder/");
+    CHECK(complete("cd My\\ Fo") == "cd My\\ Folder/");
+#endif
     // Two matches: what they share, and the list.
     CHECK(complete("cat note") == "cat note");
     CHECK(listed.size() == 2);

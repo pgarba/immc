@@ -7558,16 +7558,20 @@ static const std::vector<std::string>& console_path_commands() {
     return cmds;
 }
 
-// A name as it has to be typed: a space or a shell character is escaped.
+// A name as it has to be typed: a space or a shell character is escaped. cmd has
+// no backslash escape, so there the whole name is quoted instead.
 static std::string console_shell_escape(const std::string& s) {
+#ifdef _WIN32
+    if (s.find_first_of(" \t&|<>^()%!,;=") != std::string::npos) return "\"" + s + "\"";
+    return s;
+#else
     std::string out;
     for (char c : s) {
-#ifndef _WIN32
         if (strchr(" \t'\"\\$`&;|<>()*?[]!#~{}", c)) out += '\\';
-#endif
         out += c;
     }
     return out;
+#endif
 }
 
 // The typed word with its escapes taken out, so it can be compared with names.
@@ -7598,12 +7602,20 @@ static std::string console_complete(AppPanes* app, const std::string& line, int*
     listed->clear();
     int cur = *cursor;
     if (cur < 0 || cur > (int)line.size()) cur = (int)line.size();
-    // The word under the caret starts after the last unescaped blank before it.
-    int start = cur;
-    while (start > 0) {
-        char ch = line[(size_t)start - 1];
-        if ((ch == ' ' || ch == '\t') && !(start >= 2 && line[(size_t)start - 2] == '\\')) break;
-        start--;
+    // The word under the caret starts after the last blank before it that is
+    // neither escaped nor inside quotes.
+    int start = 0;
+    {
+        char quote = 0;
+        for (int i = 0; i < cur; i++) {
+            char ch = line[(size_t)i];
+#ifndef _WIN32
+            if (!quote && ch == '\\') { i++; continue; }
+#endif
+            if (quote) { if (ch == quote) quote = 0; continue; }
+            if (ch == '"' || ch == '\'') { quote = ch; continue; }
+            if (ch == ' ' || ch == '\t') start = i + 1;
+        }
     }
     bool first_word = true;
     for (int i = 0; i < start; i++)
