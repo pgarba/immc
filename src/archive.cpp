@@ -185,7 +185,8 @@ bool arch_can_pack(ArchKind k) {
     case ARCH_TAR_BZ2:
     case ARCH_TAR_XZ:  return path_has_tool("tar");
     case ARCH_7Z:      return path_has_tool("7z") || path_has_tool("7za");
-    default:           return false;   // rar and iso are read-only
+    case ARCH_RAR:     return path_has_tool("rar");   // unrar cannot write
+    default:           return false;   // iso is read-only
     }
 }
 
@@ -199,15 +200,17 @@ const char* arch_kind_suffix(ArchKind k) {
     case ARCH_TAR_BZ2: return ".tar.bz2";
     case ARCH_TAR_XZ:  return ".tar.xz";
     case ARCH_7Z:      return ".7z";
+    case ARCH_RAR:     return ".rar";
     default:           return "";
     }
 }
 
 // What a pack dialog should offer, in the order it reads naturally: the two
 // formats that can carry encryption and options first, then the tar family.
-// RAR is deliberately absent - there is no writer for it on a normal system.
+// RAR is listed too, but only RARLAB's own `rar` writes it (unrar and 7z only
+// read), so the dialog says when it is not installed.
 const std::vector<ArchKind>& arch_pack_kinds() {
-    static const std::vector<ArchKind> k = { ARCH_ZIP, ARCH_7Z, ARCH_TAR_GZ,
+    static const std::vector<ArchKind> k = { ARCH_ZIP, ARCH_7Z, ARCH_RAR, ARCH_TAR_GZ,
                                              ARCH_TAR_XZ, ARCH_TAR_BZ2, ARCH_TAR };
     return k;
 }
@@ -245,8 +248,8 @@ bool arch_pack_supported(const ArchPackOpts& opts, std::string* why) {
         *why = "tar cannot encrypt; choose zip or 7z for a password";
         return false;
     }
-    if (opts.volume_bytes > 0 && opts.kind != ARCH_7Z) {
-        *why = "only 7z writes volumes the tools can read back; "
+    if (opts.volume_bytes > 0 && opts.kind != ARCH_7Z && opts.kind != ARCH_RAR) {
+        *why = "only 7z and rar write volumes the tools can read back; "
                "a split .zip comes out unreadable by unzip";
         return false;
     }
@@ -1092,6 +1095,20 @@ bool arch_pack_opts(const char* archive, const char* cwd,
                    if (!opts.password.empty()) argv.push_back("-p" + opts.password);
                    if (opts.volume_bytes > 0) argv.push_back("-v" + std::to_string(opts.volume_bytes));
                    break;
+    case ARCH_RAR: {
+        // rar prints "Adding  name" once per member; its percentages are per file.
+        pr.mode = UNIT_MARKERED; pr.markers = { "Adding" };
+        argv = { "rar", "a", "-r", "-y" };
+        // rar's scale is 0 (store) to 5 (best); the dialog's is 0 to 9.
+        if (opts.level >= 0)
+            argv.push_back("-m" + std::to_string(opts.level == 0 ? 0 : 1 + (opts.level - 1) / 2));
+        if (!opts.password.empty()) argv.push_back("-p" + opts.password);
+        // Volumes come out as name.part1.rar, name.part2.rar, ...
+        if (opts.volume_bytes > 0) argv.push_back("-v" + std::to_string(opts.volume_bytes) + "b");
+        argv.push_back(a);
+        argv.push_back("--");
+        break;
+    }
     default: return false;
     }
     argv.insert(argv.end(), rel_sources.begin(), rel_sources.end());

@@ -35,6 +35,11 @@ bool proc_start(const std::vector<std::string>& argv, const char* cwd,
                 Proc* p, std::string* err) {
     int pfd[2];
     if (pipe(pfd) != 0) { *err = std::strerror(errno); return false; }
+    // Tools are started from background threads too (a pack), so another child
+    // forked meanwhile must not inherit this pipe: a stray write end keeps the
+    // read from ever seeing EOF. dup2() below clears the flag on stdout/stderr.
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) {
         close(pfd[0]); close(pfd[1]);

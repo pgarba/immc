@@ -130,8 +130,8 @@ static void test_kind_of(void) {
     CHECK(arch_is_archive("a.tgz"));
     CHECK(!arch_is_archive("a.tgz.bak"));
     CHECK(arch_kind_of(nullptr) == ARCH_NONE);
-    // rar has no writer
-    CHECK(!arch_can_pack(ARCH_RAR));
+    // rar is written only by RARLAB's own tool, which unrar and 7z are not
+    if (system("command -v rar >/dev/null 2>&1") != 0) CHECK(!arch_can_pack(ARCH_RAR));
     CHECK(arch_can_extract(ARCH_RAR));
     CHECK(!arch_can_pack(ARCH_ISO));
     // A split archive names its parts after the whole, so the part number is not
@@ -641,6 +641,8 @@ int main() {
     test_pack(root, ".zip");
     test_pack(root, ".tar.gz");
     if (arch_tool_available(ARCH_7Z)) test_pack(root, ".7z");
+    // Read back with 7z, so both the writer and a reader are needed.
+    if (arch_can_pack(ARCH_RAR) && arch_tool_available(ARCH_RAR)) test_pack(root, ".rar");
     test_test_integrity(root);
     test_abort(root);
     test_failures(root);

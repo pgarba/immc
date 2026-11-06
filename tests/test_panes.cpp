@@ -1215,6 +1215,24 @@ static void test_archive_copy_out(AppPanes* app, const std::string& root) {
     app->clipboard.paths.clear();
 }
 
+// Packing runs in the background: wait for every row to finish, then let the
+// frame-start reaper report it the way the app would.
+static void wait_bg_packs(AppPanes* app) {
+    for (int spin = 0; spin < 600; spin++) {
+        bool running = false;
+        for (auto& t : app->transfers)
+            if (t->state.load() == BgTransfer::BG_RUNNING) running = true;
+        if (!running) break;
+        SDL_Delay(50);
+    }
+    bg_reap(app);
+}
+
+static void clear_bg_packs(AppPanes* app) {
+    for (auto& t : app->transfers) if (t->worker.joinable()) t->worker.join();
+    app->transfers.clear();
+}
+
 // The archive operations themselves: pack, pack-and-delete, extract to the
 // other pane, extract here, and the integrity test.
 static void test_archive_ops(AppPanes* app, const std::string& root) {
@@ -1222,20 +1240,39 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
     Pane& q = app->right;
     app->left_focus = true;
 
-    sh("rm -rf '" + root + "/pack'");
-    sh("mkdir -p '" + root + "/pack'");
+    sh("rm -rf '" + root + "/pack' '" + root + "/packout'");
+    sh("mkdir -p '" + root + "/pack' '" + root + "/packout'");
     touch_file(root + "/pack", "a.txt");
     touch_file(root + "/pack", "b.txt");
     refresh_pane(&p, (root + "/pack").c_str());
+    refresh_pane(&q, (root + "/packout").c_str());
     for (int i = 0; i < p.entry_count; i++)
         if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
 
+
+    // The archive goes to the other pane's directory by default.
     app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
     CHECK(app->pack_open);
+    CHECK(strcmp(app->pack_dir, (root + "/packout").c_str()) == 0);
     CHECK(strcmp(app->pack_name, "archive") == 0);   // several sources: generic name
+    snprintf(app->pack_name, sizeof(app->pack_name), "elsewhere");
+    pack_commit(app);
+    CHECK(!app->pack_open);
+    CHECK(!app->transfers.empty() && app->transfers.back()->is_pack);
+    wait_bg_packs(app);
+    CHECK(strstr(app->status_msg, "Packed 2 entries") != NULL);
+    CHECK(fs_exists((root + "/packout/elsewhere.zip").c_str()));
+
+    // ... unless the dialog says otherwise.
+    for (int i = 0; i < p.entry_count; i++)
+        if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
+    app_panes_handle_key(app, SDLK_F5, SDL_KMOD_ALT);
+    CHECK(app->pack_open);
+    snprintf(app->pack_dir, sizeof(app->pack_dir), "%s", (root + "/pack").c_str());
     snprintf(app->pack_name, sizeof(app->pack_name), "packed");
     pack_commit(app);
     CHECK(!app->pack_open);
+    wait_bg_packs(app);
     CHECK(fs_exists((root + "/pack/packed.zip").c_str()));
     std::vector<ArchEntry> members;
     std::string err;
@@ -1253,7 +1290,9 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
     CHECK(app->pack_open);
     CHECK(app->pack_delete);
     snprintf(app->pack_name, sizeof(app->pack_name), "moved");
+    snprintf(app->pack_dir, sizeof(app->pack_dir), "%s", (root + "/pack").c_str());
     pack_commit(app);
+    wait_bg_packs(app);
     CHECK(fs_exists((root + "/pack/moved.zip").c_str()));
     CHECK(!fs_exists((root + "/pack/a.txt").c_str()));
     CHECK(!fs_exists((root + "/pack/b.txt").c_str()));
@@ -1296,7 +1335,8 @@ static void test_archive_ops(AppPanes* app, const std::string& root) {
     CHECK(strstr(app->status_msg, "inside an archive") != NULL);
     refresh_pane(&q, root.c_str());
 
-    sh("rm -rf '" + root + "/pack' '" + root + "/out2' '" + root + "/here'");
+    clear_bg_packs(app);
+    sh("rm -rf '" + root + "/pack' '" + root + "/packout' '" + root + "/out2' '" + root + "/here'");
 }
 
 static int kind_idx(ArchKind k) {
@@ -1327,6 +1367,8 @@ static void test_pack_options(AppPanes* app, const std::string& root) {
             if (strcmp(p.entries[i]->name, "..") != 0) p.marked[i] = true;
     };
 
+    // The archive goes to the other pane by default, so both show the sources.
+    refresh_pane(&app->right, (root + "/opts").c_str());
     CHECK(kind_idx(ARCH_7Z) >= 0);
     CHECK(kind_idx(ARCH_ZIP) >= 0);
     CHECK(kind_idx(ARCH_TAR_GZ) >= 0);
@@ -1341,6 +1383,7 @@ static void test_pack_options(AppPanes* app, const std::string& root) {
     snprintf(app->pack_password, sizeof(app->pack_password), "hunter2");
     pack_commit(app);
     CHECK(!app->pack_open);
+    wait_bg_packs(app);
     std::string sev = root + "/opts/secret.7z";
     CHECK(fs_exists(sev.c_str()));
 
@@ -1368,6 +1411,7 @@ static void test_pack_options(AppPanes* app, const std::string& root) {
     app->pack_password[0] = '\0';
     pack_commit(app);                       // same name, now without a password
     CHECK(!app->pack_open);
+    wait_bg_packs(app);
     CHECK(fs_exists((root + "/opts/plain.tar.gz").c_str()));
 
     // Volumes: refused for zip, because a split .zip comes back unreadable; and
@@ -1386,6 +1430,7 @@ static void test_pack_options(AppPanes* app, const std::string& root) {
     app->pack_password[0] = '\0';
     pack_commit(app);
     CHECK(!app->pack_open);
+    wait_bg_packs(app);
     CHECK(fs_exists((root + "/opts/split.7z.001").c_str()));
     sh("mkdir -p '" + root + "/volout'");
     CHECK(arch_extract((root + "/opts/split.7z.001").c_str(), (root + "/volout").c_str(),
@@ -1401,10 +1446,12 @@ static void test_pack_options(AppPanes* app, const std::string& root) {
     app->pack_volume_bytes = 0;
     pack_commit(app);
     CHECK(!app->pack_open);
+    wait_bg_packs(app);
     CHECK(fs_exists((root + "/opts/mismatched.tar.xz").c_str()));
     CHECK(!fs_exists((root + "/opts/mismatched.zip").c_str()));
 
     sh("rm -rf '" + root + "/opts' '" + root + "/yes' '" + root + "/nope' '" + root + "/volout'");
+    clear_bg_packs(app);
 }
 
 // TC Ctrl+P (path into the command line) and Ctrl+I (switch to the target
@@ -1630,8 +1677,8 @@ static void test_deferred_ops(AppPanes* app, const std::string& root) {
     CHECK(p.dir_size[idx_of(p, "sub")] >= 0);
 
     // DEFER_EXTRACT (Alt+F6 from the Commands menu) and DEFER_PACK (the Pack
-    // button and Enter in the pack dialog). Both pump the progress UI, so both
-    // have to arrive here rather than running inside the frame.
+    // button and Enter in the pack dialog) have to arrive here rather than
+    // running inside the frame; the pack then continues in the background.
     refresh_pane(&p, (root + "/defer").c_str());
     refresh_pane(&q, (root + "/defer/out").c_str());
     p.selected = idx_of(p, "pkg.zip");
@@ -1653,7 +1700,10 @@ static void test_deferred_ops(AppPanes* app, const std::string& root) {
     app->pending_op = DEFER_PACK;
     app_panes_run_pending(app);
     CHECK(!app->pack_open);
-    CHECK(fs_exists((root + "/defer/src/deferred.zip").c_str()));
+    wait_bg_packs(app);
+    // Written into the other pane, which is where a copy would have gone.
+    CHECK(fs_exists((root + "/defer/out/deferred.zip").c_str()));
+    clear_bg_packs(app);
 
     sh("rm -rf '" + root + "/defer'");
 }

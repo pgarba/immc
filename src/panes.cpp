@@ -145,6 +145,7 @@ AppPanes::AppPanes() {
     pack_open = false;
     pack_name[0] = '\0';
     pack_dir[0] = '\0';
+    pack_src_dir[0] = '\0';
     pack_kind_idx = 0;
     pack_level = 6;
     pack_use_level = false;
@@ -2960,13 +2961,20 @@ static void do_pack(AppPanes* app, bool and_delete) {
     bool any_tool = false;
     for (ArchKind k : arch_pack_kinds()) if (arch_can_pack(k)) { any_tool = true; break; }
     if (!any_tool) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Packing needs zip, tar or 7z installed");
+        snprintf(app->status_msg, sizeof(app->status_msg), "Packing needs zip, tar, 7z or rar installed");
         return;
     }
     // The dialog carries the choices, so it captures the sources and the target
     // directory now: marks and tabs cannot change underneath it.
     app->pack_names = names;
-    snprintf(app->pack_dir, sizeof(app->pack_dir), "%s", active.current_dir);
+    snprintf(app->pack_src_dir, sizeof(app->pack_src_dir), "%s", active.current_dir);
+    // The archive goes where a copy would: the other pane. A pane on a site or
+    // inside an archive is not a directory the tool can write into, so then it
+    // stays beside the sources. Either way the dialog lets it be changed.
+    const Pane& other = app->left_focus ? app->right : app->left;
+    const char* out = (in_remote(other) || in_archive(other) || !other.current_dir[0])
+                          ? active.current_dir : other.current_dir;
+    snprintf(app->pack_dir, sizeof(app->pack_dir), "%s", out);
     // Default name: the single source without its own suffix, else "archive".
     std::string base = names[0];
     size_t slash = base.find_last_of('/');
@@ -3007,8 +3015,12 @@ static ArchPackOpts pack_opts(const AppPanes* app) {
     return o;
 }
 
-// The dialog's Pack button, and Enter. Runs the tool with the progress bar the
-// copy operations already use, so abort works the same way here.
+static BgTransfer* bg_start_pack(AppPanes* app, const std::string& arch,
+                                 const ArchPackOpts& opts, const StringList& names);
+
+// The dialog's Pack button, and Enter. The tool runs on a thread with a row in
+// the transfer strip, the way a transfer to a site does, so the panes stay usable
+// while a large archive is written and Abort works the same way.
 static void pack_commit(AppPanes* app) {
     ArchKind kind = arch_pack_kinds()[app->pack_kind_idx];
     ArchPackOpts opts = pack_opts(app);
@@ -3021,13 +3033,22 @@ static void pack_commit(AppPanes* app) {
         app->pack_names.clear();
         return;
     }
-    std::string arch = std::string(app->pack_dir) + "/" +
+    std::string dir = app->pack_dir;
+    while (dir.size() > 1 && (dir.back() == '/' || isspace((unsigned char)dir.back()))) dir.pop_back();
+    struct stat dst_st;
+    if (dir.empty() || net_is_remote(dir.c_str()) ||
+        stat(dir.c_str(), &dst_st) != 0 || !S_ISDIR(dst_st.st_mode)) {
+        snprintf(app->status_msg, sizeof(app->status_msg),
+                 "Cannot pack: %s is not a directory on this disk", dir.c_str());
+        return;                                  // leave the dialog up to fix
+    }
+    std::string arch = (dir == "/" ? std::string() : dir) + "/" +
                        strip_archive_suffix(name) + arch_kind_suffix(kind);
 
     std::string why;
     if (!arch_pack_supported(opts, &why)) {
         snprintf(app->status_msg, sizeof(app->status_msg), "Cannot pack: %s", why.c_str());
-        return;                                  // leave the dialog up to fix
+        return;
     }
     if (!arch_can_pack(kind)) {
         snprintf(app->status_msg, sizeof(app->status_msg),
@@ -3038,38 +3059,19 @@ static void pack_commit(AppPanes* app) {
     StringList names = app->pack_names;
     app->pack_names.clear();
     app->pack_open = false;
-
-    arch_prog_begin(app, app->pack_dir, arch.c_str());
-    std::string err;
-    bool ok = arch_pack_opts(arch.c_str(), app->pack_dir, names, opts,
-                             copy_progress_cb, app, &err);
-    app->prog_active = false;
-    if (!ok) {
-        snprintf(app->status_msg, sizeof(app->status_msg), "Pack failed: %s", err.c_str());
-        return;
-    }
-    int removed = 0;
-    // Alt+Shift+F5 is a move into the archive, so the sources go too.
-    if (app->pack_delete) {
-        for (const std::string& n : names) {
-            std::string full = std::string(app->pack_dir) + "/" + n;
-            if (fs_delete_entry_progress(full.c_str(), copy_progress_cb, app)) removed++;
-        }
-    }
-    snprintf(app->status_msg, sizeof(app->status_msg), "Packed %d entr%s into %s%s",
-             (int)names.size(), names.size() == 1 ? "y" : "ies", arch.c_str(),
-             removed ? ", removed the sources" : "");
-    refresh_pane(&app->left, app->left.current_dir);
-    refresh_pane(&app->right, app->right.current_dir);
+    if (bg_start_pack(app, arch, opts, names))
+        snprintf(app->status_msg, sizeof(app->status_msg), "Packing %d entr%s into %s in the background",
+                 (int)names.size(), names.size() == 1 ? "y" : "ies", arch.c_str());
 }
 
 // Volume sizes worth offering. 7z takes a byte count, so the labels are the
 // only place units appear.
 static const long long kPackVolumes[] = { 0, 1024LL, 1024LL * 1024,
-                                          100LL * 1024 * 1024, 700LL * 1024 * 1024,
+                                          100LL * 1024 * 1024, 500LL * 1024 * 1024,
+                                          700LL * 1024 * 1024,
                                           1024LL * 1024 * 1024, 4LL * 1024 * 1024 * 1024 };
 static const char* const kPackVolumeLabels[] = {
-    "one file", "1 KB", "1 MB", "100 MB", "700 MB (CD)", "1 GB", "4 GB" };
+    "one file", "1 KB", "1 MB", "100 MB", "500 MB", "700 MB (CD)", "1 GB", "4 GB" };
 
 
 
@@ -3155,8 +3157,8 @@ static void render_pack_dialog(AppPanes* app) {
     ArchKind kind = kinds[app->pack_kind_idx];
 
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(430, 330), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 215, io.DisplaySize.y * 0.5f - 165),
+    ImGui::SetNextWindowSize(ImVec2(460, 420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f - 230, io.DisplaySize.y * 0.5f - 210),
                             ImGuiCond_FirstUseEver);
     bool open = true;
     ImGui::Begin("Pack into archive", &open, ImGuiWindowFlags_NoCollapse);
@@ -3179,9 +3181,15 @@ static void render_pack_dialog(AppPanes* app) {
     // break on, so it is shortened in the middle rather than clipped.
     float avail = ImGui::GetContentRegionAvail().x;
     std::string written = "Written as " + strip_archive_suffix(app->pack_name) + arch_kind_suffix(kind);
-    std::string into = std::string("into ") + app->pack_dir;
     text_wrap_disabled("%s", elide_middle(written.c_str(), avail).c_str());
-    text_wrap_disabled("%s", elide_middle(into.c_str(), avail).c_str());
+
+    // Where it goes: the other pane's directory unless changed here.
+    pack_fill("Output to");
+    ImGui::InputText("Output to", app->pack_dir, sizeof(app->pack_dir));
+    if (strcmp(app->pack_dir, app->pack_src_dir) != 0) {
+        std::string from = std::string("from ") + app->pack_src_dir;
+        text_wrap_disabled("%s", elide_middle(from.c_str(), avail).c_str());
+    }
 
     pack_fill("Format");
     if (ImGui::Combo("Format", &app->pack_kind_idx, items)) {
@@ -3191,7 +3199,7 @@ static void render_pack_dialog(AppPanes* app) {
         bool is_tar = nk == ARCH_TAR || nk == ARCH_TAR_GZ || nk == ARCH_TAR_BZ2 || nk == ARCH_TAR_XZ;
         if (is_tar) { app->pack_password[0] = '\0'; app->pack_volume_bytes = 0; }
         if (nk == ARCH_TAR) app->pack_use_level = false;
-        if (nk != ARCH_7Z) app->pack_volume_bytes = 0;
+        if (nk != ARCH_7Z && nk != ARCH_RAR) app->pack_volume_bytes = 0;
     }
 
     bool is_tar = kind == ARCH_TAR || kind == ARCH_TAR_GZ ||
@@ -3218,8 +3226,9 @@ static void render_pack_dialog(AppPanes* app) {
                            "process list while packing", arch_kind_name(kind));
     }
 
-    if (kind != ARCH_7Z) {
-        text_wrap_disabled("only 7z writes volumes the tools can read back");
+    const bool can_split = kind == ARCH_7Z || kind == ARCH_RAR;
+    if (!can_split) {
+        text_wrap_disabled("only 7z and rar write volumes the tools can read back");
     } else {
         int vi = 0;
         for (int i = 0; i < (int)(sizeof(kPackVolumes) / sizeof(kPackVolumes[0])); i++)
@@ -3229,6 +3238,21 @@ static void render_pack_dialog(AppPanes* app) {
                          (int)(sizeof(kPackVolumeLabels) / sizeof(kPackVolumeLabels[0]))))
             app->pack_volume_bytes = kPackVolumes[vi];
     }
+    // The common split, one click away. Only 7z and rar write volumes, so the box
+    // picks 7z when it is ticked under another format.
+    bool split500 = can_split && app->pack_volume_bytes == 500LL * 1024 * 1024;
+    ImGui::BeginDisabled(!can_split && !arch_can_pack(ARCH_7Z));
+    if (ImGui::Checkbox("Split into 500 MB volumes", &split500)) {
+        if (split500) {
+            if (!can_split)
+                for (int i = 0; i < (int)kinds.size(); i++)
+                    if (kinds[i] == ARCH_7Z) app->pack_kind_idx = i;
+            app->pack_volume_bytes = 500LL * 1024 * 1024;
+        } else {
+            app->pack_volume_bytes = 0;
+        }
+    }
+    ImGui::EndDisabled();
 
     ImGui::Checkbox("Delete the sources afterwards", &app->pack_delete);
 
@@ -3241,15 +3265,15 @@ static void render_pack_dialog(AppPanes* app) {
         text_wrap_colored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", why.c_str());
     }
     ImGui::Spacing();
-    bool can_pack = arch_can_pack(kind) && supported && app->pack_name[0];
+    bool can_pack = arch_can_pack(kind) && supported && app->pack_name[0] && app->pack_dir[0];
     ImGui::BeginDisabled(!can_pack);
-    // The button only records the request: packing blocks and pumps its own
-    // ImGui frames, which cannot happen while this dialog's frame is open.
+    // The button only records the request; the pack itself starts between frames
+    // and runs in the background, with its row in the transfer strip.
     if (ImGui::Button("Pack")) app->pending_op = DEFER_PACK;
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) { app->pack_open = false; app->pack_names.clear(); }
-    text_wrap_disabled("Enter packs, Esc cancels");
+    text_wrap_disabled("Enter packs in the background, Esc cancels");
     if (!open) { app->pack_open = false; app->pack_names.clear(); }
     ImGui::End();
 }
@@ -3998,6 +4022,94 @@ static BgTransfer* bg_start_remote_plan(AppPanes* app, const OpPlan& plan) {
     return t;
 }
 
+// A background pack reports through the same counters a transfer's files do, so
+// the row's bar, numbers and Abort need nothing of their own.
+static bool bg_pack_progress(long long done, long long total, int fd, int ft, void* user) {
+    BgTransfer* t = (BgTransfer*)user;
+    t->done = done;
+    t->total = total;
+    t->files_done = fd;
+    t->files_total = ft;
+    return !t->abort.load();
+}
+
+// The worker's half of Alt+F5. It touches only the record: the archive tool runs
+// with the sources' directory as its cwd, and a move into the archive removes the
+// sources only once the archive is known good.
+static void bg_run_pack(BgTransfer* t) {
+    const std::string& arch = t->src;
+    struct stat st;
+    const bool existed = stat(arch.c_str(), &st) == 0;
+    std::string err;
+    bool ok = arch_pack_opts(arch.c_str(), t->pack_cwd.c_str(), t->pack_names, t->pack_opts,
+                             bg_pack_progress, t, &err);
+    if (!ok && !existed) {
+        // A stopped or failed pack leaves half an archive behind, which looks like
+        // a good one in the pane. Only what this run created is removed.
+        remove(arch.c_str());
+        for (int v = 1; v < 10000; v++) {          // 7z volumes: name.7z.001, ...
+            char suf[16];
+            snprintf(suf, sizeof(suf), ".%03d", v);
+            if (remove((arch + suf).c_str()) != 0) break;
+        }
+        // rar volumes: name.part1.rar, name.part01.rar, ...
+        std::string stem = arch.size() > 4 ? arch.substr(0, arch.size() - 4) : arch;
+        for (const char* fmt : { "%s.part%d.rar", "%s.part%02d.rar", "%s.part%03d.rar" })
+            for (int v = 1; v < 10000; v++) {
+                char buf[4200];
+                snprintf(buf, sizeof(buf), fmt, stem.c_str(), v);
+                if (remove(buf) != 0) break;
+            }
+    }
+    if (ok) {
+        t->ok_names = (int)t->pack_names.size();
+        if (t->pack_delete && !t->abort.load()) {
+            for (const std::string& n : t->pack_names) {
+                std::string full = t->pack_cwd + "/" + n;
+                fs_delete_entry_progress(full.c_str(), bg_abort_cb, t);
+            }
+            t->pack_removed = true;
+        }
+    } else {
+        t->error = t->abort.load() ? "stopped; the partial archive was removed"
+                                   : (err.empty() ? std::string("packing failed") : err);
+    }
+    t->t_end_ms = (long long)SDL_GetTicks();
+    int state = t->abort.load() ? BgTransfer::BG_ABORTED
+                                : (ok ? BgTransfer::BG_DONE : BgTransfer::BG_FAILED);
+    t->state.store(state, std::memory_order_release);
+}
+
+static BgTransfer* bg_start_pack(AppPanes* app, const std::string& arch,
+                                 const ArchPackOpts& opts, const StringList& names) {
+    while (app->transfers.size() >= 12) {
+        size_t before = app->transfers.size();
+        bg_retire_oldest_finished(app);
+        if (app->transfers.size() == before) break;
+    }
+    std::unique_ptr<BgTransfer> up = std::make_unique<BgTransfer>();
+    BgTransfer* t = up.get();
+    t->state   = BgTransfer::BG_RUNNING;
+    t->abort   = false;
+    t->settled = false;
+    t->dismiss = false;
+    t->is_move  = false;
+    t->download = false;
+    t->t0       = SDL_GetTicks() / 1000.0;
+    t->src      = arch;
+    size_t slash = arch.find_last_of('/');
+    t->dst      = slash == 0 ? std::string("/") : arch.substr(0, slash);
+    t->resumable = false;
+    t->is_pack     = true;
+    t->pack_cwd    = app->pack_src_dir;
+    t->pack_names  = names;
+    t->pack_opts   = opts;
+    t->pack_delete = app->pack_delete;
+    t->worker = std::thread(bg_run_pack, t);
+    app->transfers.push_back(std::move(up));
+    return t;
+}
+
 // Start a stopped row again, which is the whole reason the record keeps its plan.
 // `restart` is the difference between continuing and starting over: a resume hands
 // the transport the offsets it can pick up - the size of each `.part` for a
@@ -4359,6 +4471,17 @@ static void bg_reap(AppPanes* app) {
     for (size_t i = 0; i < app->transfers.size();) {
         BgTransfer* t = app->transfers[i].get();
         bool running = t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
+        if (!running && t->is_pack && !t->settled.exchange(true)) {
+            if (t->ok_names)
+                snprintf(app->status_msg, sizeof(app->status_msg), "Packed %d entr%s into %s%s",
+                         t->ok_names, t->ok_names == 1 ? "y" : "ies", t->src.c_str(),
+                         t->pack_removed ? ", removed the sources" : "");
+            else
+                snprintf(app->status_msg, sizeof(app->status_msg), "Pack failed: %s",
+                         t->error.c_str());
+            refresh_pane(&app->left, app->left.current_dir);
+            refresh_pane(&app->right, app->right.current_dir);
+        }
         if (!running && !t->settled.exchange(true)) {
             char skip_note[32] = "";
             if (t->skipped_names)
@@ -4434,7 +4557,9 @@ struct QueueSummary {
 static QueueSummary bg_queue_summary(AppPanes* app) {
     QueueSummary q;
     double first = 0.0;
+    // The queue is the network's; a pack row has its own bar and no threads.
     for (const std::unique_ptr<BgTransfer>& t : app->transfers) {
+        if (t->is_pack) continue;
         if (t->state.load(std::memory_order_acquire) != BgTransfer::BG_RUNNING) continue;
         q.running++;
         if (first == 0.0 || t->t0 < first) first = t->t0;
@@ -4442,6 +4567,7 @@ static QueueSummary bg_queue_summary(AppPanes* app) {
     if (!q.running) { app->queue_t0 = 0.0; return q; }
     if (app->queue_t0 == 0.0 || first < app->queue_t0) app->queue_t0 = first;
     for (const std::unique_ptr<BgTransfer>& t : app->transfers) {
+        if (t->is_pack) continue;
         bool running = t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING;
         if (!running && t->t0 < app->queue_t0) continue;   // from an earlier batch
         long long done = t->done.load(), total = t->total.load();
@@ -4485,7 +4611,8 @@ static float bg_strip_height(const AppPanes* app, float frame) {
     if (rows > 7) rows = 7;
     // The queue's own line over the table, while anything is running.
     for (const std::unique_ptr<BgTransfer>& t : app->transfers)
-        if (t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) { rows++; break; }
+        if (!t->is_pack &&
+            t->state.load(std::memory_order_acquire) == BgTransfer::BG_RUNNING) { rows++; break; }
     return 6.0f + (float)rows * frame;
 }
 
@@ -4574,7 +4701,7 @@ static void render_transfers(AppPanes* app, float h) {
         ImGui::TableNextRow();
 
         ImGui::TableNextColumn();
-        ImGui::TextDisabled("%s", t->download ? "get" : "put");
+        ImGui::TextDisabled("%s", t->is_pack ? "pack" : t->download ? "get" : "put");
 
         ImGui::TableNextColumn();
         // The name that is moving, not the whole path: the path is what the row
@@ -4582,7 +4709,7 @@ static void render_transfers(AppPanes* app, float h) {
         std::string base = t->src;
         size_t slash = base.find_last_of('/');
         if (slash != std::string::npos && slash + 1 < base.size()) base = base.substr(slash + 1);
-        std::string what = base + (t->is_move ? " (move)" : "");
+        std::string what = base + (t->is_move || (t->is_pack && t->pack_delete) ? " (move)" : "");
         ImGui::TextUnformatted(elide_middle(what.c_str(), ImGui::GetContentRegionAvail().x).c_str());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s\n-> %s\n%s\nfiles: %d of %d", t->src.c_str(), t->dst.c_str(),

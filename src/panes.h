@@ -13,6 +13,7 @@
 #include "img.h"      // ImgFormat, for what a quick view preview turned out to be
 #include "remote.h"   // NetSite, for the site list AppPanes owns
 #include "xfer.h"     // XferJob, what a background transfer reports through
+#include "archive.h"  // ArchPackOpts, what a background pack is asked to write
 
 static const int MAX_TABS = 8;
 static const int MAX_DIR_HISTORY = 32;
@@ -272,6 +273,17 @@ struct BgTransfer : XferJob {
     // that publishes it. A finished row stays on screen long after the thread is
     // gone, so its "in Ns" is this minus t0 and not the clock minus t0.
     std::atomic<long long> t_end_ms{0};
+
+    // A pack (Alt+F5) runs in the same strip as a transfer: same bar, same Abort,
+    // same row. It has no site and no plan; it has the sources, where they are,
+    // and the archive to write. `src` is the archive, `dst` the directory it goes
+    // into. Fixed before the worker starts, like the fields above.
+    bool                     is_pack = false;
+    std::string              pack_cwd;      // the directory the sources are relative to
+    std::vector<std::string> pack_names;
+    ArchPackOpts             pack_opts{};
+    bool                     pack_delete = false;
+    bool                     pack_removed = false;  // the worker's: sources went afterwards
 
     std::thread worker;
 };
@@ -726,7 +738,9 @@ public:
     // while the pane is showing an unrelated tab.
     bool pack_open;
     char pack_name[512];           // without the suffix; the format supplies it
-    char pack_dir[4096];           // directory the archive is written into
+    char pack_dir[4096];           // directory the archive is written into (editable;
+                                   // starts as the other pane's directory)
+    char pack_src_dir[4096];       // directory the sources are in (the active pane's)
     int  pack_kind_idx;            // index into arch_pack_kinds()
     int  pack_level;               // 0 store .. 9 best
     bool pack_use_level;           // false = the tool's own default
